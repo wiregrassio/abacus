@@ -1,0 +1,20 @@
+[package]
+name = "abacus-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Abacus RTS daemon: the 1 ms coordination loop"
+
+[[bin]]
+name = "abacus"
+path = "src/main.rs"
+
+[dependencies]
+abacus-core = { workspace = true }
+abacus-wire = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+abacus-client = { workspace = true }
+abacus-tests = { workspace = true }

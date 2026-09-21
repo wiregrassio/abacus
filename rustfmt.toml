@@ -1,0 +1,2 @@
+# Defaults. The file pins the intent: `cargo fmt --all -- --check` is a CI gate.
+edition = "2021"

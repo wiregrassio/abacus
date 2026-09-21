@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/abacus-core",
+    "crates/abacus-wire",
+    "crates/abacus-daemon",
+    "crates/abacus-client",
+    "crates/abacus-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Option::is_none_or (1.82), c"..." CStr literals (1.77), and let-else (1.65) are used.
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+libc = "0.2"
+abacus-core = { path = "crates/abacus-core" }
+abacus-wire = { path = "crates/abacus-wire" }
+abacus-daemon = { path = "crates/abacus-daemon" }
+abacus-client = { path = "crates/abacus-client" }
+abacus-tests = { path = "crates/abacus-tests" }
+
+# The daemon ships from this profile. panic = "abort" keeps crash-only semantics: a panic in
+# the loop takes the process down instead of unwinding into a half-evaluated registry.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

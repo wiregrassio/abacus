@@ -1,0 +1,19 @@
+# The contribution gate, mechanical: format, lint with warnings denied, build, every test, on
+# Linux. memfd, futex, and UDS all work on the GitHub runner.
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+      - run: cargo build --release -p abacus-daemon
