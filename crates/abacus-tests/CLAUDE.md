@@ -2,7 +2,7 @@
 
 # crates/abacus-tests/
 
-Integration-test crate and shared test infrastructure for validating Abacus RTS client, daemon, wire-protocol, resilience, and timing contracts.
+Integration-test crate and shared test infrastructure for validating Abacus client, daemon, wire-protocol, resilience, and timing contracts.
 
 </purpose>
 
@@ -58,7 +58,7 @@ Integration-test crate and shared test infrastructure for validating Abacus RTS 
 ## Files
 | File | Purpose |
 |---|---|
-| `Cargo.toml` | Defines the `abacus-tests` crate and its dependencies on Abacus RTS workspace components plus `libc`. |
+| `Cargo.toml` | Defines the `abacus-tests` crate and its dependencies on Abacus workspace components plus `libc`. |
 
 </files>
 

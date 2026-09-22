@@ -43,7 +43,7 @@ pub enum TimeoutPolicy {
     /// liveness check.
     #[default]
     Abort,
-    /// Return `SdkError::RtsTimeout`. Required for any host that cannot be aborted (a non-Rust
+    /// Return `SdkError::DeliveryTimeout`. Required for any host that cannot be aborted (a non-Rust
     /// binding, a managed runtime, a process that must run cleanup).
     Error,
 }

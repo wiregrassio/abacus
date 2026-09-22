@@ -116,7 +116,7 @@ fn wait_timer__wait_ms_zero_does_not_abort() {
 }
 
 /// Under TimeoutPolicy::Error a daemon that stops delivering produces
-/// Err(SdkError::RtsTimeout) after the fatal margin, and the process lives. The daemon is
+/// Err(SdkError::DeliveryTimeout) after the fatal margin, and the process lives. The daemon is
 /// stopped with SIGSTOP for the duration.
 #[test]
 fn wait_timer__rts_timeout_is_an_error_under_error_policy() {
@@ -130,18 +130,18 @@ fn wait_timer__rts_timeout_is_an_error_under_error_policy() {
     let elapsed = t0.elapsed();
     d.kill(libc::SIGCONT);
     assert!(
-        matches!(r, Err(SdkError::RtsTimeout)),
+        matches!(r, Err(SdkError::DeliveryTimeout)),
         "stopped daemon: wait_ms(5) returned {r:?} after {elapsed:?}"
     );
     assert!(
         elapsed >= Duration::from_millis(MIN_FATAL_MARGIN_MS)
             && elapsed < Duration::from_millis(MIN_FATAL_MARGIN_MS + 40),
-        "RtsTimeout after {elapsed:?}, expected about {MIN_FATAL_MARGIN_MS} ms"
+        "DeliveryTimeout after {elapsed:?}, expected about {MIN_FATAL_MARGIN_MS} ms"
     );
 }
 
 /// ARCHITECTURE.md, a daemon restart wakes nobody; the
-/// waiter learns of it through RtsTimeout under TimeoutPolicy::Error, and a fresh client
+/// waiter learns of it through DeliveryTimeout under TimeoutPolicy::Error, and a fresh client
 /// connects and creates on the new daemon.
 #[test]
 fn daemon__restart_wakes_nobody_and_timers_time_out() {
@@ -163,12 +163,12 @@ fn daemon__restart_wakes_nobody_and_timers_time_out() {
         )
     });
     assert!(
-        matches!(r, Err(SdkError::RtsTimeout)),
+        matches!(r, Err(SdkError::DeliveryTimeout)),
         "waiter across a restart returned {r:?} after {elapsed:?}"
     );
     assert!(
         elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(200),
-        "RtsTimeout after {elapsed:?}, expected about 2 x 50 ms"
+        "DeliveryTimeout after {elapsed:?}, expected about 2 x 50 ms"
     );
     assert!(
         !client.is_connected(),

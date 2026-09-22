@@ -19,7 +19,7 @@ use abacus_tests::{
 pub const BIN: &str = env!("CARGO_BIN_EXE_abacus");
 
 /// `main.rs` default when no `--socket-path` is given.
-pub const DEFAULT_SOCKET_PATH: &str = "/run/abacus-rts/abacus.sock";
+pub const DEFAULT_SOCKET_PATH: &str = "/run/abacus/abacus.sock";
 
 pub fn bin() -> &'static Path {
     Path::new(BIN)
@@ -71,7 +71,7 @@ impl Drop for RawDaemon {
 }
 
 /// The pass condition every "survives" test shares: a fresh client can create a timer and
-/// `wait_ms(wait_ms)` on it. Runs in a role child so an SDK abort (RTSTimeout) or a hung
+/// `wait_ms(wait_ms)` on it. Runs in a role child so an SDK abort (DeliveryTimeout) or a hung
 /// create is contained: an abort shows as `signal 6`, a hang is killed at `deadline`. Never
 /// call the SDK's `wait_ms` with a small budget in the test process itself; one stall would
 /// take every test in the binary down.

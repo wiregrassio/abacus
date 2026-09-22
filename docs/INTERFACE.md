@@ -1,5 +1,5 @@
 
-# Abacus RTS interface
+# Abacus interface
 
 The frozen interface surface: wire protocol, SDK API, errors, permissions, and termination
 contracts. DESIGN.md says why and how the mechanism works internally. This file says what
@@ -460,8 +460,8 @@ wait_ms_with_margin(&self, ms: u64, margin_ms: u64) -> Result<WaitResult, SdkErr
     ms == 0 and the handle is already terminated; SdkError::InvalidRequest { message:
     "margin_ms (N) must exceed wait (M)" } when margin_ms <= ms;
     SdkError::InterlockReaped from interlock_arm on a SENTINEL expiration.
-    On the margin expiring: TimeoutPolicy::Error returns Err(SdkError::RtsTimeout);
-    TimeoutPolicy::Abort prints an "abacus: RTSTimeout" diagnostic to stderr and calls
+    On the margin expiring: TimeoutPolicy::Error returns Err(SdkError::DeliveryTimeout);
+    TimeoutPolicy::Abort prints an "abacus: DeliveryTimeout" diagnostic to stderr and calls
     std::process::abort (wait_timer.rs::WaitTimer::on_timeout).
 
 wait_until(&self, timestamp_ms: u64) -> Result<WaitResult, SdkError>
@@ -920,7 +920,7 @@ Sentinel is checked before classification: every wait loop loads both counters a
 | Waiter | Timeout result |
 |---|---|
 | `WaitCounter::wait_until` | `Ok(WaitResult { state: Timeout, completed_at })` after the futex reports `ETIMEDOUT` and one more delivery check fails |
-| `WaitTimer::wait_ms*` | `on_timeout`: `TimeoutPolicy::Error` yields `Err(SdkError::RtsTimeout)`; `TimeoutPolicy::Abort` prints a diagnostic and calls `std::process::abort` |
+| `WaitTimer::wait_ms*` | `on_timeout`: `TimeoutPolicy::Error` yields `Err(SdkError::DeliveryTimeout)`; `TimeoutPolicy::Abort` prints a diagnostic and calls `std::process::abort` |
 | `Interlock::wait_open_for` and siblings | `Ok(None)` |
 | `WaitCron::wait`, `WaitBarrier::wait` | no timeout; they return only on delivery or reap |
 
@@ -1096,7 +1096,7 @@ client.rs::SdkError. Derives `Debug, Clone, PartialEq, Eq`, implements `Display`
 | `InterlockNotFound { name }` | Daemon reply code `ERR_INTERLOCK_NOT_FOUND`, with the reply message carried as `name` (client.rs::daemon_error) |
 | `AllocationFailed { message }` | Daemon reply code `ERR_ALLOCATION_FAILED` (client.rs::daemon_error); `Condition::AllocationFailed` rendered to a string (client.rs::From<Condition>) |
 | `InvalidRequest { message }` | `attach_interlock("clock")` (client.rs::AbacusClient::attach_interlock); `create_wait_cron` with `interval_ms == 0` (client.rs::AbacusClient::create_wait_cron); `WaitRace::wait` over zero counters (wait_race.rs::WaitRace::wait); `wait_ms_with_margin` with `margin_ms <= ms` (wait_timer.rs::WaitTimer::wait_ms_with_margin); daemon reply code `ERR_INVALID_REQUEST` (client.rs::daemon_error) |
-| `RtsTimeout` | `WaitTimer` margin expiry under `TimeoutPolicy::Error` (wait_timer.rs::WaitTimer::on_timeout) |
+| `DeliveryTimeout` | `WaitTimer` margin expiry under `TimeoutPolicy::Error` (wait_timer.rs::WaitTimer::on_timeout) |
 | `Transport(TransportError)` | Connect, timeout set, frame send, frame receive, decode, and descriptor-count faults (client.rs::ClientConn); `extract_single_fd` when the reply carries a count other than one (client.rs::extract_single_fd) |
 | `MmapFailed { message }` | The mapping function returns `Condition`, rendered to a string (client.rs::map_handle) |
 | `UnexpectedResponse { message }` | A reply that is neither the expected `Created`/`Attached` nor `Error` (client.rs::AbacusClient::do_create, client.rs::do_attach); an unrecognized daemon error code, message `"unknown daemon error 0x{code:02x}: {message}"` (client.rs::daemon_error) |

@@ -5,7 +5,7 @@
 //! release constant carries the same value and says so.
 //!
 //! Anything that can abort (`wait_ms` with a tight margin) runs in a role child so an
-//! RTSTimeout abort is a red test with the child's stderr, not a dead test binary.
+//! DeliveryTimeout abort is a red test with the child's stderr, not a dead test binary.
 
 #![allow(non_snake_case)]
 // Debug and release thresholds are stated as separate arms even where the values coincide:
@@ -86,7 +86,7 @@ fn bin() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Measuring wait_ms in a child (an RTSTimeout abort must not kill this binary)
+// Measuring wait_ms in a child (an DeliveryTimeout abort must not kill this binary)
 // ---------------------------------------------------------------------------
 
 /// The child's `REPORT ...` line. libtest under `--nocapture` prints `test name ... ` with no
@@ -113,7 +113,7 @@ struct Bench {
 }
 
 /// Run `n` x `wait_ms(ms)` on a fresh timer in a role child and parse its REPORT line.
-/// `Err` carries the exit description and the child's stderr (the RTSTimeout line).
+/// `Err` carries the exit description and the child's stderr (the DeliveryTimeout line).
 fn bench_wait_ms(sock: &Path, ms: u64, n: usize) -> Result<Bench, String> {
     let sock_s = sock.to_str().expect("utf8 socket path");
     let child = role_command(

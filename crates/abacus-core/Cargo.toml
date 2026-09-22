@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Abacus RTS core: interlock primitive, clock, error types"
+description = "Abacus core: interlock primitive, clock, error types"
 
 [dependencies]
 libc = { workspace = true }

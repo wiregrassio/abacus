@@ -2,7 +2,7 @@
 
 # tests/
 
-Integration, regression, abuse, soak, and hardware-timing test suites that exercise the Abacus RTS client/daemon contracts through in-thread and real-process daemons.
+Integration, regression, abuse, soak, and hardware-timing test suites that exercise the Abacus client/daemon contracts through in-thread and real-process daemons.
 
 </purpose>
 

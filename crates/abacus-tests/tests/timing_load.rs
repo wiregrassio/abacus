@@ -16,7 +16,7 @@
 //! The test thread is pinned first, so the SDK's touch threads and the role children it
 //! spawns inherit the client core set and never land on the daemon's core.
 //!
-//! Every wait_ms loop runs in a role child so an RTSTimeout abort is a red test with the
+//! Every wait_ms loop runs in a role child so an DeliveryTimeout abort is a red test with the
 //! child's stderr, not a dead test binary. The load is threads in this process
 //! (`abacus_tests::Load`), so a panic leaves nothing running. Every test holds
 //! `serialized()`: two load shapes at once starve each other's daemon.
@@ -110,7 +110,7 @@ fn bin() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Measuring wait_ms in a child (an RTSTimeout abort must not kill this binary)
+// Measuring wait_ms in a child (an DeliveryTimeout abort must not kill this binary)
 // ---------------------------------------------------------------------------
 
 /// The child's `REPORT ...` line. libtest under `--nocapture` prints `test name ... ` with no
@@ -135,7 +135,7 @@ struct Bench {
 }
 
 /// Run `n` x `wait_ms(ms)` on a fresh timer in a role child and parse its REPORT line.
-/// `Err` carries the exit description and the child's stderr (the RTSTimeout line).
+/// `Err` carries the exit description and the child's stderr (the DeliveryTimeout line).
 fn bench_wait_ms(sock: &Path, ms: u64, n: usize) -> Result<Bench, String> {
     let sock_s = sock.to_str().expect("utf8 socket path");
     let child = role_command(

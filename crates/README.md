@@ -1,6 +1,6 @@
 # crates/
 
-This directory holds the Rust crates that make up Abacus RTS. The core crate defines Linux shared-memory coordination primitives, the wire crate defines the socket protocol, the daemon owns interlock registration and evaluation, and the client packages those mechanisms as an SDK.
+This directory holds the Rust crates that make up Abacus. The core crate defines Linux shared-memory coordination primitives, the wire crate defines the socket protocol, the daemon owns interlock registration and evaluation, and the client packages those mechanisms as an SDK.
 
 Build the workspace with Cargo on Linux. A normal deployment runs the `abacus` daemon and links applications against `abacus-client`; the daemon and client then share mapped interlock state while using the Unix socket for setup and descriptor transfer.
 

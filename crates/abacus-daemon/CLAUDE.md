@@ -2,7 +2,7 @@
 
 # crates/abacus-daemon/
 
-Builds the `abacus` daemon executable and library that run Abacus RTS's 1 ms coordination loop over a Unix-domain-socket interface.
+Builds the `abacus` daemon executable and library that run Abacus's 1 ms coordination loop over a Unix-domain-socket interface.
 
 </purpose>
 

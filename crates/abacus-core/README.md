@@ -1,6 +1,6 @@
 # crates/abacus-core/
 
-`abacus-core` is the low-level Linux foundation for the Abacus RTS system. It owns the shared interlock representation used to coordinate clients and daemon processes, along with monotonic-time and futex support and the common error vocabulary.
+`abacus-core` is the low-level Linux foundation for the Abacus system. It owns the shared interlock representation used to coordinate clients and daemon processes, along with monotonic-time and futex support and the common error vocabulary.
 
 The crate depends on Linux kernel primitives rather than providing a portable synchronization abstraction. Building it therefore requires a Linux target and a kernel that supports memfd creation, file seals, shared mappings, and futexes.
 
@@ -61,6 +61,6 @@ Most users should consume the higher-level SDK or daemon crates instead of manip
 ### Cargo.toml
 | Symbol | Kind | Purpose | Rationale |
 |---|---|---|---|
-| `abacus-core` | package | Defines the shared low-level Abacus RTS crate. | Isolates Linux ABI-sensitive synchronization and error primitives from higher-level consumers. |
+| `abacus-core` | package | Defines the shared low-level Abacus crate. | Isolates Linux ABI-sensitive synchronization and error primitives from higher-level consumers. |
 
 </symbol-table>

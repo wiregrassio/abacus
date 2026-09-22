@@ -1,6 +1,6 @@
 # crates/abacus-client/
 
-This directory is the Cargo package for the Abacus RTS Rust client SDK. It provides the dependencies and package metadata needed to build the SDK implemented in `src/`.
+This directory is the Cargo package for the Abacus Rust client SDK. It provides the dependencies and package metadata needed to build the SDK implemented in `src/`.
 
 Applications use this crate to connect to an Abacus daemon, create or attach named interlocks, and wait on counters, timers, cron schedules, barriers, races, or a daemon-backed process clock. The daemon provides shared-memory descriptors, while the client maps them and keeps registered resources alive.
 
@@ -62,7 +62,7 @@ Start with the public exports in `src/lib.rs`, then read `src/client.rs` for con
 ### Cargo.toml
 | Symbol | Kind | Purpose | Rationale |
 |---|---|---|---|
-| `abacus-client` | package | Defines the Abacus RTS client SDK crate. | Separates consumer-facing daemon and interlock APIs from core shared-memory and wire-protocol crates. |
+| `abacus-client` | package | Defines the Abacus client SDK crate. | Separates consumer-facing daemon and interlock APIs from core shared-memory and wire-protocol crates. |
 | `abacus-core` | dependency | Supplies shared-memory interlock and lifecycle primitives. | Keeps low-level interlock mechanics reusable outside the SDK facade. |
 | `abacus-wire` | dependency | Supplies daemon protocol and descriptor-transfer support. | Centralizes wire compatibility between client and daemon. |
 | `libc` | dependency | Supplies required Unix and futex-adjacent system interfaces. | Rust standard APIs do not expose all required low-level socket and errno behavior. |

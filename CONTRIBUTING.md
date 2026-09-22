@@ -1,7 +1,7 @@
 
 # Contributing
 
-Abacus RTS is a coordination plane for real-time compute: one shared-memory primitive (the interlock), a crash-only daemon that evaluates five tiers on a 1 ms cadence, and a typed Rust SDK over both. Before you write code, read `PHILOSOPHY.md` (the design law) and `CONVENTIONS.md` (repository, code, and documentation conventions). This document tells you how to build, test, and submit.
+Abacus is a coordination plane for real-time compute: one shared-memory primitive (the interlock), a crash-only daemon that evaluates five tiers on a 1 ms cadence, and a typed Rust SDK over both. Before you write code, read `PHILOSOPHY.md` (the design law) and `CONVENTIONS.md` (repository, code, and documentation conventions). This document tells you how to build, test, and submit.
 
 ## Platform
 
@@ -9,7 +9,7 @@ Linux only. The guard is compile-time, in `crates/abacus-core/src/lib.rs`:
 
 ```rust
 #[cfg(not(target_os = "linux"))]
-compile_error!("abacus-rts is Linux-only: memfd, futex, SCM_RIGHTS");
+compile_error!("abacus is Linux-only: memfd, futex, SCM_RIGHTS");
 ```
 
 A macOS build stops there. This is not an oversight to fix: the implementation rests on memfd with seals, futex, Unix-domain sockets with `SCM_RIGHTS`, signals, and `/proc`. Little-endian is also asserted at compile time, next to the `futex_addr` that depends on it (`crates/abacus-core/src/clock.rs`).
@@ -26,7 +26,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The daemon binary lands at `target/release/abacus`. `cargo test` starts daemons on unique sockets under `/tmp` and stops them. One test (`daemon__default_socket_path_and_flag_forms`) validates the daemon's default socket path argument parsing and binds to `/run/abacus-rts/abacus.sock` if that path is writable.
+The daemon binary lands at `target/release/abacus`. `cargo test` starts daemons on unique sockets under `/tmp` and stops them. One test (`daemon__default_socket_path_and_flag_forms`) validates the daemon's default socket path argument parsing and binds to `/run/abacus/abacus.sock` if that path is writable.
 
 Ignored suites, run deliberately:
 
@@ -65,7 +65,7 @@ cargo run -p abacus-tests --example probe -- cron /tmp/abacus-probe.sock 10 200
 | `crates/abacus-tests` | Shared test kit, integration suites, probes |
 | `docs/` | `PHILOSOPHY.md`, `DESIGN.md`, `INTERFACE.md`, `CONVENTIONS.md` |
 | `docs/` | `OPERATION.md`, `BACKLOG.md` |
-| `deploy/` | `abacus-rts.service` |
+| `deploy/` | `abacus.service` |
 
 The crate split is an ABI boundary, not a filing convention. Shared-memory word layout, wire framing, descriptor cardinality, sentinel meaning, and futex behavior must stay synchronized across four independently compiled crates. `abacus-client` must not depend on `abacus-daemon`; both depend on `abacus-wire`, and `wire_crate.rs` asserts that by reading the manifests.
 

@@ -33,7 +33,7 @@ Non-isolated operation is best-effort and explicitly out of contract.
 - **No rate limiting or per-peer quota.** Only the global `max_interlocks` cap applies.
 - **Slow readers are dropped, not buffered.** `EAGAIN` on write is treated as connection death, because the protocol is strict request/response and a client not draining its socket is broken.
 - **No metrics, health endpoint, structured logging, or admin tool.** Diagnostics are stderr lines; the registry is observable only through the SDK. The daemon's budget is a 1 ms loop; an observability surface is a design problem of its own.
-- **Real-time scheduling and CPU pinning are left to the deployer**, commented out in the systemd unit. Pinning without kernel-level isolation does not help, so the unit ships neither rather than shipping a half-measure that reads as a guarantee.
+- **Real-time scheduling and CPU pinning assume an isolated core.** The unit pins to core 4 with SCHED_FIFO priority 50, correct only where the host boots with `isolcpus` covering core 4. Without kernel-level isolation the pin is a half-measure that reads as a guarantee, so check the boot parameters before deploying.
 - **Socket is listening before its mode is applied.** `UnixListener::bind` sockets, binds, and listens in one call; the chmod follows. In the window the socket accepts connections at umask-derived permissions. The runtime directory's `0755` mode limits exposure to processes that can reach the path.
 
 ## Deferred implementation

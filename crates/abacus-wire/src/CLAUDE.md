@@ -2,7 +2,7 @@
 
 # src/
 
-Shared wire-protocol implementation for Abacus RTS v1: codec, length-prefixed Unix-stream framing, and SCM_RIGHTS file-descriptor passing.
+Shared wire-protocol implementation for Abacus v1: codec, length-prefixed Unix-stream framing, and SCM_RIGHTS file-descriptor passing.
 
 </purpose>
 

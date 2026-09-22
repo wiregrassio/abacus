@@ -43,8 +43,8 @@ End-to-end L2 integration tests that run the `abacus` daemon as a real process a
 - HIGH: Timing assertions depend on host process startup latency and daemon cadence; a slow or heavily loaded host can cause deadline-sensitive tests to fail.
 - HIGH: Timing assertions depend on host scheduler latency, Unix process startup, daemon loop cadence, and CPU-tick accounting; heavily loaded or slow debug environments can produce flaky deadline failures.
 - HIGH: Role subprocesses are addressed by ignored-test names passed as strings; a rename that does not update `role_command`/`role_args` callers breaks tests only at runtime.
-- MEDIUM: Tests manipulate real signals, Unix socket files, memfd file descriptors, and `/run/abacus-rts/abacus.sock`; they are Unix-specific and can be affected by host permissions or stale external socket state.
-- MEDIUM: The default-socket test branches on whether `/run/abacus-rts` exists, so its expected outcome depends on machine configuration.
+- MEDIUM: Tests manipulate real signals, Unix socket files, memfd file descriptors, and `/run/abacus/abacus.sock`; they are Unix-specific and can be affected by host permissions or stale external socket state.
+- MEDIUM: The default-socket test branches on whether `/run/abacus` exists, so its expected outcome depends on machine configuration.
 - LOW: Tests that inspect stderr assume stable diagnostic fragments such as `abacus: fatal`, `occupied by a live daemon`, and `protocol fault`.
 
 </known-hazards>

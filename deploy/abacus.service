@@ -1,0 +1,29 @@
+# Abacus daemon. Install: see docs/OPERATION.md.
+[Unit]
+Description=Abacus coordination daemon
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/abacus --socket-path=/run/abacus/abacus.sock
+RuntimeDirectory=abacus
+RuntimeDirectoryMode=0755
+# One fd and one mapping per interlock; the default cap is 4096 interlocks.
+LimitNOFILE=16384
+# Allow mlockall(MCL_CURRENT | MCL_FUTURE) to pin all pages and prevent cold-page faults.
+LimitMEMLOCK=infinity
+Restart=always
+RestartSec=100ms
+KillSignal=SIGTERM
+TimeoutStopSec=2
+
+# Deployment choices, not daemon choices. Core 4 is the first isolated core on the target
+# (isolcpus=4-11). The loop is a ppoll to the next millisecond boundary, so it yields every
+# cycle and SCHED_FIFO cannot starve the core it owns. Record the probe numbers
+# (docs/OPERATION.md) against an unpinned run before treating these as settled.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+CPUAffinity=4
+
+[Install]
+WantedBy=multi-user.target

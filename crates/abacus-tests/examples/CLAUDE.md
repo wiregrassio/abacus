@@ -25,7 +25,7 @@ Run manually against a live daemon. Not consumed by other crates.
 
 ## Data Flow
 - Command-line arguments enter `main` as a probe mode, Unix-socket path, and optional numeric parameters.
-- `bench`, `cron`, and `barrier` create client-side Abacus RTS objects through `abacus_client` and wait for daemon-produced completion results.
+- `bench`, `cron`, and `barrier` create client-side Abacus objects through `abacus_client` and wait for daemon-produced completion results.
 - Timing samples and completion states are collected locally, sorted, summarized as percentile/statistical output, and written to stdout.
 - `partial` opens a raw Unix socket, writes two bytes of an assumed four-byte frame-length prefix, keeps the connection open for eight seconds, then closes it to probe incomplete-request handling.
 

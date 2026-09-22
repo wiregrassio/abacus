@@ -5,7 +5,7 @@
 //! with `-- --ignored`.
 //!
 //! The well-behaved check runs in a role child so a half-wedged daemon (wait_ms aborting on
-//! RTSTimeout) is a red test, not a dead test binary.
+//! DeliveryTimeout) is a red test, not a dead test binary.
 
 #![allow(non_snake_case)]
 

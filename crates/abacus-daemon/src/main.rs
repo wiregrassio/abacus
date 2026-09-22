@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use abacus_daemon::daemon::{daemon_run_with, DaemonConfig};
 use abacus_daemon::registry::DEFAULT_MAX_INTERLOCKS;
 
-const DEFAULT_SOCKET_PATH: &str = "/run/abacus-rts/abacus.sock";
+const DEFAULT_SOCKET_PATH: &str = "/run/abacus/abacus.sock";
 
 static STOP: AtomicBool = AtomicBool::new(false);
 

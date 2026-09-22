@@ -1,7 +1,7 @@
 
-# Abacus RTS design
+# Abacus design
 
-How and why Abacus RTS is shaped the way it is. The primitive, the tiers, the daemon loop, the
+How and why Abacus is shaped the way it is. The primitive, the tiers, the daemon loop, the
 SDK split, and the mechanisms that make crash-only coordination work. INTERFACE.md is the frozen
 contract surface; PHILOSOPHY.md is the design constitution; this file is the rationale and
 mechanism between them.
@@ -280,7 +280,7 @@ SDK: `WaitTimer::wait_ms_with_margin(ms, margin_ms)` reads the clock, returns im
 `Normal` if `ms == 0`, rejects `margin_ms <= ms`, CAS-maxes `clock_now + ms` into
 `open_count`, arms TTL to `margin_ms`, and loops on `closed_count`. If `now_ns >= deadline_ns`
 without delivery, `on_timeout` applies the policy: `TimeoutPolicy::Error` returns
-`SdkError::RtsTimeout`; `TimeoutPolicy::Abort` (default) prints diagnostics and calls
+`SdkError::DeliveryTimeout`; `TimeoutPolicy::Abort` (default) prints diagnostics and calls
 `std::process::abort()`. The margin defaults to `max(2 * ms, MIN_FATAL_MARGIN_MS)` where
 `MIN_FATAL_MARGIN_MS` is 50. A daemon restart is discovered exactly here: nobody stamps and the
 margin expires.

@@ -1,4 +1,4 @@
-//! Abacus RTS client SDK: connect to the daemon, create and attach interlocks, and wait on
+//! Abacus client SDK: connect to the daemon, create and attach interlocks, and wait on
 //! them through typed handles with a shared keepalive thread and fatal-timeout handling.
 
 #![warn(missing_docs)]

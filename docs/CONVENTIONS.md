@@ -23,7 +23,7 @@ cargo test --workspace
 
 ```rust
 #[cfg(not(target_os = "linux"))]
-compile_error!("abacus-rts is Linux-only: memfd, futex, SCM_RIGHTS");
+compile_error!("abacus is Linux-only: memfd, futex, SCM_RIGHTS");
 ```
 
 - Little-endian is also a compile-time assertion, in `crates/abacus-core/src/clock.rs`:
@@ -113,8 +113,8 @@ working directory.
 
    ```bash
    rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock \
-     ./ <jetson-host>:~/abacus-rts-tests/
-   ssh <jetson-host> 'export PATH=$HOME/.cargo/bin:$PATH; cd ~/abacus-rts-tests && \
+     ./ <jetson-host>:~/abacus-tests/
+   ssh <jetson-host> 'export PATH=$HOME/.cargo/bin:$PATH; cd ~/abacus-tests && \
      cargo build --workspace --release'
    ```
 

@@ -1,6 +1,6 @@
 //! WaitTimer: a WaitCounter on clock.open_count with a fatal margin. If the daemon does not
 //! deliver within the margin it is dead, and the timer either aborts the process or returns
-//! `RtsTimeout`, per the client's `TimeoutPolicy`.
+//! `DeliveryTimeout`, per the client's `TimeoutPolicy`.
 
 use std::sync::atomic::Ordering;
 
@@ -72,7 +72,7 @@ impl WaitTimer {
     ///
     /// On `Normal` or `Overrun` delivery returns the result. On a missed margin: with
     /// `TimeoutPolicy::Abort` prints a diagnostic and aborts the process; with
-    /// `TimeoutPolicy::Error` returns `Err(RtsTimeout)`. `Err(InterlockReaped)` if the timer
+    /// `TimeoutPolicy::Error` returns `Err(DeliveryTimeout)`. `Err(InterlockReaped)` if the timer
     /// is terminated before delivery.
     pub fn wait_ms_with_margin(&self, ms: u64, margin_ms: u64) -> Result<WaitResult, SdkError> {
         let words = self.handle.words();
@@ -159,10 +159,10 @@ impl WaitTimer {
         closed: u64,
     ) -> Result<WaitResult, SdkError> {
         match self.policy {
-            TimeoutPolicy::Error => Err(SdkError::RtsTimeout),
+            TimeoutPolicy::Error => Err(SdkError::DeliveryTimeout),
             TimeoutPolicy::Abort => {
                 eprintln!(
-                    "abacus: RTSTimeout: daemon did not deliver within {margin_ms}ms \
+                    "abacus: DeliveryTimeout: daemon did not deliver within {margin_ms}ms \
                      (wait={ms}ms, target={target}, open={open}, closed={closed}); aborting"
                 );
                 std::process::abort();

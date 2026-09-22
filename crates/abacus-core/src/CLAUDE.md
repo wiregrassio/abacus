@@ -2,7 +2,7 @@
 
 # crates/abacus-core/src/
 
-Abacus RTS's Linux-only shared core implements sealed memfd-backed interlocks, monotonic-clock and futex primitives, and the error vocabulary used across daemon and SDK boundaries.
+Abacus's Linux-only shared core implements sealed memfd-backed interlocks, monotonic-clock and futex primitives, and the error vocabulary used across daemon and SDK boundaries.
 
 </purpose>
 

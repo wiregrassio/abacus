@@ -1,7 +1,7 @@
 
 # Abacus
 
-Abacus RTS (Real-Time Scheduler): lockless atomic coordination for real-time compute. One primitive (the interlock), a crash-only daemon that evaluates five tiers on a 1 ms cadence, and a Rust SDK of typed handles.
+Abacus (Real-Time Scheduler): lockless atomic coordination for real-time compute. One primitive (the interlock), a crash-only daemon that evaluates five tiers on a 1 ms cadence, and a Rust SDK of typed handles.
 
 An interlock is three `u64` words in a sealed memfd: `open_count`, `closed_count`, `expiration_ns`. The counters are futex-waitable, monotonic, and incremented by arbitrary amounts. Applications create and attach interlocks by name over a Unix-domain socket; the daemon hands back a duplicated descriptor via `SCM_RIGHTS`, and from then on all state lives in shared memory. Waiting costs a futex sleep, not a round trip.
 
@@ -74,7 +74,7 @@ Long-running timing, soak, and hostile-environment suites are marked `#[ignore]`
 
 ## Deploy
 
-`deploy/abacus-rts.service` is the systemd unit. It creates `/run/abacus-rts` and launches the daemon on `/run/abacus-rts/abacus.sock`. Install steps, the socket permission model, and the file-descriptor limit are in `docs/OPERATION.md`.
+`deploy/abacus.service` is the systemd unit. It creates `/run/abacus` and launches the daemon on `/run/abacus/abacus.sock`. Install steps, the socket permission model, and the file-descriptor limit are in `docs/OPERATION.md`.
 
 The daemon is crash-only by design. `panic = "abort"` is deliberate: a panic terminates the process rather than unwinding through a half-evaluated registry. A restart comes back empty, wakes no one, and every timer discovers the restart through its own fatal margin.
 

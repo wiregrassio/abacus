@@ -1,6 +1,6 @@
 # crates/abacus-wire/
 
-`abacus-wire` is the shared protocol boundary for Abacus RTS components communicating over Unix-domain streams. It contains the v1 message encoding, bounded length-prefixed framing, and support for passing file descriptors through Unix socket ancillary data.
+`abacus-wire` is the shared protocol boundary for Abacus components communicating over Unix-domain streams. It contains the v1 message encoding, bounded length-prefixed framing, and support for passing file descriptors through Unix socket ancillary data.
 
 Use this crate when implementing either side of the protocol. Construct requests or responses using its public protocol API, serialize and frame them for transport, and decode received frames back into protocol values. Responses that can carry file descriptors require separate validation of the received descriptor count.
 
@@ -60,6 +60,6 @@ When reading the implementation, start with the public exports in `src/lib.rs`, 
 ### Cargo.toml
 | Symbol | Kind | Purpose | Rationale |
 |---|---|---|---|
-| `abacus-wire` | crate | Packages the shared Abacus RTS v1 wire-protocol implementation. | Keeps daemon and SDK protocol behavior in a common dependency rather than coupling either implementation directly to the other. |
+| `abacus-wire` | crate | Packages the shared Abacus v1 wire-protocol implementation. | Keeps daemon and SDK protocol behavior in a common dependency rather than coupling either implementation directly to the other. |
 
 </symbol-table>

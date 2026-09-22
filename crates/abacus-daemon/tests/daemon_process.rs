@@ -40,7 +40,7 @@ fn daemon__starts_and_serves_within_500ms() {
 }
 
 /// `main.rs`: `--socket-path=<path>` and `--socket-path <path>` both select the socket; with
-/// no argument the daemon uses `/run/abacus-rts/abacus.sock`. On a host where that directory
+/// no argument the daemon uses `/run/abacus/abacus.sock`. On a host where that directory
 /// is absent the daemon exits 1 with a bind failure (ENOENT); where it exists the socket
 /// appears there. Both branches check the same default path. The fatal line does not name
 /// the path it failed to bind.
@@ -216,8 +216,8 @@ fn daemon__sigkill_leaves_stale_socket_that_next_start_replaces() {
 
 /// ARCHITECTURE.md, README: a daemon restart wakes nobody and every waiter
 /// discovers it through its own futex timeout. With today's abort policy the waiting child
-/// dies by SIGABRT (RTSTimeout) within 2x its wait; the child instead reports
-/// `Err(SdkError::RtsTimeout)` under `TimeoutPolicy::Error` (). Then a
+/// dies by SIGABRT (DeliveryTimeout) within 2x its wait; the child instead reports
+/// `Err(SdkError::DeliveryTimeout)` under `TimeoutPolicy::Error` (). Then a
 /// fresh client connects and creates on the new daemon.
 #[test]
 fn daemon__restart_wakes_nobody_and_timers_time_out() {
@@ -254,7 +254,7 @@ fn daemon__restart_wakes_nobody_and_timers_time_out() {
     assert_eq!(
         status.signal(),
         Some(libc::SIGABRT),
-        "waiter should die by RTSTimeout abort after the restart, ended with {} after {waited:?}",
+        "waiter should die by DeliveryTimeout abort after the restart, ended with {} after {waited:?}",
         describe_exit(&status)
     );
     assert!(
@@ -476,7 +476,7 @@ fn role__create_and_advance() {
 }
 
 /// Role: connect to `args[0]`, create WaitTimer `args[1]`, `wait_ms(args[2])`. Exits 3 if the
-/// wait returns Ok, 4 on Err; the parent expects neither (SIGABRT from RTSTimeout). Not a
+/// wait returns Ok, 4 on Err; the parent expects neither (SIGABRT from DeliveryTimeout). Not a
 /// test; spawned by `daemon__restart_wakes_nobody_and_timers_time_out`.
 #[test]
 #[ignore = "role: process entry point for daemon__restart_wakes_nobody_and_timers_time_out"]

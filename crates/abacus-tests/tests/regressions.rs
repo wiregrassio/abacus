@@ -53,7 +53,7 @@ fn cron_fires_on_grid_without_drift() {
     );
 }
 
-/// With TimeoutPolicy::Error a stopped daemon produces RtsTimeout within the
+/// With TimeoutPolicy::Error a stopped daemon produces DeliveryTimeout within the
 /// margin, and the margin has a floor.
 #[test]
 fn timer_error_policy_returns_rts_timeout_within_margin() {
@@ -71,7 +71,7 @@ fn timer_error_policy_returns_rts_timeout_within_margin() {
     let t0 = Instant::now();
     let r = timer.wait_ms(5);
     let elapsed = t0.elapsed();
-    assert_eq!(r, Err(SdkError::RtsTimeout));
+    assert_eq!(r, Err(SdkError::DeliveryTimeout));
     assert!(
         elapsed >= Duration::from_millis(MIN_FATAL_MARGIN_MS),
         "returned early: {elapsed:?}"
@@ -83,7 +83,10 @@ fn timer_error_policy_returns_rts_timeout_within_margin() {
 
     // Per-call margin.
     let t0 = Instant::now();
-    assert_eq!(timer.wait_ms_with_margin(5, 60), Err(SdkError::RtsTimeout));
+    assert_eq!(
+        timer.wait_ms_with_margin(5, 60),
+        Err(SdkError::DeliveryTimeout)
+    );
     assert!(t0.elapsed() >= Duration::from_millis(60));
     // A margin that cannot work is rejected up front.
     assert!(matches!(
@@ -123,7 +126,7 @@ fn timer_abort_policy_aborts_the_process() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("RTSTimeout"), "stderr: {stderr}");
+    assert!(stderr.contains("DeliveryTimeout"), "stderr: {stderr}");
 }
 
 /// wait_ms(0) returns at once without arming.

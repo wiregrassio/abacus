@@ -1,7 +1,7 @@
 
 # docs/
 
-Design philosophy, mechanism, interface surface, conventions, operations, and deferred work for the Abacus RTS interlock daemon and SDK.
+Design philosophy, mechanism, interface surface, conventions, operations, and deferred work for the Abacus interlock daemon and SDK.
 
 ## Files
 

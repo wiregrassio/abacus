@@ -1,4 +1,4 @@
-//! Abacus RTS wire protocol v1, shared by the daemon and the client SDK: the request and
+//! Abacus wire protocol v1, shared by the daemon and the client SDK: the request and
 //! response codec, length-prefixed framing, and SCM_RIGHTS fd passing over a Unix stream.
 //!
 //! Neither side depends on the other for wire types; both depend on this crate.

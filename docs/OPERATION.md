@@ -1,6 +1,6 @@
 # Operations
 
-Running Abacus RTS as a service, what it needs from the host, how to read it, and the measured
+Running Abacus as a service, what it needs from the host, how to read it, and the measured
 numbers behind the defaults.
 
 ## Install
@@ -8,30 +8,30 @@ numbers behind the defaults.
 ```bash
 cargo build --release -p abacus-daemon
 sudo install -m 0755 target/release/abacus /usr/local/bin/abacus
-sudo install -m 0644 deploy/abacus-rts.service /etc/systemd/system/abacus-rts.service
+sudo install -m 0644 deploy/abacus.service /etc/systemd/system/abacus.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now abacus-rts
-systemctl status abacus-rts
+sudo systemctl enable --now abacus
+systemctl status abacus
 ```
 
-The unit runs `abacus --socket-path=/run/abacus-rts/abacus.sock` with `RuntimeDirectory=`
-creating `/run/abacus-rts`, `Restart=always` with a 100 ms delay, and `KillSignal=SIGTERM`.
+The unit runs `abacus --socket-path=/run/abacus/abacus.sock` with `RuntimeDirectory=`
+creating `/run/abacus`, `Restart=always` with a 100 ms delay, and `KillSignal=SIGTERM`.
 On SIGTERM or SIGINT the daemon exits 0 within a millisecond and removes its socket file. A
 stale socket file left by a SIGKILL is replaced on the next start; a live daemon on the path
 makes the second instance exit 1.
 
 ## Socket path and permissions
 
-Abacus RTS trusts every local process that can open its socket (INTERFACE.md, Trust model). The
+Abacus trusts every local process that can open its socket (INTERFACE.md, Trust model). The
 socket file is created and chmoded to `--socket-mode` (default 0660) after binding. To restrict it to a group:
 
 ```
-ExecStart=/usr/local/bin/abacus --socket-path=/run/abacus-rts/abacus.sock --socket-group=abacus
+ExecStart=/usr/local/bin/abacus --socket-path=/run/abacus/abacus.sock --socket-group=abacus
 ```
 
 `--socket-group` names a group that must exist; the daemon exits 1 if it does not. Clients
 then need membership in that group. Containerized clients reach the socket by bind-mounting
-`/run/abacus-rts` into the pod.
+`/run/abacus` into the pod.
 
 ## Limits
 
@@ -42,18 +42,17 @@ connections, and the fds in flight all fit. Names are 1 to 255 bytes.
 
 ## Scheduling and pinning
 
-The daemon runs unpinned, SCHED_OTHER, and sets only its own timer slack (1 ns). Whether to
-pin it to an isolated core with real-time priority is a deployment decision; the unit carries
-the three lines commented out:
+The daemon sets its own timer slack (1 ns). The unit pins it to core 4 with real-time
+priority:
 
 ```
-#CPUSchedulingPolicy=fifo
-#CPUSchedulingPriority=50
-#CPUAffinity=11
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+CPUAffinity=4
 ```
 
-The numbers below were taken without them. Take the same numbers with them before committing
-to the change: on a box with nothing else contending, the unpinned daemon already lands
+The numbers below were taken unpinned. Take the same numbers pinned before treating the
+change as settled: on a box with nothing else contending, the unpinned daemon already lands
 timers on the boundary.
 
 Pinning is not isolation. A daemon pinned to a shared core (one that other processes can
@@ -66,7 +65,7 @@ exists: it absorbs the scheduling jitter that pinning alone does not prevent.
 
 ## Reading the log
 
-The daemon writes one line per event to stderr (`journalctl -u abacus-rts`):
+The daemon writes one line per event to stderr (`journalctl -u abacus`):
 
 | Line | Meaning |
 |------|---------|
@@ -88,8 +87,8 @@ The daemon holds no durable state; a restart comes back empty. Existing mappings
 (the memfds live as long as any holder maps them) but nothing evaluates them:
 
 - A WaitTimer waiting through the restart hits its fatal margin, `max(2 * W, 50 ms)`: under
-  `TimeoutPolicy::Abort` (default) the process aborts with an `RTSTimeout` line on stderr;
-  under `TimeoutPolicy::Error` the call returns `Err(RtsTimeout)`.
+  `TimeoutPolicy::Abort` (default) the process aborts with an `DeliveryTimeout` line on stderr;
+  under `TimeoutPolicy::Error` the call returns `Err(DeliveryTimeout)`.
 - Every wait path (bare interlocks, WaitCron, WaitBarrier, and the clock) returns
   `InterlockReaped` within 100 ms (the clock's TTL). The clock interlock is daemon-owned and
   read-only to clients; after daemon death its expiration lapses and every wait loop detects it.

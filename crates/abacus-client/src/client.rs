@@ -63,7 +63,7 @@ pub enum SdkError {
         message: String,
     },
     /// A WaitTimer's fatal margin elapsed without delivery, under `TimeoutPolicy::Error`.
-    RtsTimeout,
+    DeliveryTimeout,
 }
 
 impl std::fmt::Display for SdkError {
@@ -76,7 +76,10 @@ impl std::fmt::Display for SdkError {
             Self::MmapFailed { message } => write!(f, "mmap failed: {message}"),
             Self::InvalidRequest { message } => write!(f, "invalid request: {message}"),
             Self::UnexpectedResponse { message } => write!(f, "unexpected response: {message}"),
-            Self::RtsTimeout => write!(f, "RTSTimeout: daemon did not deliver within the margin"),
+            Self::DeliveryTimeout => write!(
+                f,
+                "DeliveryTimeout: daemon did not deliver within the margin"
+            ),
         }
     }
 }
@@ -590,7 +593,7 @@ mod tests {
             SdkError::UnexpectedResponse {
                 message: "m".into(),
             },
-            SdkError::RtsTimeout,
+            SdkError::DeliveryTimeout,
         ];
         for v in variants {
             assert!(!v.to_string().is_empty());

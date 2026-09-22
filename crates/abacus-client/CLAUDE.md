@@ -2,7 +2,7 @@
 
 # crates/abacus-client/
 
-The Abacus RTS Rust client SDK: daemon-backed shared-memory interlocks and wait primitives.
+The Abacus Rust client SDK: daemon-backed shared-memory interlocks and wait primitives.
 
 </purpose>
 

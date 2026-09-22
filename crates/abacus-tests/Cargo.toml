@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Integration tests and test kit for Abacus RTS"
+description = "Integration tests and test kit for Abacus"
 
 [dependencies]
 abacus-core = { workspace = true }
