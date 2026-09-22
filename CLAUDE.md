@@ -48,6 +48,6 @@ Lockless atomic coordination for real-time compute: one primitive (the interlock
 | Directory | Purpose |
 |-----------|---------|
 | `crates/` | The five workspace crates: `abacus-core` (24-byte interlock, memfd, futex, clock, shared errors), `abacus-wire` (v1 codec, framing, SCM_RIGHTS descriptor passing), `abacus-daemon` (registry, transport, 1 ms loop, the `abacus` binary), `abacus-client` (typed handles, wait tiers, keepalive, compositions), `abacus-tests` (shared test kit plus the L1 through L4 integration suites and the `probe` example). |
-| `docs/` | Design philosophy, normative contracts (ARCHITECTURE, CONTRACTS, LIFECYCLE, SURFACE, VOCABULARY), conventions, operation, testing, open issues, and backlog. |
+| `docs/` | Design philosophy (PHILOSOPHY), mechanism and rationale (DESIGN), frozen interface surface (INTERFACE), conventions, operation, and backlog. |
 | `deploy/` | The systemd unit `abacus-rts.service`: runtime directory, socket path argument, restart policy, descriptor limit, and the commented-out real-time scheduling knobs. |
 | `.github/workflows/` | CI on Linux: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build --workspace`, `cargo test --workspace`. |

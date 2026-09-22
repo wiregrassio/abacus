@@ -22,7 +22,7 @@ makes the second instance exit 1.
 
 ## Socket path and permissions
 
-Abacus RTS trusts every local process that can open its socket (CONTRACTS.md, Trust model). The
+Abacus RTS trusts every local process that can open its socket (INTERFACE.md, Trust model). The
 socket file is created and chmoded to `--socket-mode` (default 0660) after binding. To restrict it to a group:
 
 ```

@@ -63,8 +63,8 @@ cargo run -p abacus-tests --example probe -- cron /tmp/abacus-probe.sock 10 200
 | `crates/abacus-daemon` | The `abacus` binary plus `daemon`, `registry`, `transport` |
 | `crates/abacus-client` | Typed SDK handles and compositions |
 | `crates/abacus-tests` | Shared test kit, integration suites, probes |
-| `docs/` | `ARCHITECTURE.md`, `CONTRACTS.md`, `LIFECYCLE.md`, `SURFACE.md` |
-| `docs/` | `OPERATION.md`, `TESTING.md`, `BACKLOG.md` |
+| `docs/` | `PHILOSOPHY.md`, `DESIGN.md`, `INTERFACE.md`, `CONVENTIONS.md` |
+| `docs/` | `OPERATION.md`, `BACKLOG.md` |
 | `deploy/` | `abacus-rts.service` |
 
 The crate split is an ABI boundary, not a filing convention. Shared-memory word layout, wire framing, descriptor cardinality, sentinel meaning, and futex behavior must stay synchronized across four independently compiled crates. `abacus-client` must not depend on `abacus-daemon`; both depend on `abacus-wire`, and `wire_crate.rs` asserts that by reading the manifests.
@@ -144,7 +144,7 @@ const EVALUATE_1000_MEDIAN_CEILING_US: u128 = if cfg!(debug_assertions) { 200 } 
 
 L3 assertions are only meaningful on isolated CPU cores: a Jetson-class board or equivalent with kernel-level CPU isolation. Affinity alone is not isolation. Without `isolcpus` (or equivalent), scheduler stalls beyond 10 ms remain possible, and the 50 ms fatal-margin floor (`MIN_FATAL_MARGIN_MS`) is an operational defense against observed jitter, not a proof of real-time behavior.
 
-The test side reads `/sys/devices/system/cpu/isolated` through `daemon_core()` and falls back to the last online core when nothing is isolated. `timing_load.rs` pins the daemon to that core and the load threads elsewhere. Do not report a latency number without its profile: a figure without conditions is a number, not evidence. Measured numbers with their conditions belong in `docs/OPERATION.md`; the run procedure belongs in `docs/TESTING.md`.
+The test side reads `/sys/devices/system/cpu/isolated` through `daemon_core()` and falls back to the last online core when nothing is isolated. `timing_load.rs` pins the daemon to that core and the load threads elsewhere. Do not report a latency number without its profile: a figure without conditions is a number, not evidence. Measured numbers with their conditions belong in `docs/OPERATION.md`; the run procedure belongs in `docs/CONVENTIONS.md`.
 
 If a timing test fails on a shared or loaded host, say so in the report rather than raising the ceiling. Raising a threshold to make a host pass is a change to the claim, and it needs the same scrutiny as a change to the code.
 
@@ -179,7 +179,7 @@ Where the ABI is currently insufficient (wire v1's `Attached` response carries a
 - Every directory carries a `CLAUDE.md` with the same sections: Purpose, Dependencies, Consumed By, Data Flow, Known Hazards, Files, Subdirectories, Contracts, Notes, Reference. Hazards are severity-tagged (CRITICAL, HIGH, MEDIUM, LOW). If you add a directory, add its `CLAUDE.md`. If you add a hazard, tag it.
 - Cite `file::symbol`, not line numbers.
 - Tables over prose for contracts.
-- The four design documents do not blur: `ARCHITECTURE.md` is rationale, `CONTRACTS.md` is frozen boundaries, `LIFECYCLE.md` is internal mechanism, `SURFACE.md` is the consumer API.
+- The design documents do not blur: `PHILOSOPHY.md` is the design constitution, `DESIGN.md` is mechanism and rationale, `INTERFACE.md` is frozen boundaries and the consumer API, `CONVENTIONS.md` is code style and test conventions.
 - Design docs describe what exists. Deferred and planned work goes to `docs/BACKLOG.md` with its integration trigger.
 - Measured numbers go to `docs/OPERATION.md` with the conditions that produced them. Measured behavior does not silently redefine the ABI.
 

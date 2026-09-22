@@ -7,6 +7,30 @@ An interlock is three `u64` words in a sealed memfd: `open_count`, `closed_count
 
 The clock is itself an interlock named `clock`: `open_count` is the current monotonic millisecond, `closed_count` the daemon start time. A timer is a counter watching it.
 
+## Design motivation
+
+Abacus is built for pipelines where a missed wake is a dropped frame and a stuck wait is a
+hung pipeline: machine vision, robotics, edge inference, video processing. In these systems
+a process that crashes mid-cycle cannot be nursed back to health. The only correct recovery
+is to terminate, let the supervisor restart it, and resume processing from a known-good
+state. There is no time to reconstruct what was happening; there is only time to start
+again.
+
+This constraint shaped every design decision:
+
+- **Crash-only.** The daemon holds no durable state. `panic = "abort"`. A restart comes back
+  empty, and that is correct behavior. No journal, no snapshot, no reconciliation.
+- **Fail-loud.** A timed wait that misses its deadline by more than 2x aborts the process by
+  default, because a real-time stage that missed its budget has already failed. Silent
+  degradation is the failure mode this design eliminates.
+- **Lifecycle from the primitive.** Liveness is a deadline in shared memory. Stop extending it
+  and you are dead by definition. The daemon reaps you; your peers learn from the memory they
+  already hold. No release call, no reference counting, no cleanup protocol.
+- **Minimal dependencies.** One runtime dependency: `libc`. No async runtime, no allocator, no
+  framework. The daemon loop is a hand-rolled `ppoll` with nanosecond timeouts anchored to a
+  fixed origin. For a 1 ms cadence, anything between you and the kernel is latency you chose
+  to add.
+
 ## The five tiers
 
 Every wait type is a contract layered over the one interlock primitive. None is a separate primitive.
@@ -46,7 +70,7 @@ cargo fmt --all -- --check
 
 `cargo test` starts daemons on unique sockets under `/tmp` and stops them. It never touches a production socket. The process-level tests run the real binary as a child process.
 
-Long-running timing, soak, and hostile-environment suites are marked `#[ignore]` and run with `--ignored`. See `docs/TESTING.md` for the procedure and `docs/OPERATION.md` for measured numbers.
+Long-running timing, soak, and hostile-environment suites are marked `#[ignore]` and run with `--ignored`. See `docs/CONVENTIONS.md` for the procedure and `docs/OPERATION.md` for measured numbers.
 
 ## Deploy
 
@@ -71,23 +95,44 @@ All guarantees hold on an isolated core (`isolcpus` or cpuset shield). Non-isola
 Cadence is 1 ms with sub-millisecond median jitter on an isolated core. Full measurement
 tables with conditions in `docs/OPERATION.md`.
 
-Full measurement tables with conditions in `docs/OPERATION.md`.
+## Why not X?
 
-## CLAUDE.md convention
+Coordination between processes on one host has two failure axes: **wake latency** (does the
+signal arrive inside the frame budget?) and **crash liveness** (if the signaling process dies,
+does the pipeline wedge?). Every common alternative fails at least one.
 
-`CLAUDE.md` files are agent context maps, auto-injected root-to-leaf by Claude Code when it
-reads a file in the directory. They serve as machine-readable directory maps. `README.md` files
-are for humans and live at crate roots and top-level directories only.
+| | Wake latency | Crash-safe | Lifecycle | Dependencies | Scope |
+|---|---|---|---|---|---|
+| Raw futex | sub-us | no | none | libc | mechanism |
+| POSIX semaphore | sub-us | no | none | libc | mechanism |
+| pthread condvar | sub-us | partial | none | libc | mechanism |
+| eventfd | ~us (syscall each) | no | none | libc | mechanism |
+| Redis pub/sub | 30-200+ us | yes | yes | Redis server | service |
+| D-Bus | ms | yes | yes | dbus-daemon | service |
+| iceoryx2 | sub-us | yes | yes | iceoryx2 runtime | framework |
+| **Abacus** | **sub-us** | **yes** | **yes (TTL + reaper)** | **libc** | **primitive** |
+
+The fast primitives (futex, semaphore, condvar, eventfd) provide the wake mechanism but no
+crash recovery: a process that dies leaves waiters stuck and no one learns about it from the
+primitive itself. The crash-safe services (Redis, D-Bus) add socket transport and
+serialization overhead that exceeds a sub-millisecond frame budget.
+
+[iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) is the closest comparison: Rust
+core, shared memory, sub-microsecond, with stale-resource cleanup after process death. It is
+a service-oriented zero-copy IPC framework (pub/sub, request-response, service discovery,
+C/C++ bindings). Abacus is not a data plane. It is a coordination primitive: three u64 words
+in a sealed memfd, a crash-only daemon, and a typed SDK with `libc` as the only dependency.
+Use iceoryx2 to move buffers through a service graph. Use Abacus to coordinate timing,
+liveness, and sequencing between processes that need to survive each other's crashes.
 
 ## Documentation
 
-- `docs/ARCHITECTURE.md`: why the primitive, the tiers, the loop, and the TTL model are shaped this way.
-- `docs/CONTRACTS.md`: the frozen daemon, SDK, shared-memory, and wire contracts.
-- `docs/LIFECYCLE.md`: interlock states and daemon evaluation order.
-- `docs/SURFACE.md`: the public Rust SDK.
+- `docs/PHILOSOPHY.md`: the design constitution, eight laws governing every architectural choice.
+- `docs/DESIGN.md`: mechanism and rationale: the primitive, five tiers, the clock, daemon evaluation, TTL, death detection, trust model.
+- `docs/INTERFACE.md`: frozen interface surface: wire ABI v1, SDK API, per-tier field semantics, permissions, errors, termination.
+- `docs/CONVENTIONS.md`: code style, naming, test conventions (layers, adding tests, timing procedure).
 - `docs/OPERATION.md`: installation, permissions, capacity, scheduling, measured performance.
-- `docs/TESTING.md`: test layers and cadence.
-- `docs/BACKLOG.md`: deferred work, including the wire v2 changes that boolean compositions and tier-aware attachment require.
+- `docs/BACKLOG.md`: design limits, deferred work (wire v2, FFI, boolean compositions), known defects.
 
 ## License
 

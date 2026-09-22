@@ -1,45 +1,10 @@
 
 # Conventions
 
-Repository, code, and documentation conventions for this project. These exist so the
+Code, documentation, and test conventions for this project. These exist so the
 project reads as one coherent thing regardless of who wrote a given piece. They are
 conventions, not the design law (the law is in PHILOSOPHY.md), but they are enforced
 in review all the same.
-
-## Repository layout
-
-| Path | Contents |
-|------|----------|
-| `Cargo.toml` | Workspace root: members, shared package metadata, shared dependency versions, release profile (`panic = "abort"`). Source: root `CLAUDE.md`. |
-| `Cargo.lock` | Committed, because the workspace ships a binary. Source: root `CLAUDE.md`. |
-| `rustfmt.toml` | Formatter configuration, checked in CI. Source: root `CLAUDE.md`. |
-| `crates/` | Five workspace crates. Source: `crates/CLAUDE.md`. |
-| `docs/` | `OPERATION.md`, `TESTING.md`, `BACKLOG.md`. Source: `docs/CLAUDE.md`. |
-| `docs/` | `ARCHITECTURE.md` (rationale), `CONTRACTS.md` (frozen boundaries), `LIFECYCLE.md` (mechanism), `SURFACE.md` (consumer API). Source: `docs/CLAUDE.md`. |
-| `deploy/` | `abacus-rts.service`, the systemd unit. Source: `deploy/CLAUDE.md`. |
-| `.github/workflows/` | CI: fmt, clippy, build, test. Source: root `CLAUDE.md`. |
-
-Crate organization, per `crates/CLAUDE.md`:
-
-| Crate | Role | Depends on |
-|-------|------|------------|
-| `abacus-core` | Shared-memory interlock layout, clock, futex, errors | `libc` |
-| `abacus-wire` | Protocol v1 framing, codec, SCM_RIGHTS transfer | `abacus-core`, `libc` |
-| `abacus-daemon` | `abacus` binary plus library (`daemon`, `registry`, `transport`) | `abacus-core`, `abacus-wire`, `libc` |
-| `abacus-client` | Typed SDK handles and compositions | `abacus-core`, `abacus-wire`, `libc` |
-| `abacus-tests` | Shared test kit plus integration suites and probes | all four, `libc` |
-
-The crate split is an ABI boundary, not an organizational one: shared-memory word
-layout, wire framing, descriptor transfer, sentinel values, and futex behavior must
-stay synchronized across the independently compiled crates (root `CLAUDE.md`).
-
-Test locations:
-
-- L0 unit tests live beside the code: inline `#[cfg(test)] mod tests` (`crates/abacus-core/src/clock.rs`, `crates/abacus-wire/src/codec.rs`) or a `src/tests/` module tree (`crates/abacus-core/src/tests/mod.rs`, `crates/abacus-daemon/src/tests/mod.rs`).
-- L2 process tests live in `crates/abacus-daemon/tests/`, with shared helpers in `crates/abacus-daemon/tests/common/mod.rs`.
-- L1 through L4 integration tests live in `crates/abacus-tests/tests/`, one file per area.
-- Shared test infrastructure lives in `crates/abacus-tests/src/lib.rs`.
-- Operational probes live in `crates/abacus-tests/examples/probe.rs`.
 
 ## Language and tooling
 
@@ -124,15 +89,67 @@ Files:
 
 ## Test conventions
 
-Five layers (`docs/TESTING.md`, and the CLAUDE.md files that describe each directory):
+### Layers
 
-| Layer | What it is | Where |
-|-------|-----------|-------|
-| L0 | Unit tests, no daemon loop | `crates/*/src/tests/`, inline `mod tests` |
-| L1 | In-process integration against `ThreadDaemon` | `crates/abacus-tests/tests/` (`interlock.rs`, `wait_*.rs`, `attached.rs`, `client.rs`) |
-| L2 | Process-level, real `abacus` binary as a child | `crates/abacus-daemon/tests/` |
-| L3 | Hardware timing and load benchmarks | `crates/abacus-tests/tests/timing_loop.rs`, `timing_load.rs` |
-| L4 | Abuse and soak | `crates/abacus-tests/tests/abuse_*.rs`, `soak_hour.rs` |
+| Layer | What it is | Where | Default run | Budget |
+|-------|-----------|-------|-------------|--------|
+| L0 | Unit tests, no daemon loop | `crates/*/src/tests/`, inline `mod tests` | yes | under 2 s |
+| L1 | In-process integration against `ThreadDaemon` | `crates/abacus-tests/tests/` (`interlock.rs`, `wait_*.rs`, `attached.rs`, `client.rs`) | yes | under 15 s |
+| L2 | Process-level, real `abacus` binary as a child | `crates/abacus-daemon/tests/` | yes | under 15 s |
+| L3 | Hardware timing and load benchmarks | `crates/abacus-tests/tests/timing_loop.rs`, `timing_load.rs` | no (`--ignored`) | under 3 min |
+| L4 | Abuse and soak | `crates/abacus-tests/tests/abuse_*.rs`, `soak_hour.rs` | no (`--ignored`) | under 5 min |
+
+Run one layer or one file: `cargo test -p abacus-tests --test wait_timer`,
+`cargo test -p abacus-daemon --test daemon_process`, `cargo test -p abacus-core --lib`.
+Add `-- --ignored` for L3 and L4 files. Either thread count must pass:
+`-- --test-threads=1` and `-- --test-threads=12`.
+
+### Quarterly run
+
+Linux only (memfd, futex, UDS). Run on an isolated-core Linux host in a dedicated
+working directory.
+
+1. Sync and build release:
+
+   ```bash
+   rsync -a --delete --exclude target --exclude .git --exclude Cargo.lock \
+     ./ <jetson-host>:~/abacus-rts-tests/
+   ssh <jetson-host> 'export PATH=$HOME/.cargo/bin:$PATH; cd ~/abacus-rts-tests && \
+     cargo build --workspace --release'
+   ```
+
+2. Default suite, L0 to L2. Must be green. Finishes in under 30 s. `--no-fail-fast` runs
+   every test binary instead of stopping at the first red crate:
+
+   ```bash
+   cargo test --workspace --no-fail-fast
+   ```
+
+3. Timing, abuse, and soak, L3 and L4. Must be green. Runs on an otherwise idle machine
+   (timing thresholds assume it). Add `ABACUS_SOAK=1` for the full one-hour soak; without it
+   the soak test runs a 60 s abbreviated pass with the same assertions:
+
+   ```bash
+   cargo test --workspace --release --no-fail-fast -- --ignored
+   ```
+
+4. `cargo audit` if installed. The only dependency is `libc`; note its version from
+   `Cargo.lock`.
+
+5. Anything red: the test's name is the claim that broke, and its doc comment cites the
+   contract section it guards.
+
+### Reading a failure
+
+- The libtest summary names the test. Its doc comment names the contract or finding.
+- Assertion messages print the observed state: counters, expiration, elapsed, and for timing
+  tests the percentile table (`n`, `p50`, `p90`, `p99`, `max`).
+- Randomized tests print their seed. Replay with `ABACUS_TEST_SEED=<seed>`.
+- Tests named `role__*` are not tests. They are process entry points: the test binary
+  re-executed as a child by the test named in their ignore reason. They report `ok` and do
+  nothing when run directly.
+
+### Writing tests
 
 One claim per test, and the name is the claim. `interlock__arm_never_decrements`
 (`crates/abacus-core/src/tests/interlock.rs`) asserts exactly that;
@@ -154,10 +171,41 @@ Related helpers: `wait_for_daemon`, `on_thread`, `recv_within`, `wait_child`, `r
 spawned waiter reach its futex before a stimulus is applied, never as the assertion's
 timing source.
 
+Never a fixed sleep as synchronization. Never a shared daemon between tests. Never an
+`unwrap()` on the result the test is about.
+
+Use the kit in `crates/abacus-tests/src/lib.rs`: `ThreadDaemon` (L1), `ProcessDaemon`
+(L2 to L4), `RawClient` for anything hostile or below the SDK, `wait_for` for every wait,
+`Stats` for anything measured, `Rng` for anything randomized.
+
+### Measurement and serialization
+
 Measurement tests take `serialized()`, a cross-binary file lock over
 `/tmp/abacus-test-serial.lock` plus a process-local mutex
 (`crates/abacus-tests/src/lib.rs::serialized`). Every abuse, timing, and soak test
 begins `let _serial = serialized();`.
+
+A test that measures time, CPU, or load holds `serialized()` for its whole body. Tests in
+one binary run on parallel threads; two load generators at once make every number
+meaningless.
+
+Load tests come in three shapes: unpinned 2x oversubscription (the worst case), the
+production profile (12 cores, 6 pegged, daemon pinned to one core), and a stress profile
+(4x on every non-daemon core). `ProcessDaemon::start_pinned`, `Load::cpu_on`, and
+`pin_current_thread` build them. The pinned profiles assert an isolated core; on a box
+where other processes can still run on the daemon's core they stay red and say so.
+
+Thresholds that differ between profiles use `cfg!(debug_assertions)` at the constant, not
+inside the assertion:
+
+```rust
+const EVALUATE_1000_MEDIAN_CEILING_US: u128 = if cfg!(debug_assertions) { 200 } else { 50 };
+```
+
+(`crates/abacus-daemon/src/tests/registry.rs`; same pattern in `timing_loop.rs`,
+`timing_load.rs`, and `daemon_process.rs`.)
+
+### Child process roles
 
 Child process entry points are `role__` functions, marked `#[test] #[ignore]` and
 guarded by `role_args`:
@@ -175,34 +223,30 @@ Parents dispatch with `role_command(name, args)`, which re-executes the current 
 binary with `--exact --ignored --nocapture --test-threads=1` and passes arguments
 through `ABACUS_TEST_ROLE` and `ABACUS_TEST_ROLE_ARGS`, U+001F separated
 (`crates/abacus-tests/src/lib.rs`). Roles exist where an SDK abort, a hung request, or a
-`SIGBUS` from a hostile mapping must not kill the parent test binary
-(`crates/abacus-tests/CLAUDE.md`).
+`SIGBUS` from a hostile mapping must not kill the parent test binary.
 
-Ignore reasons carry a category prefix and a justification:
+A client that can shrink a memfd must run in a role child process, along with any later
+check that maps the same daemon's memory. A shrunk memfd SIGBUSes every mapper.
+
+### Ignore reasons
+
+Every ignored test carries a reason starting with a category prefix:
 
 | Prefix | Meaning | Example |
 |--------|---------|---------|
-| `timing:` | Hardware-dependent benchmark | `#[ignore = "timing: run with --ignored on hardware"]` (`timing_loop.rs`) |
-| `abuse:` | Hostile-environment suite | `#[ignore = "abuse: run with --ignored"]` (`abuse_wire.rs`) |
-| `soak:` | Long-running | `#[ignore = "soak: run with --ignored; ABACUS_SOAK=1 for the full hour, else 60 s"]` (`soak_hour.rs`) |
-| `role:` | Child process entry point | `#[ignore = "role: process entry point for ..."]` (`daemon_process.rs`) |
+| `timing:` | Hardware-dependent benchmark | `#[ignore = "timing: run with --ignored on hardware"]` |
+| `abuse:` | Hostile-environment suite | `#[ignore = "abuse: run with --ignored"]` |
+| `soak:` | Long-running | `#[ignore = "soak: run with --ignored; ABACUS_SOAK=1 for the full hour, else 60 s"]` |
+| `role:` | Child process entry point | `#[ignore = "role: process entry point for ..."]` |
 
-Thresholds that differ between profiles use `cfg!(debug_assertions)` at the constant, not
-inside the assertion:
-
-```rust
-const EVALUATE_1000_MEDIAN_CEILING_US: u128 = if cfg!(debug_assertions) { 200 } else { 50 };
-```
-
-(`crates/abacus-daemon/src/tests/registry.rs`; same pattern in `timing_loop.rs`,
-`timing_load.rs`, and `daemon_process.rs`.)
+### Process-level tests
 
 Process-level tests run the real binary. The path comes from `CARGO_BIN_EXE_abacus`
 (`crates/abacus-daemon/tests/common/mod.rs::BIN`) or from
 `abacus_binary()` (`crates/abacus-tests/src/lib.rs`), which falls back to a sibling
 `abacus` in the target directory and panics with build instructions when absent. Each
 daemon gets a unique socket under `/tmp` via `unique_socket_path(label)`, and labels are
-capped at 40 bytes. `cargo test` never touches a production socket (root `CLAUDE.md`).
+capped at 40 bytes. `cargo test` never touches a production socket.
 
 Randomized tests take their seed from `ABACUS_TEST_SEED` and print it on failure, so a
 failure is replayable (`crates/abacus-tests/src/lib.rs::Rng::from_env`,
@@ -212,10 +256,9 @@ failure is replayable (`crates/abacus-tests/src/lib.rs::Rng::from_env`,
 
 - `CLAUDE.md` maps every directory. Each one carries the same sections: Purpose, Dependencies, Consumed By, Data Flow, Known Hazards, Files, Subdirectories, Contracts, Notes, Reference. Hazards are severity-tagged (CRITICAL, HIGH, MEDIUM, LOW).
 - Design docs cite `file::symbol`, not line numbers, so a citation survives an edit.
-- Tables over prose for contracts: the tier table in the root `CLAUDE.md`, the file and subdirectory tables in every `CLAUDE.md`, the permission-model rows exercised by `crates/abacus-tests/tests/permissions.rs`.
-- Design docs describe what exists. Deferred and planned work lives in `docs/BACKLOG.md` with its integration trigger, not in `docs/` (`docs/CLAUDE.md`).
-- The four design documents separate concerns and must not blur: `ARCHITECTURE.md` is rationale, `CONTRACTS.md` is frozen boundaries, `LIFECYCLE.md` is internal mechanism, `SURFACE.md` is the consumer API (`docs/CLAUDE.md`).
-- Operational evidence and measured numbers live in `docs/OPERATION.md`; the test procedure lives in `docs/TESTING.md`. Measured behavior does not silently redefine the ABI (`docs/CLAUDE.md`).
+- Tables over prose for contracts.
+- Design docs describe what exists. Deferred and planned work lives in `docs/BACKLOG.md` with its integration trigger.
+- Operational evidence and measured numbers live in `docs/OPERATION.md`. Measured behavior does not silently redefine the ABI.
 - `README.md` is the human introduction; the root `CLAUDE.md` is the technical hub.
 
 ## Git conventions
@@ -223,15 +266,3 @@ failure is replayable (`crates/abacus-tests/src/lib.rs::Rng::from_env`,
 - Commit messages use the same shortest-complete register as the code, with no em or en dashes (root `CLAUDE.md`).
 - Committed: `Cargo.lock` (the workspace ships a binary), source, docs, `deploy/`, `rustfmt.toml`, `.github/workflows/`.
 - Not committed: `target/`, excluded by `.gitignore`.
-
-## Deployment conventions
-
-- The systemd unit is `deploy/abacus-rts.service`. It is the only file in `deploy/`.
-- The unit orders after `local-fs.target`, creates its runtime directory, and launches `/usr/local/bin/abacus --socket-path=/run/abacus-rts/abacus.sock` (`deploy/CLAUDE.md`).
-- Socket path: `/run/abacus-rts/abacus.sock`. The runtime directory is mode `0755`; the socket file itself is created by the daemon at mode `0660` by default (`crates/abacus-daemon/src/transport.rs::SocketOptions::default`, `crates/abacus-daemon/src/daemon.rs::DaemonConfig::new`). Confidentiality depends on the daemon-set socket permissions, not on the runtime-directory mode (`deploy/CLAUDE.md`).
-- The daemon accepts `--socket-path`, `--socket-mode` (octal), `--socket-group`, `--max-interlocks`, plus `--help` and `--version`. Flags take either `--flag value` or `--flag=value` (`crates/abacus-daemon/src/main.rs::usage`).
-- Restart policy: `Restart=always` with a 100 ms delay; stop is `SIGTERM` with `TimeoutStopSec=2` (`deploy/CLAUDE.md`).
-- The file-descriptor limit assumes roughly one descriptor per interlock and leaves headroom above the documented default capacity of 4096 (`deploy/CLAUDE.md`, `crates/abacus-daemon/src/registry.rs::DEFAULT_MAX_INTERLOCKS`).
-- Real-time scheduling and CPU affinity directives are present but disabled until operational probes justify deployment-specific pinning (`deploy/CLAUDE.md`). Pinning without kernel-level CPU isolation does not give timing isolation (`docs/CLAUDE.md`). Test-side CPU selection reads `/sys/devices/system/cpu/isolated` and falls back to the last online core (`crates/abacus-tests/src/lib.rs::daemon_core`).
-- The daemon sets `PR_SET_TIMERSLACK` to 1 ns at startup and logs a diagnostic if the call fails (`crates/abacus-daemon/src/daemon.rs::set_timer_slack`).
-- Probe scripts live in `crates/abacus-tests/examples/probe.rs`. One binary, subcommand first, socket path second, then optional numeric arguments: `probe bench|cron|barrier|partial <sock> [n] [ms]`. Each subcommand prints a single summary line of percentiles and counts to stdout.
