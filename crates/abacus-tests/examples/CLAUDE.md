@@ -10,7 +10,7 @@ Operational probe binary and the pod topology example. The probe exercises a liv
 
 ## Dependencies
 - External standard library facilities: command-line arguments, timing, threads, Unix-domain sockets, and byte writes.
-- Sibling/workspace crate `abacus_client`: `Abacus RTSClient`, `WaitState`, and `WatchedWord`.
+- Sibling/workspace crate `abacus_client`: `AbacusClient`, `WaitState`, and `WatchedWord`.
 
 </dependencies>
 

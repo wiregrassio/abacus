@@ -64,8 +64,8 @@ new one takes the name with a strictly larger id (`registry::Registry::create` r
 path, `registry::Registry::remove_slot`).
 
 The SDK rejects `create_wait_cron` with `interval_ms == 0` before it reaches the wire
-(`client::Abacus RTSClient::create_wait_cron`), and rejects `attach_interlock("clock")`
-(`client::Abacus RTSClient::attach_interlock`).
+(`client::AbacusClient::create_wait_cron`), and rejects `attach_interlock("clock")`
+(`client::AbacusClient::attach_interlock`).
 
 ### Initialization values
 

@@ -14,7 +14,7 @@ Use `TESTING.md` to run the workspace suite and its ignored timing, abuse, and s
 - The daemon creates the socket with the requested mode before accepting clients and exits with status 1 when a requested group is absent or a live daemon already occupies the path.
 - Clean SIGTERM or SIGINT handling exits with status 0 and removes the socket; a stale socket left by SIGKILL is replaced at startup.
 - The registry is non-durable. Consumers must recreate state after daemon restart or intentionally fail and rely on supervision.
-- A create beyond `--max-interlocks` is rejected as `InvalidRequest`; interlock names must contain 1to255 bytes.
+- A create beyond `--max-interlocks` is rejected as `InvalidRequest`; interlock names must contain 1 to 255 bytes.
 - Default timeout behavior may abort the consumer process. Embeddings and FFI users that cannot tolerate host termination must select `TimeoutPolicy::Error`.
 - Timing and load tests require an otherwise idle Linux host unless the test explicitly creates its own load profile.
 - Timing, CPU, and load tests must hold the shared serialization guard; fixed sleeps are forbidden as synchronization.
@@ -57,7 +57,7 @@ Use `TESTING.md` to run the workspace suite and its ignored timing, abuse, and s
 - Process-level coverage includes partial-frame clients, memfd sealing, clean termination, socket cleanup, and fatal-margin behavior under a stopped daemon.
 - Tests are required to pass with both one and twelve test threads.
 - Wire-v1 tier recovery on attach: NO TEST; the protocol does not expose the required tier.
-- Boolean composition tiers 5to8: NO TEST; they are not implemented.
+- Boolean composition tiers 5 to 8: NO TEST; they are not implemented.
 - Non-Rust FFI behavior: NO TEST; no binding exists.
 - Cron millisecond-to-nanosecond conversion, rounding, and overflow: no verification identified in the supplied material.
 - Installation and systemd deployment instructions: no automated documentation test identified.

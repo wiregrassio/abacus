@@ -28,7 +28,7 @@ The Abacus RTS Rust client SDK: daemon-backed shared-memory interlocks and wait 
 <data-flow>
 
 ## Data Flow
-- SDK consumers create an `Abacus RTSClient`, which connects to the Abacus daemon through a blocking Unix-domain socket.
+- SDK consumers create an `AbacusClient`, which connects to the Abacus daemon through a blocking Unix-domain socket.
 - The client encodes create or attach requests through `abacus-wire`, receives a protocol response and shared-memory file descriptor, and maps the descriptor through `abacus-core` into an interlock handle.
 - Typed SDK wrappers expose interlocks, counters, timers, cron waits, barriers, races, and process-clock functionality.
 - Local operations atomically update shared lifecycle and expiration state; futex operations block until daemon-written or peer-written state changes occur.
@@ -46,7 +46,7 @@ The Abacus RTS Rust client SDK: daemon-backed shared-memory interlocks and wait 
 - **MEDIUM:** Shared counter correctness depends on `SENTINEL` remaining globally reserved; direct or wrapping writes that use it can make a live interlock appear reaped.
 - **MEDIUM:** `WaitCounter::wait_until` and `WaitTimer` use CAS-max targets, so concurrent users of one handle cannot independently lower or isolate targets; one waiter can observe another waiter's delivery.
 - **MEDIUM:** Keepalive liveness depends on its single worker thread running before TTL expiry; sufficiently long process stalls allow daemon reaping.
-- **LOW:** `Abacus RTSClient::is_connected` detects socket EOF but cannot establish that the daemon remains able to serve requests.
+- **LOW:** `AbacusClient::is_connected` detects socket EOF but cannot establish that the daemon remains able to serve requests.
 
 </known-hazards>
 

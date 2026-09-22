@@ -151,7 +151,7 @@ Reading the numbers: on an idle isolated core the loop lands on the boundary (me
 for a 5 ms wait). Under load the median is unchanged and the tail reaches 12 to 18 ms,
 which is why the fatal margin has a 50 ms floor. The worst `wait_ms(5)` delivery seen under
 stress was 16.9 ms, leaving 33.1 ms of margin. A noisier host needs a larger floor
-(`Abacus RTSClient::set_min_fatal_margin_ms`) or the pinning lines above.
+(`AbacusClient::set_min_fatal_margin_ms`) or the pinning lines above.
 
 To reproduce: build release, start `target/release/abacus --socket-path=/tmp/abacus-probe.sock`,
 then `cargo test --workspace --release --no-fail-fast -- --ignored --nocapture`. The timing

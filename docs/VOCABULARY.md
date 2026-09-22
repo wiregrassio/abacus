@@ -46,7 +46,7 @@ bugs hide.
 | `Tier::Interlock` (0) | Bare interlock: daemon reaps on expired TTL or `SENTINEL`, nothing else. | `crates/abacus-daemon/src/registry.rs::Tier::Interlock` |
 | `Tier::WaitBarrier` (4) | Fires when every condition holds; re-armable by incrementing `open_count`. | `crates/abacus-daemon/src/registry.rs::Tier::WaitBarrier` |
 | `Tier::WaitCounter` (1) | Watches another interlock's word and stamps `closed_count` when the target is reached. | `crates/abacus-daemon/src/registry.rs::Tier::WaitCounter` |
-| `Tier::WaitCron` (2 lines, tier 3) | Fires on a grid line, then re-arms to the next line. | `crates/abacus-daemon/src/registry.rs::Tier::WaitCron` |
+| `Tier::WaitCron` (3) | Fires on a grid line, then re-arms to the next line. | `crates/abacus-daemon/src/registry.rs::Tier::WaitCron` |
 | `Tier::WaitTimer` (2) | Watches the clock's `open_count`; fires when the clock reaches the target. | `crates/abacus-daemon/src/registry.rs::Tier::WaitTimer` |
 | `Tier::from_wire` | Maps a wire tier byte (0 to 4) to a `Tier`; anything else is invalid. | `crates/abacus-daemon/src/registry.rs::Tier::from_wire` |
 | `Interlock` (SDK) | Owning handle for tier 0: open, close, touch, wait, free. | `crates/abacus-client/src/interlock.rs::Interlock` |
@@ -104,7 +104,7 @@ bugs hide.
 
 | Term | Meaning | Defined at |
 |------|---------|------------|
-| `Abacus RTSClient` | Blocking UDS connection plus the attached clock, keepalive, and timeout policy. | `crates/abacus-client/src/client.rs::Abacus RTSClient` |
+| `AbacusClient` | Blocking UDS connection plus the attached clock, keepalive, and timeout policy. | `crates/abacus-client/src/client.rs::AbacusClient` |
 | `DEFAULT_TIMEOUT_NANOS` | Futex wait slice used by open-ended waits: 100 ms. | `crates/abacus-client/src/types.rs::DEFAULT_TIMEOUT_NANOS` |
 | `DEFAULT_TOUCH_INTERVAL_MS` | Keepalive re-arm interval: 40 ms. | `crates/abacus-client/src/types.rs::DEFAULT_TOUCH_INTERVAL_MS` |
 | `DEFAULT_TOUCH_TTL_MS` | Default TTL a keepalive arms: 200 ms, equal to `MIN_TOUCH_TTL_MS`. | `crates/abacus-client/src/types.rs::DEFAULT_TOUCH_TTL_MS` |
@@ -204,7 +204,7 @@ bugs hide.
 | CAS-max | Compare-and-swap that only moves a word forward; a lower value is a no-op. | `crates/abacus-core/src/interlock.rs::interlock_arm` |
 | `interlock_*` free functions | Core operations on a handle rather than methods, so daemon and SDK share them. | `crates/abacus-core/src/interlock.rs::interlock_free` |
 | `interlock_map_*` per tier | One mapping function per tier so protection flags stay tier-specific. | `crates/abacus-core/src/interlock.rs::interlock_map_clock` |
-| `create_*` / `attach_*` | Client verbs: `create` allocates and owns, `attach` maps an existing name. | `crates/abacus-client/src/client.rs::Abacus RTSClient::attach_interlock` |
+| `create_*` / `attach_*` | Client verbs: `create` allocates and owns, `attach` maps an existing name. | `crates/abacus-client/src/client.rs::AbacusClient::attach_interlock` |
 | `TAG_` / `ERR_` prefixes | Wire discriminants: `TAG_` for message types, `ERR_` for error codes. | `crates/abacus-wire/src/codec.rs::ERR_INVALID_REQUEST` |
 | `TIER_` prefix | Raw tier byte constants used by the test kit's raw client. | `crates/abacus-tests/src/lib.rs::TIER_WAIT_BARRIER` |
 | `DEFAULT_` / `MIN_` / `MAX_` prefixes | Configured default, enforced floor, enforced ceiling. | `crates/abacus-client/src/types.rs::MIN_FATAL_MARGIN_MS` |

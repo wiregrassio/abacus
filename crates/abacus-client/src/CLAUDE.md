@@ -28,7 +28,7 @@ Implements the Rust SDK: daemon connection, interlock creation/attachment, TTL m
 <data-flow>
 
 ## Data Flow
-- `Abacus RTSClient` connects to the daemon over a blocking Unix-domain socket, sends encoded create/attach requests, receives wire responses plus one shared-memory file descriptor, and maps that descriptor into an `InterlockHandle`.
+- `AbacusClient` connects to the daemon over a blocking Unix-domain socket, sends encoded create/attach requests, receives wire responses plus one shared-memory file descriptor, and maps that descriptor into an `InterlockHandle`.
 - Typed constructors wrap mapped handles as bare `Interlock`, `WaitCounter`, `WaitTimer`, `WaitCron`, `WaitBarrier`, or `ProcessClock` objects.
 - Handles read and mutate atomically shared `open_count`, `closed_count`, and `expiration_ns` words, using futex waits/wakes for local blocking synchronization.
 - A client-wide `Keepalive` background thread periodically arms registered interlocks with future expiration timestamps; `ProcessClock` registrations also copy the daemon clock into `open_count`.
@@ -45,7 +45,7 @@ Implements the Rust SDK: daemon connection, interlock creation/attachment, TTL m
 - **MEDIUM:** Shared counter semantics rely on the `SENTINEL` value remaining reserved globally; direct or wrapping writes that violate this convention can make live interlocks appear reaped.
 - **MEDIUM:** `WaitCounter::wait_until` and `WaitTimer` use CAS-max targets, so concurrent users of the same handle cannot independently lower or isolate requested targets; one waiter may observe another waiter's delivery.
 - **MEDIUM:** Keepalive liveness depends on its single background thread receiving CPU time before TTL expiration; long process stalls beyond the configured TTL cause daemon reaping.
-- **LOW:** `Abacus RTSClient::is_connected` only distinguishes socket EOF from no immediately observable closure; it does not establish that the daemon can serve a request.
+- **LOW:** `AbacusClient::is_connected` only distinguishes socket EOF from no immediately observable closure; it does not establish that the daemon can serve a request.
 
 </known-hazards>
 
@@ -75,7 +75,7 @@ Implements the Rust SDK: daemon connection, interlock creation/attachment, TTL m
 ## Notes
 - The daemon controls interlock allocation, naming, tier evaluation, and passed-memory descriptors; the client controls local handle lifetime, TTL refresh, and futex waiting.
 - Typed handles encode intended mutation permissions at the Rust API boundary, but attached shared memory remains a cross-process mutable resource.
-- The clock interlock is attached automatically during `Abacus RTSClient::connect`; callers access it only through `client.clock()`.
+- The clock interlock is attached automatically during `AbacusClient::connect`; callers access it only through `client.clock()`.
 
 </notes>
 

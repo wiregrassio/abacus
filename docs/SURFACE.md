@@ -6,23 +6,23 @@ Rust SDK is the native implementation; a non-Rust binding (deferred) wraps it vi
 
 ## Connection
 
-`Abacus RTSClient` (client.rs::Abacus RTSClient) owns one socket connection, one read-only clock
+`AbacusClient` (client.rs::AbacusClient) owns one socket connection, one read-only clock
 handle, one keepalive, and the default timeout policy applied to timers it creates.
 
 ```
-Abacus RTSClient::connect(socket_path: &Path) -> Result<Self>
+AbacusClient::connect(socket_path: &Path) -> Result<Self>
     Connects and attaches the daemon clock. Delegates to connect_with_timeout
-    (client.rs::Abacus RTSClient::connect).
+    (client.rs::AbacusClient::connect).
     Errors: SdkError::Transport(TransportError::Io { operation: IoOperation::Connect, .. })
     when the socket cannot be opened (client.rs::ClientConn::connect); SdkError::MmapFailed
     if the clock descriptor cannot be mapped (client.rs::map_handle).
     Default: timeout = DEFAULT_TRANSPORT_TIMEOUT = Duration::from_secs(1)
     (types.rs::DEFAULT_TRANSPORT_TIMEOUT).
 
-Abacus RTSClient::connect_with_timeout(socket_path: &Path, timeout: Duration) -> Result<Self>
+AbacusClient::connect_with_timeout(socket_path: &Path, timeout: Duration) -> Result<Self>
     Connects, sets the same value as both socket read and write timeout, then attaches
     "clock" through interlock_map_clock (read-only mapping)
-    (client.rs::Abacus RTSClient::connect_with_timeout).
+    (client.rs::AbacusClient::connect_with_timeout).
     Errors: Transport Io with IoOperation::Connect or IoOperation::SetTimeout;
     Transport Io with errno rewritten from EAGAIN to ETIMEDOUT on any timed-out read or
     write (client.rs::ClientConn::map_timeout); Transport Protocol on frame or descriptor
@@ -32,70 +32,70 @@ Abacus RTSClient::connect_with_timeout(socket_path: &Path, timeout: Duration) ->
 
 set_timeout_policy(&mut self, policy: TimeoutPolicy)
     Sets the policy handed to every WaitTimer created afterwards
-    (client.rs::Abacus RTSClient::set_timeout_policy, create_wait_timer).
+    (client.rs::AbacusClient::set_timeout_policy, create_wait_timer).
 
 timeout_policy(&self) -> TimeoutPolicy
-    Returns the current policy (client.rs::Abacus RTSClient::timeout_policy).
+    Returns the current policy (client.rs::AbacusClient::timeout_policy).
     Default: TimeoutPolicy::Abort (types.rs::TimeoutPolicy).
 
 set_min_fatal_margin_ms(&mut self, margin_ms: u64)
     Sets the floor used by timers created afterwards
-    (client.rs::Abacus RTSClient::set_min_fatal_margin_ms).
+    (client.rs::AbacusClient::set_min_fatal_margin_ms).
 
 min_fatal_margin_ms(&self) -> u64
-    Returns the floor (client.rs::Abacus RTSClient::min_fatal_margin_ms).
+    Returns the floor (client.rs::AbacusClient::min_fatal_margin_ms).
     Default: MIN_FATAL_MARGIN_MS = 50 (types.rs::MIN_FATAL_MARGIN_MS).
 
 transport_timeout(&self) -> Duration
-    The socket read and write timeout in force (client.rs::Abacus RTSClient::transport_timeout).
+    The socket read and write timeout in force (client.rs::AbacusClient::transport_timeout).
 
 keepalive(&self) -> &Keepalive
     The single consolidated keepalive shared by every handle this client created
-    (client.rs::Abacus RTSClient::keepalive).
+    (client.rs::AbacusClient::keepalive).
 
 clock(&self) -> &ClockHandle
-    The read-only clock attached at connect (client.rs::Abacus RTSClient::clock).
+    The read-only clock attached at connect (client.rs::AbacusClient::clock).
 
 is_connected(&self) -> bool
     MSG_PEEK | MSG_DONTWAIT recv of one byte. false on EOF (recv returns 0); true on
     EAGAIN or EWOULDBLOCK; false on any other errno
-    (client.rs::Abacus RTSClient::is_connected).
+    (client.rs::AbacusClient::is_connected).
 
 create_interlock(&mut self, name: &str) -> Result<Interlock>
     Creates tier 0 and registers it with the keepalive
-    (client.rs::Abacus RTSClient::create_interlock, interlock.rs::Interlock::new).
+    (client.rs::AbacusClient::create_interlock, interlock.rs::Interlock::new).
     Errors: SdkError mapped from the daemon error code (client.rs::daemon_error);
     SdkError::UnexpectedResponse for a non-Created, non-Error reply;
     SdkError::MmapFailed when the returned descriptor cannot be mapped.
 
 attach_interlock(&mut self, name: &str) -> Result<AttachedInterlock>
     Attaches by name with a read-write mapping (interlock_map)
-    (client.rs::Abacus RTSClient::attach_interlock).
+    (client.rs::AbacusClient::attach_interlock).
     Errors: SdkError::InvalidRequest { message: "use client.clock() to access the system
     clock" } when name == "clock"; SdkError::InterlockNotFound when the daemon returns
     ERR_INTERLOCK_NOT_FOUND; the other daemon error mappings.
 
 attach_wait_counter(&mut self, name: &str) -> Result<AttachedWaitCounter>
     Attaches by name and maps through interlock_map_counter
-    (client.rs::Abacus RTSClient::attach_wait_counter).
+    (client.rs::AbacusClient::attach_wait_counter).
     Errors: same as attach_interlock, without the reserved-name rejection.
 
 create_wait_counter(&mut self, name: &str, watched_name: &str, watched_word: WatchedWord)
     -> Result<WaitCounter>
     Creates tier 1 with the watched name and word set on the request
-    (client.rs::Abacus RTSClient::create_wait_counter).
+    (client.rs::AbacusClient::create_wait_counter).
     Errors: SdkError::InterlockNotFound when the watched name is unknown to the daemon
     (registry.rs::Registry::resolve); SdkError::InvalidRequest for a rejected word or a
     missing field; the other daemon error mappings.
 
 create_wait_timer(&mut self, name: &str) -> Result<WaitTimer>
     Creates tier 2 and hands the timer the clock handle, the client's timeout policy, and
-    the client's min_fatal_margin_ms (client.rs::Abacus RTSClient::create_wait_timer).
+    the client's min_fatal_margin_ms (client.rs::AbacusClient::create_wait_timer).
     Errors: daemon error mappings; SdkError::MmapFailed.
 
 create_wait_cron(&mut self, name: &str, interval_ms: u64) -> Result<WaitCron>
     Creates tier 3. interval_ms is multiplied by 1_000_000 with saturating_mul to fill
-    interval_ns (client.rs::Abacus RTSClient::create_wait_cron).
+    interval_ns (client.rs::AbacusClient::create_wait_cron).
     Errors: SdkError::InvalidRequest { message: "WaitCron interval_ms must be > 0" } when
     interval_ms == 0, rejected client-side before any I/O; daemon InvalidRequest when the
     resulting interval is under 1 ms (registry.rs::Registry::create).
@@ -103,13 +103,13 @@ create_wait_cron(&mut self, name: &str, interval_ms: u64) -> Result<WaitCron>
 create_wait_barrier(&mut self, name: &str, conditions: Vec<(String, WatchedWord, u64)>)
     -> Result<WaitBarrier>
     Creates tier 4. Each condition becomes (name, word discriminant, threshold)
-    (client.rs::Abacus RTSClient::create_wait_barrier).
+    (client.rs::AbacusClient::create_wait_barrier).
     Errors: daemon InvalidRequest for an empty condition list; InterlockNotFound when any
     watched name is unknown (registry.rs::Registry::create).
 
 create_process_clock(&mut self, name: &str) -> Result<ProcessClock>
     Creates a tier 0 interlock and wraps it as a liveness beacon
-    (client.rs::Abacus RTSClient::create_process_clock, process_clock.rs::ProcessClock::new).
+    (client.rs::AbacusClient::create_process_clock, process_clock.rs::ProcessClock::new).
     Errors: daemon error mappings; SdkError::MmapFailed.
 ```
 
@@ -212,7 +212,7 @@ increment that starts from SENTINEL or that would cross it restores SENTINEL and
 ### AttachedInterlock
 
 The attacher's handle (interlock.rs::AttachedInterlock). Mapped read-write via
-`interlock_map` (client.rs::Abacus RTSClient::attach_interlock).
+`interlock_map` (client.rs::AbacusClient::attach_interlock).
 
 ```
 open(&self, h: u64) -> Result<(), SdkError>
@@ -242,7 +242,7 @@ crates/abacus-tests/src/permissions.rs (`attached__cannot_touch`,
 ### AttachedWaitCounter
 
 Read-only view of a tier 1 interlock, mapped through `interlock_map_counter`
-(client.rs::Abacus RTSClient::attach_wait_counter, interlock.rs::AttachedWaitCounter).
+(client.rs::AbacusClient::attach_wait_counter, interlock.rs::AttachedWaitCounter).
 
 ```
 peek(&self) -> (u64, u64)
@@ -312,7 +312,7 @@ Absent: `open`, `close`, `touch`, `free`
 ## WaitCounter
 
 Tier 1. Created through `create_wait_counter(name, watched_name, watched_word)`
-(client.rs::Abacus RTSClient::create_wait_counter). Registered with the keepalive at
+(client.rs::AbacusClient::create_wait_counter). Registered with the keepalive at
 construction using `DEFAULT_TOUCH_INTERVAL_MS` and `default_touch_ttl_ms(40)` = 200
 (wait_counter.rs::WaitCounter::new).
 
@@ -358,7 +358,7 @@ Absent: `close` (crates/abacus-tests/src/permissions.rs marker
 
 Tier 2. Created through `create_wait_timer(name)`, which passes the clock handle, the
 client's `TimeoutPolicy`, and the client's `min_fatal_margin_ms`
-(client.rs::Abacus RTSClient::create_wait_timer, wait_timer.rs::WaitTimer::new). Registered
+(client.rs::AbacusClient::create_wait_timer, wait_timer.rs::WaitTimer::new). Registered
 with the keepalive at `DEFAULT_TOUCH_INTERVAL_MS` and TTL 200.
 
 ```
@@ -408,13 +408,13 @@ free(&mut self)
 ```
 
 Absent: `close` (crates/abacus-tests/src/permissions.rs marker
-`wait_timer__has_no_close`). There is no `attach_wait_timer` on `Abacus RTSClient`
+`wait_timer__has_no_close`). There is no `attach_wait_timer` on `AbacusClient`
 (marker `client__has_no_attach_wait_timer`).
 
 ## WaitCron
 
 Tier 3. Created through `create_wait_cron(name, interval_ms)`
-(client.rs::Abacus RTSClient::create_wait_cron). Registered with the keepalive at
+(client.rs::AbacusClient::create_wait_cron). Registered with the keepalive at
 `DEFAULT_TOUCH_INTERVAL_MS` and TTL 200 (wait_cron.rs::WaitCron::new).
 
 ```
@@ -445,7 +445,7 @@ bursting (registry.rs::Registry::evaluate_all, registry.rs::next_grid_line).
 ## WaitBarrier
 
 Tier 4. Created through `create_wait_barrier(name, conditions)` where each condition is
-`(String, WatchedWord, u64)` (client.rs::Abacus RTSClient::create_wait_barrier). The daemon
+`(String, WatchedWord, u64)` (client.rs::AbacusClient::create_wait_barrier). The daemon
 initializes `open_count` to 1 and `closed_count` to 0 (registry.rs::Registry::create).
 Registered with the keepalive at `DEFAULT_TOUCH_INTERVAL_MS` and TTL 200
 (wait_barrier.rs::WaitBarrier::new).
@@ -485,8 +485,8 @@ in the same pass.
 
 ## Keepalive
 
-One `Keepalive` per `Abacus RTSClient`, created in `connect_with_timeout` and cloned into
-every handle it makes (client.rs::Abacus RTSClient::connect_with_timeout,
+One `Keepalive` per `AbacusClient`, created in `connect_with_timeout` and cloned into
+every handle it makes (client.rs::AbacusClient::connect_with_timeout,
 touch.rs::Keepalive). It is a single background thread shared by all registered handles.
 
 ```
@@ -569,7 +569,7 @@ values, and each counter's own `free` or drop path applies (wait_counter.rs::Wai
 ### ProcessClock
 
 A liveness and uptime beacon built on a bare tier 0 interlock
-(process_clock.rs::ProcessClock, client.rs::Abacus RTSClient::create_process_clock).
+(process_clock.rs::ProcessClock, client.rs::AbacusClient::create_process_clock).
 Construction stores the current daemon clock millisecond into both `closed_count` and
 `open_count`, then registers with `register_with_clock` so every keepalive tick stamps
 `open_count` with the daemon clock (process_clock.rs::ProcessClock::new,
@@ -645,11 +645,11 @@ client.rs::SdkError. Derives `Debug, Clone, PartialEq, Eq`, implements `Display`
 | `InterlockReaped` | Increment from or across SENTINEL (handle_ops.rs::increment); any wait loop observing a SENTINEL word or a lapsed `expiration_ns` (handle_ops.rs::wait_word, wait_counter.rs, wait_timer.rs, wait_cron.rs, wait_barrier.rs); `interlock_arm` on a SENTINEL expiration (interlock.rs::interlock_arm); daemon reply code `ERR_INTERLOCK_REAPED` (client.rs::daemon_error) |
 | `InterlockNotFound { name }` | Daemon reply code `ERR_INTERLOCK_NOT_FOUND`, with the reply message carried as `name` (client.rs::daemon_error) |
 | `AllocationFailed { message }` | Daemon reply code `ERR_ALLOCATION_FAILED` (client.rs::daemon_error); `Condition::AllocationFailed` rendered to a string (client.rs::From<Condition>) |
-| `InvalidRequest { message }` | `attach_interlock("clock")` (client.rs::Abacus RTSClient::attach_interlock); `create_wait_cron` with `interval_ms == 0` (client.rs::Abacus RTSClient::create_wait_cron); `WaitRace::wait` over zero counters (wait_race.rs::WaitRace::wait); `wait_ms_with_margin` with `margin_ms <= ms` (wait_timer.rs::WaitTimer::wait_ms_with_margin); daemon reply code `ERR_INVALID_REQUEST` (client.rs::daemon_error) |
+| `InvalidRequest { message }` | `attach_interlock("clock")` (client.rs::AbacusClient::attach_interlock); `create_wait_cron` with `interval_ms == 0` (client.rs::AbacusClient::create_wait_cron); `WaitRace::wait` over zero counters (wait_race.rs::WaitRace::wait); `wait_ms_with_margin` with `margin_ms <= ms` (wait_timer.rs::WaitTimer::wait_ms_with_margin); daemon reply code `ERR_INVALID_REQUEST` (client.rs::daemon_error) |
 | `RtsTimeout` | `WaitTimer` margin expiry under `TimeoutPolicy::Error` (wait_timer.rs::WaitTimer::on_timeout) |
 | `Transport(TransportError)` | Connect, timeout set, frame send, frame receive, decode, and descriptor-count faults (client.rs::ClientConn); `extract_single_fd` when the reply carries a count other than one (client.rs::extract_single_fd) |
 | `MmapFailed { message }` | The mapping function returns `Condition`, rendered to a string (client.rs::map_handle) |
-| `UnexpectedResponse { message }` | A reply that is neither the expected `Created`/`Attached` nor `Error` (client.rs::Abacus RTSClient::do_create, client.rs::do_attach); an unrecognized daemon error code, message `"unknown daemon error 0x{code:02x}: {message}"` (client.rs::daemon_error) |
+| `UnexpectedResponse { message }` | A reply that is neither the expected `Created`/`Attached` nor `Error` (client.rs::AbacusClient::do_create, client.rs::do_attach); an unrecognized daemon error code, message `"unknown daemon error 0x{code:02x}: {message}"` (client.rs::daemon_error) |
 | `ConnectionClosed` | Not an `SdkError` variant. It is `TransportError::ConnectionClosed` (error.rs::TransportError), reachable as `SdkError::Transport(TransportError::ConnectionClosed)` when a read hits EOF (framing.rs::read_exact, fdpass.rs::recv_prefix_with_fds) |
 
 ### From conversions

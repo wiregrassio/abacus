@@ -29,7 +29,7 @@ End-to-end L2 integration tests that run the `abacus` daemon as a real process a
 
 ## Data Flow
 - Test cases start the Cargo-built `abacus` daemon through `ProcessDaemon` or local `RawDaemon` helpers, generally with a unique Unix-domain socket path.
-- SDK clients (`Abacus RTSClient`) exercise normal create, attach, timer, counter, connection, and restart behavior.
+- SDK clients (`AbacusClient`) exercise normal create, attach, timer, counter, connection, and restart behavior.
 - Raw clients (`RawClient`) send deliberately malformed, partial, oversized, or unread protocol traffic directly over the daemon socket.
 - Some tests re-execute their own integration-test binary as named ignored-test roles; parent tests pass the daemon socket and role arguments through command-line dispatch.
 - Tests collect daemon exit status, socket-file state, CPU ticks, FD counts, stderr fault lines, mapped shared-memory words, and client-visible results.

@@ -24,7 +24,7 @@ Every tier is the same 24 bytes. The tier is a property of the registry entry (`
 
 | Tier | Daemon per cycle | SDK exposes |
 | --- | --- | --- |
-| 0 Interlock | Reap only: `SENTINEL` in any word or a lapsed `expiration_ns` triggers `interlock_reap` and slot removal | `client::Abacus RTSClient::create_interlock` returns `interlock::Interlock`: `open`, `close`, `peek`, `value`, `state`, `touch`, `wait_open`, `wait_close`, bounded variants, `free` |
+| 0 Interlock | Reap only: `SENTINEL` in any word or a lapsed `expiration_ns` triggers `interlock_reap` and slot removal | `client::AbacusClient::create_interlock` returns `interlock::Interlock`: `open`, `close`, `peek`, `value`, `state`, `touch`, `wait_open`, `wait_close`, bounded variants, `free` |
 | 1 WaitCounter | `Tier::WaitCounter` arm: reads the watched target's word through `Registry::watched_value`; if the counter is Open and the watched value reached `open_count`, stores the watched value into `closed_count` and `futex_wake`s | `create_wait_counter`, `wait_counter::WaitCounter::wait_until` (CAS-max target, arms 2x timeout, classifies the wake); attachers get the read-only `interlock::AttachedWaitCounter` |
 | 2 WaitTimer | `Tier::WaitTimer` arm: target is the clock; when `clock_now_ms >= open_count`, stores `clock_now_ms` into `closed_count` and wakes | `create_wait_timer`, `wait_timer::WaitTimer::wait_ms`, `wait_ms_with_margin`, `wait_until` |
 | 3 WaitCron | Same fire test, then re-arms `open_count` to `registry::next_grid_line(clock_now_ms, interval_ms)`; overflow reaps the entry | `create_wait_cron`, `wait_cron::WaitCron::wait`, which reports `Normal` when `completed_at % interval_ms == 0` and `Overrun` otherwise |
@@ -48,9 +48,9 @@ Protections the clock gets that other interlocks do not:
 
 - `interlock_create_clock` maps the memfd read-write *first*, then applies `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE | F_SEAL_SEAL`. `F_SEAL_FUTURE_WRITE` (declared locally as `0x0010`, absent from the libc crate) leaves the daemon's existing writable mapping intact and blocks any new writable mapping of the same file.
 - Clients map it through `interlock_map_clock`, which passes `PROT_READ` only. With the seal in place, a client that attempts `interlock_map` on the clock fd gets `AllocationFailed { step: Mmap }`.
-- `Abacus RTSClient::attach_interlock` rejects the name `clock` with `InvalidRequest` pointing at `client.clock()`; `Registry::create` rejects `clock` as a reserved name.
+- `AbacusClient::attach_interlock` rejects the name `clock` with `InvalidRequest` pointing at `client.clock()`; `Registry::create` rejects `clock` as a reserved name.
 
-The clock handle is attached once, on connect (`Abacus RTSClient::connect_with_timeout` calls `do_attach(conn, "clock", interlock_map_clock)`), and exposed as the read-only `interlock::ClockHandle`.
+The clock handle is attached once, on connect (`AbacusClient::connect_with_timeout` calls `do_attach(conn, "clock", interlock_map_clock)`), and exposed as the read-only `interlock::ClockHandle`.
 
 ## Daemon and SDK
 
@@ -80,7 +80,7 @@ Defaults, from `types`:
 - `default_touch_ttl_ms(interval)` is `max(5 * interval, MIN_TOUCH_TTL_MS)`; `MIN_TOUCH_TTL_MS = 200`, so `DEFAULT_TOUCH_TTL_MS = 200` (asserted equal at compile time). The comment on `MIN_TOUCH_TTL_MS` states the reason: a consumer stalled by CFS quota throttling (a 100 ms period) must survive a full period plus scheduling slack.
 - `CREATION_TTL_NANOS = 100_000_000` (100 ms) is what a fresh interlock carries out of `interlock_create`, before any keepalive arm.
 
-The keepalive thread is consolidated, one per `Keepalive` value and therefore one per `Abacus RTSClient` (`Abacus RTSClient::connect_with_timeout` constructs `Keepalive::new()`; every create passes `&self.keepalive`). `touch::run` walks the entry list, arms each entry whose `next_due_ns` has passed, computes the earliest next due across all entries (capped at `IDLE_SLEEP`, 100 ms), and sleeps on a `Condvar` until then. An entry whose `interlock_arm` returns `InterlockReaped` sets its `reaped` flag and is removed from the list, which is what `TouchHandle::is_reaped` reports. The thread holds only a `Weak<Inner>`; when the last `Keepalive` and `TouchHandle` are dropped, `Arc::strong_count` falls to 1 and the thread clears `thread_running` and returns.
+The keepalive thread is consolidated, one per `Keepalive` value and therefore one per `AbacusClient` (`AbacusClient::connect_with_timeout` constructs `Keepalive::new()`; every create passes `&self.keepalive`). `touch::run` walks the entry list, arms each entry whose `next_due_ns` has passed, computes the earliest next due across all entries (capped at `IDLE_SLEEP`, 100 ms), and sleeps on a `Condvar` until then. An entry whose `interlock_arm` returns `InterlockReaped` sets its `reaped` flag and is removed from the list, which is what `TouchHandle::is_reaped` reports. The thread holds only a `Weak<Inner>`; when the last `Keepalive` and `TouchHandle` are dropped, `Arc::strong_count` falls to 1 and the thread clears `thread_running` and returns.
 
 `ProcessClock` uses `Keepalive::register_with_clock`: on every touch it also stores the clock's `open_count` into the interlock's `open_count`, so `closed_count` is the start time, `open_count` is the last touch, and `value` is uptime in milliseconds.
 
@@ -154,7 +154,7 @@ The client maps through a tier-specific function chosen by the SDK call, all def
 
 - `interlock_map`: `PROT_READ | PROT_WRITE`. Used by `create_interlock`, `attach_interlock`, and `create_process_clock`.
 - `interlock_map_counter`, `interlock_map_timer`, `interlock_map_cron`, `interlock_map_barrier`: `PROT_READ | PROT_WRITE`. Which words a holder may write is enforced by the SDK type, not by the mapping: `WaitCounter` has no `close`, `AttachedWaitCounter` has no mutators at all.
-- `interlock_map_clock`: `PROT_READ`. Used by `Abacus RTSClient::connect_with_timeout` for the clock.
+- `interlock_map_clock`: `PROT_READ`. Used by `AbacusClient::connect_with_timeout` for the clock.
 
 The clock is read-only for clients because every reader in the system derives time from it. `WaitTimer` computes its target from `clock.open_count`, `WaitBarrier::wait` reports `completed_at` from it, `ProcessClock` stamps it into its own `open_count`, and the daemon fires every tier-2 and tier-3 interlock against it. A single writable client could move the whole system's clock. `PROT_READ` is the client's own mapping flag; `F_SEAL_FUTURE_WRITE` is what makes it not merely a convention, since it prevents any process from creating a writable mapping of that fd after the daemon's.
 
@@ -166,7 +166,7 @@ The daemon does not persist anything. A restart comes back empty: no names, no r
 
 The daemon does not track ownership. `daemon::service_client` removes a hung-up client from the poll set and nothing else; interlocks die by TTL. There is no per-connection interlock table and no cleanup on disconnect.
 
-The wire carries no tier on attach. `Response::Attached` has only an id, so `Abacus RTSClient::attach_wait_counter` requires the caller to know the name is a WaitCounter; attaching a different tier returns a handle with the wrong contract.
+The wire carries no tier on attach. `Response::Attached` has only an id, so `AbacusClient::attach_wait_counter` requires the caller to know the name is a WaitCounter; attaching a different tier returns a handle with the wrong contract.
 
 `ERR_INTERLOCK_REAPED` (`0x01`) is reserved in v1 and never produced by the daemon: create and attach cannot observe a reap, and the SDK raises `InterlockReaped` from the words.
 
