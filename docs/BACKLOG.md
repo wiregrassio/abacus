@@ -44,6 +44,12 @@ The Attached wire response carries only the id, not the tier. The SDK cannot enf
 
 **When:** when a third-party consumer attaches to interlocks it did not create, or when `WaitRace` polling shows up in a profile.
 
+### WaitCounter waits cannot see a dead daemon
+
+`WaitCounter` is the one wait tier built without the clock handle. `wait_until` checks its own words for the sentinel, but a dead daemon neither reaps nor delivers, so every wait returns `Timeout` forever. `Interlock`, `AttachedInterlock`, `ClockHandle`, `WaitTimer`, `WaitCron`, and `WaitBarrier` all check the clock's expiration and return `InterlockReaped` within its 100 ms TTL. Fix: `WaitCounter` carries the clock, as `WaitTimer` does, and `wait_until` checks it on every loop. Until then a consumer polls: Convoy's rider waits in 100 ms slices and, on each timeout, runs a zero-time `wait_close_for` on the watched interlock to reach the clock check.
+
+**When:** before a second consumer relies on a WaitCounter alone for liveness, or when Convoy's poll slices show up in a profile.
+
 ### Boolean compositions
 
 WaitAnd, WaitOr, WaitXor, WaitNand require daemon-side tier discriminants (tiers 5 to 8) not present in wire ABI v1.
