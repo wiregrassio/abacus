@@ -89,6 +89,7 @@ The unit runs as root with no `User=`, `NoNewPrivileges`, `ProtectSystem`, `Priv
 - **Keepalive thread spawn panics from a library API.** Thread exhaustion produces a panic from `create_interlock` where every other failure returns `SdkError`.
 - **Cron interval converts lossily at the boundary.** `saturating_mul` silently clamps a very large interval.
 - **`interlock_arm` can CAS SENTINEL into `expiration_ns`.** `saturating_add` to `u64::MAX` is SENTINEL. `interlock_create` uses plain addition. Reachable only near `u64::MAX`.
+- **`state()` and `value()` can report a false `Overrun`.** `handle_ops::state` and `handle_ops::peek` (behind `value()`) load `open_count` before `closed_count`. A writer that advances both between the two loads, open then closed as every transaction does, makes a Closed or Open interlock read closed past open: `value()` negative, `state()` `Overrun`. Fix: load `closed_count` first; open only grows, and grows before closed, so the pair can never read inverted. The wait paths already load closed first. Convoy's BusDriver avoids it by calling `interlock_state` on its own ordered loads. Requires contention with a concurrent writer.
 
 ### Verification gaps (no test identified)
 
