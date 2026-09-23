@@ -36,6 +36,11 @@ impl Interlock {
         }
     }
 
+    /// The underlying shared-memory handle.
+    pub fn handle(&self) -> &InterlockHandle {
+        &self.handle
+    }
+
     /// open_count += h. `Err(InterlockReaped)` if the word is at SENTINEL; the increment
     /// never erases a sentinel.
     pub fn open(&self, h: u64) -> Result<(), SdkError> {
@@ -141,6 +146,11 @@ impl AttachedInterlock {
         Self { handle, clock }
     }
 
+    /// The underlying shared-memory handle.
+    pub fn handle(&self) -> &InterlockHandle {
+        &self.handle
+    }
+
     /// open_count += h. Sentinel-aware; see `Interlock::open`.
     pub fn open(&self, h: u64) -> Result<(), SdkError> {
         handle_ops::increment(&self.handle, Word::Open, h)
@@ -230,6 +240,11 @@ pub struct AttachedWaitCounter {
 impl AttachedWaitCounter {
     pub(crate) fn new(handle: InterlockHandle) -> Self {
         Self { handle }
+    }
+
+    /// The underlying shared-memory handle.
+    pub fn handle(&self) -> &InterlockHandle {
+        &self.handle
     }
 
     /// Read both counters: (open_count, closed_count).
