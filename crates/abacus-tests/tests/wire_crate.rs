@@ -15,6 +15,8 @@ fn every_request() -> Vec<Request> {
         Request::CreateInterlock {
             name: "cam0".into(),
             tier: 0,
+            owner: None,
+            dependencies: vec![],
             watched_name: None,
             watched_word: None,
             interval_ns: None,
@@ -23,6 +25,8 @@ fn every_request() -> Vec<Request> {
         Request::CreateInterlock {
             name: "frame_done".into(),
             tier: 1,
+            owner: None,
+            dependencies: vec![],
             watched_name: Some("cam0".into()),
             watched_word: Some(1),
             interval_ns: None,
@@ -31,6 +35,8 @@ fn every_request() -> Vec<Request> {
         Request::CreateInterlock {
             name: "timeout".into(),
             tier: 2,
+            owner: None,
+            dependencies: vec![],
             watched_name: None,
             watched_word: None,
             interval_ns: None,
@@ -39,6 +45,8 @@ fn every_request() -> Vec<Request> {
         Request::CreateInterlock {
             name: "cron".into(),
             tier: 3,
+            owner: None,
+            dependencies: vec![],
             watched_name: None,
             watched_word: None,
             interval_ns: Some(33_000_000),
@@ -47,6 +55,8 @@ fn every_request() -> Vec<Request> {
         Request::CreateInterlock {
             name: "barrier".into(),
             tier: 4,
+            owner: None,
+            dependencies: vec![],
             watched_name: None,
             watched_word: None,
             interval_ns: None,
@@ -55,13 +65,34 @@ fn every_request() -> Vec<Request> {
         Request::AttachInterlock {
             name: "sensor".into(),
         },
+        Request::CreateInterlock {
+            name: "owned".into(),
+            tier: 0,
+            owner: Some(("pc".into(), 42)),
+            dependencies: vec![],
+            watched_name: None,
+            watched_word: None,
+            interval_ns: None,
+            conditions: None,
+        },
+        Request::CreateInterlock {
+            name: "deps".into(),
+            tier: 0,
+            owner: Some(("pc".into(), 1)),
+            dependencies: vec!["a".into(), "bb".into(), "ccc".into()],
+            watched_name: None,
+            watched_word: None,
+            interval_ns: None,
+            conditions: None,
+        },
     ]
 }
 
 fn every_response() -> Vec<Response> {
     vec![
         Response::Created { id: 42 },
-        Response::Attached { id: 7 },
+        Response::Attached { id: 7, tier: 0 },
+        Response::Attached { id: 3, tier: 4 },
         Response::from_condition(&Condition::InterlockReaped),
         Response::from_condition(&Condition::InterlockNotFound {
             name: "missing".into(),

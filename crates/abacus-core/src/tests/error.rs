@@ -86,6 +86,14 @@ fn error__every_variant_displays() {
         ProtocolFault::InvalidUtf8,
         "UTF-8",
     );
+    shown(
+        "ProtocolFault::InvalidFlag",
+        ProtocolFault::InvalidFlag {
+            field: "owner",
+            value: 2,
+        },
+        "owner",
+    );
 
     shown(
         "TransportError::Protocol",

@@ -27,18 +27,18 @@ impl WaitCron {
         clock: InterlockHandle,
         keepalive: &Keepalive,
         interval_ms: u64,
-    ) -> Self {
+    ) -> Result<Self, SdkError> {
         let touch = Some(keepalive.register(
             handle.clone(),
             DEFAULT_TOUCH_INTERVAL_MS,
             default_touch_ttl_ms(DEFAULT_TOUCH_INTERVAL_MS),
-        ));
-        Self {
+        )?);
+        Ok(Self {
             handle,
             clock,
             touch,
             interval_ms,
-        }
+        })
     }
 
     /// The grid interval.
@@ -83,7 +83,8 @@ impl WaitCron {
             // Check the daemon-owned clock's expiration. The client keepalive cannot re-arm
             // the clock (it is read-only), so after daemon death this fires within one clock TTL.
             let clock_exp = self.clock.words().expiration_ns.load(Ordering::Acquire);
-            if clock_exp != SENTINEL && clock_exp < now {
+            // A terminated daemon clock (SENTINEL) is dead, not alive.
+            if clock_exp == SENTINEL || clock_exp < now {
                 return Err(SdkError::InterlockReaped);
             }
             let _ = futex_wait(closed_word, futex_word(closed), DEFAULT_TIMEOUT_NANOS);

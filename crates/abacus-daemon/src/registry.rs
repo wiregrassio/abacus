@@ -2,17 +2,19 @@
 //! attach, the clock, and the per-cycle evaluation pass.
 
 use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::sync::atomic::Ordering;
 
 use abacus_core::clock::{expiration_alive, futex_wake, monotonic_now_nanos, NANOS_PER_MS};
 use abacus_core::error::{Condition, Result};
 use abacus_core::interlock::{
-    interlock_arm, interlock_create, interlock_create_clock, interlock_reap, Interlock,
-    InterlockHandle, SENTINEL,
+    interlock_arm, interlock_create, interlock_create_clock, interlock_dup_fd, interlock_reap,
+    Interlock, InterlockHandle, SENTINEL,
 };
 
-/// The reserved name of the daemon-owned clock interlock.
-pub const CLOCK_NAME: &str = "clock";
+/// The reserved name of the daemon-owned clock interlock, defined in abacus-core so the
+/// SDK shares it.
+pub use abacus_core::interlock::CLOCK_NAME;
 /// The registry id of the clock.
 pub const CLOCK_ID: u64 = 0;
 /// Longest accepted interlock name, in bytes.
@@ -25,9 +27,10 @@ const CLOCK_TTL_NANOS: u64 = 100_000_000;
 // -- Tier --
 
 /// What the daemon does with an interlock each cycle beyond reaping it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tier {
     /// Reap only.
+    #[default]
     Interlock,
     /// Watch one word of another interlock; stamp and wake when it reaches the target.
     WaitCounter,
@@ -49,6 +52,17 @@ impl Tier {
             3 => Some(Self::WaitCron),
             4 => Some(Self::WaitBarrier),
             _ => None,
+        }
+    }
+
+    /// The inverse of `from_wire`.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Self::Interlock => 0,
+            Self::WaitCounter => 1,
+            Self::WaitTimer => 2,
+            Self::WaitCron => 3,
+            Self::WaitBarrier => 4,
         }
     }
 }
@@ -94,6 +108,29 @@ struct Entry {
     interval_ms: Option<u64>,
     /// WaitBarrier: (target, word, threshold) per condition.
     conditions: Option<Vec<(Target, WatchedWord, u64)>>,
+    /// Owner (first) then dependencies: targets this entry dies with.
+    depends_on: Vec<Target>,
+}
+
+/// All fields for a create request.
+#[derive(Debug, Clone, Default)]
+pub struct CreateSpec {
+    /// The interlock name.
+    pub name: String,
+    /// The tier.
+    pub tier: Tier,
+    /// WaitCounter: the interlock to watch.
+    pub watched_name: Option<String>,
+    /// WaitCounter: which word of it to watch.
+    pub watched_word: Option<u8>,
+    /// WaitCron: grid interval in nanoseconds.
+    pub interval_ns: Option<u64>,
+    /// WaitBarrier: list of (watched_name, watched_word, threshold).
+    pub barrier_conditions: Option<Vec<(String, u8, u64)>>,
+    /// The ProcessClock that owns this interlock: name and registry id.
+    pub owner: Option<(String, u64)>,
+    /// Names this interlock dies with, resolved at create.
+    pub dependencies: Vec<String>,
 }
 
 /// The registry.
@@ -119,7 +156,7 @@ impl Registry {
     /// A registry holding only the clock, capped at `max_interlocks` live entries.
     pub fn with_limit(max_interlocks: usize) -> Result<Self> {
         let clock = interlock_create_clock()?;
-        interlock_arm(&clock, CLOCK_TTL_NANOS).expect("fresh clock cannot be reaped");
+        interlock_arm(&clock, CLOCK_TTL_NANOS)?;
         // closed_count = daemon start ms (set once). open_count = current ms (each cycle).
         let start_ms = monotonic_now_nanos() / NANOS_PER_MS;
         clock
@@ -160,49 +197,68 @@ impl Registry {
         self.dead_slots.capacity()
     }
 
+    /// The slot a live name currently occupies, or `None` if it is not registered.
+    /// Exposed for tests that assert a slot-order precondition rather than just naming it
+    /// in a comment.
+    #[cfg(test)]
+    pub(crate) fn slot_of(&self, name: &str) -> Option<usize> {
+        self.index.get(name).copied()
+    }
+
     /// Create a named interlock. An existing name is reaped and replaced.
     /// Returns the new id and a handle sharing the daemon's mapping.
-    pub fn create(
-        &mut self,
-        name: String,
-        tier: Tier,
-        watched_name: Option<String>,
-        watched_word: Option<u8>,
-        interval_ns: Option<u64>,
-        barrier_conditions: Option<Vec<(String, u8, u64)>>,
-    ) -> Result<(u64, InterlockHandle)> {
-        validate_name(&name)?;
-        if name == CLOCK_NAME {
+    pub fn create(&mut self, spec: CreateSpec) -> Result<(u64, InterlockHandle)> {
+        self.create_with_fd(spec)
+            .map(|(id, handle, _fd)| (id, handle))
+    }
+
+    /// Create a named interlock and hand back a descriptor for it in the same call. An
+    /// existing name is reaped and replaced. All validation, `interlock_create()`, and the
+    /// descriptor duplication happen before any registry mutation, so a refused or failed
+    /// create changes nothing.
+    pub fn create_with_fd(&mut self, spec: CreateSpec) -> Result<(u64, InterlockHandle, OwnedFd)> {
+        validate_name(&spec.name)?;
+        if spec.name == CLOCK_NAME {
             return Err(Condition::InvalidRequest {
                 message: format!("\"{CLOCK_NAME}\" is a reserved name"),
             });
         }
-        if !self.index.contains_key(&name) && self.live >= self.max_interlocks {
+        if !self.index.contains_key(&spec.name) && self.live >= self.max_interlocks {
             return Err(Condition::InvalidRequest {
                 message: format!("interlock limit reached: {}", self.max_interlocks),
             });
         }
 
+        let tier = spec.tier;
         let mut watch = None;
         let mut interval_ms = None;
         let mut conditions = None;
+        let now_ns = monotonic_now_nanos();
 
         match tier {
             Tier::WaitCounter => {
-                let wn = watched_name.ok_or_else(|| Condition::InvalidRequest {
+                let wn = spec.watched_name.ok_or_else(|| Condition::InvalidRequest {
                     message: "WaitCounter requires watched_name".to_string(),
                 })?;
-                let ww = watched_word.ok_or_else(|| Condition::InvalidRequest {
+                if wn == spec.name {
+                    return Err(Condition::InvalidRequest {
+                        message: "an interlock cannot watch its own name".to_string(),
+                    });
+                }
+                let ww = spec.watched_word.ok_or_else(|| Condition::InvalidRequest {
                     message: "WaitCounter requires watched_word".to_string(),
                 })?;
                 let target = self.resolve(&wn)?;
+                if !self.target_alive(target, now_ns) {
+                    return Err(Condition::InterlockNotFound { name: wn });
+                }
                 watch = Some((target, WatchedWord::from_wire(ww)?));
             }
             Tier::WaitTimer => {
                 watch = Some((Target::Clock, WatchedWord::OpenCount));
             }
             Tier::WaitCron => {
-                let ival_ns = interval_ns.ok_or_else(|| Condition::InvalidRequest {
+                let ival_ns = spec.interval_ns.ok_or_else(|| Condition::InvalidRequest {
                     message: "WaitCron requires interval_ns".to_string(),
                 })?;
                 if ival_ns == 0 {
@@ -220,9 +276,11 @@ impl Registry {
                 watch = Some((Target::Clock, WatchedWord::OpenCount));
             }
             Tier::WaitBarrier => {
-                let conds = barrier_conditions.ok_or_else(|| Condition::InvalidRequest {
-                    message: "WaitBarrier requires conditions".to_string(),
-                })?;
+                let conds = spec
+                    .barrier_conditions
+                    .ok_or_else(|| Condition::InvalidRequest {
+                        message: "WaitBarrier requires conditions".to_string(),
+                    })?;
                 if conds.is_empty() {
                     return Err(Condition::InvalidRequest {
                         message: "WaitBarrier requires at least one condition".to_string(),
@@ -230,7 +288,15 @@ impl Registry {
                 }
                 let mut parsed = Vec::with_capacity(conds.len());
                 for (wn, ww, threshold) in conds {
+                    if wn == spec.name {
+                        return Err(Condition::InvalidRequest {
+                            message: "an interlock cannot watch its own name".to_string(),
+                        });
+                    }
                     let target = self.resolve(&wn)?;
+                    if !self.target_alive(target, now_ns) {
+                        return Err(Condition::InterlockNotFound { name: wn });
+                    }
                     parsed.push((target, WatchedWord::from_wire(ww)?, threshold));
                 }
                 conditions = Some(parsed);
@@ -238,9 +304,57 @@ impl Registry {
             Tier::Interlock => {}
         }
 
+        // Owner and dependency validation: before interlock_create() so a refused create
+        // never displaces the existing entry.
+        let mut depends_on = Vec::new();
+
+        if let Some((ref oname, _)) = spec.owner {
+            if *oname == spec.name {
+                return Err(Condition::InvalidRequest {
+                    message: "an interlock cannot depend on its own name".to_string(),
+                });
+            }
+        }
+        for dep in &spec.dependencies {
+            if *dep == spec.name {
+                return Err(Condition::InvalidRequest {
+                    message: "an interlock cannot depend on its own name".to_string(),
+                });
+            }
+        }
+
+        if let Some((ref oname, oid)) = spec.owner {
+            if oname == CLOCK_NAME && oid == CLOCK_ID {
+                depends_on.push(Target::Clock);
+            } else {
+                let target = match self
+                    .index
+                    .get(oname.as_str())
+                    .and_then(|&slot| self.slots[slot].as_ref().map(|e| (slot, e.id)))
+                {
+                    Some((slot, id))
+                        if id == oid && self.target_alive(Target::Slot { slot, id }, now_ns) =>
+                    {
+                        Target::Slot { slot, id }
+                    }
+                    _ => return Err(Condition::InterlockReaped),
+                };
+                depends_on.push(target);
+            }
+        }
+
+        for dep in &spec.dependencies {
+            let target = self.resolve(dep)?;
+            if !self.target_alive(target, now_ns) {
+                return Err(Condition::InterlockNotFound { name: dep.clone() });
+            }
+            depends_on.push(target);
+        }
+
+        // The descriptor is duplicated before any registry mutation, so a dup failure
+        // leaves an existing entry of the same name (if any) untouched.
         let handle = interlock_create()?;
-        let id = self.next_id;
-        self.next_id += 1;
+        let fd = interlock_dup_fd(&handle)?;
 
         // Tier-specific initialization per CONTRACTS.md.
         let clock_now_ms = self.clock.words().open_count.load(Ordering::Acquire);
@@ -283,8 +397,11 @@ impl Registry {
             Tier::Interlock | Tier::WaitCounter => {}
         }
 
+        let id = self.next_id;
+        self.next_id += 1;
+
         // An existing name is reaped and replaced.
-        if let Some(old_slot) = self.index.get(&name).copied() {
+        if let Some(old_slot) = self.index.get(&spec.name).copied() {
             self.remove_slot(old_slot);
         }
 
@@ -297,47 +414,51 @@ impl Registry {
         };
         self.slots[slot] = Some(Entry {
             id,
-            name: name.clone(),
+            name: spec.name.clone(),
             handle: handle.clone(),
             tier,
             watch,
             interval_ms,
             conditions,
+            depends_on,
         });
-        self.index.insert(name, slot);
+        self.index.insert(spec.name, slot);
         self.live += 1;
 
-        Ok((id, handle))
+        Ok((id, handle, fd))
     }
 
-    /// Look up an interlock by name.
-    pub fn attach(&self, name: &str) -> Result<(u64, InterlockHandle)> {
+    /// Look up an interlock by name. Returns the id, tier, and handle.
+    pub fn attach(&self, name: &str) -> Result<(u64, Tier, InterlockHandle)> {
         if name == CLOCK_NAME {
-            return Ok((CLOCK_ID, self.clock.clone()));
+            return Ok((CLOCK_ID, Tier::Interlock, self.clock.clone()));
         }
+        validate_name(name)?;
         match self
             .index
             .get(name)
             .and_then(|&slot| self.slots[slot].as_ref())
         {
-            Some(entry) => Ok((entry.id, entry.handle.clone())),
+            Some(entry) => Ok((entry.id, entry.tier, entry.handle.clone())),
             None => Err(Condition::InterlockNotFound {
                 name: name.to_string(),
             }),
         }
     }
 
-    /// One daemon cycle at `now_ns`: advance the clock, evaluate every interlock, wake clock
-    /// watchers, refresh the clock's own expiration.
+    /// One daemon cycle at `now_ns`: advance the clock and refresh its expiration, evaluate
+    /// every interlock against it, then wake clock watchers.
     pub fn tick(&mut self, now_ns: u64) {
         let current_ms = now_ns / NANOS_PER_MS;
         self.clock
             .words()
             .open_count
             .store(current_ms, Ordering::Release);
+        // The clock is current before anything is evaluated against it: after a stall
+        // longer than its TTL, evaluating first would reap every clock dependent.
+        self.refresh_clock_expiration();
         self.evaluate_all(current_ms, now_ns);
         futex_wake(&self.clock.words().open_count);
-        self.refresh_clock_expiration();
     }
 
     /// Evaluate every interlock once. For each: reap on any SENTINEL word, reap on expired
@@ -366,6 +487,17 @@ impl Registry {
                 continue;
             }
 
+            // The owner or a dependency died.
+            if entry
+                .depends_on
+                .iter()
+                .any(|t| !self.target_alive(*t, now_ns))
+            {
+                interlock_reap(&entry.handle);
+                self.dead_slots.push(slot);
+                continue;
+            }
+
             // Open (value > 0) is the firing gate. Target liveness is checked regardless, so
             // an idle watcher still dies with its target.
             let value = (open_count as i64).wrapping_sub(closed_count as i64);
@@ -387,7 +519,14 @@ impl Registry {
                         // never burst. Overflow means the grid is exhausted; reap.
                         match next_grid_line(clock_now_ms, entry.interval_ms.unwrap_or(1)) {
                             Some(next_line) => {
-                                words.open_count.store(next_line, Ordering::Release);
+                                // A concurrent free's SENTINEL must never be undone by this
+                                // re-arm; on CAS failure the next pass reaps whatever was written.
+                                let _ = words.open_count.compare_exchange(
+                                    open_count,
+                                    next_line,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                );
                             }
                             None => {
                                 interlock_reap(&entry.handle);
@@ -400,7 +539,7 @@ impl Registry {
                     let Some((target, word)) = entry.watch else {
                         continue;
                     };
-                    match self.watched_value(target, word) {
+                    match self.watched_value(target, word, now_ns) {
                         None => {
                             // Target reaped or recreated: the watcher dies with it.
                             interlock_reap(&entry.handle);
@@ -420,7 +559,7 @@ impl Registry {
                     let mut all_met = true;
                     let mut target_gone = false;
                     for (target, word, threshold) in conditions {
-                        match self.watched_value(*target, *word) {
+                        match self.watched_value(*target, *word, now_ns) {
                             Some(watched) => {
                                 if watched < *threshold {
                                     all_met = false;
@@ -454,7 +593,12 @@ impl Registry {
 
     /// Keep the clock alive. It is never reaped.
     pub fn refresh_clock_expiration(&self) {
-        let _ = interlock_arm(&self.clock, CLOCK_TTL_NANOS);
+        // The clock is every client's liveness root, so a daemon that cannot keep it alive
+        // must die, not limp.
+        if interlock_arm(&self.clock, CLOCK_TTL_NANOS).is_err() {
+            eprintln!("abacus: the daemon clock is terminated; aborting");
+            std::process::abort();
+        }
     }
 
     // -- internals --
@@ -475,28 +619,49 @@ impl Registry {
         }
     }
 
-    /// The watched word's value, or `None` if the target is gone, recreated under the same
-    /// name, or itself terminated.
-    fn watched_value(&self, target: Target, word: WatchedWord) -> Option<u64> {
-        let words: &Interlock = match target {
-            Target::Clock => self.clock.words(),
+    /// The three words of a target, or `None` if the slot is empty or holds a different id.
+    fn words_of(&self, target: Target) -> Option<&Interlock> {
+        match target {
+            Target::Clock => Some(self.clock.words()),
             Target::Slot { slot, id } => {
                 let entry = self.slots.get(slot)?.as_ref()?;
                 if entry.id != id {
                     return None;
                 }
-                entry.handle.words()
+                Some(entry.handle.words())
             }
-        };
-        // A freed interlock has expiration_ns stamped to SENTINEL while its counter words
-        // remain live. Check all three words so a watcher in a lower slot (already past
-        // evaluate_all's forward scan of the target) does not read the stale counters.
-        if words.open_count.load(Ordering::Acquire) == SENTINEL
-            || words.closed_count.load(Ordering::Acquire) == SENTINEL
-            || words.expiration_ns.load(Ordering::Acquire) == SENTINEL
-        {
+        }
+    }
+
+    /// True when the target exists, none of its three words is SENTINEL, and its expiration
+    /// has not lapsed. A lapsed-but-unreaped target counts as dead, not alive: a create
+    /// against it must see the same refusal evaluate_all will enforce on the next pass. A
+    /// freed interlock has expiration_ns stamped to SENTINEL while its counter words remain
+    /// live; checking all three words lets a watcher in a lower slot (already past the
+    /// target in evaluate_all's forward scan) see the death. `Target::Clock` uses the
+    /// clock's own words; its expiration is refreshed every tick.
+    fn target_alive(&self, target: Target, now_ns: u64) -> bool {
+        match self.words_of(target) {
+            None => false,
+            Some(w) => {
+                let open = w.open_count.load(Ordering::Acquire);
+                let closed = w.closed_count.load(Ordering::Acquire);
+                let exp = w.expiration_ns.load(Ordering::Acquire);
+                open != SENTINEL
+                    && closed != SENTINEL
+                    && exp != SENTINEL
+                    && expiration_alive(exp, now_ns)
+            }
+        }
+    }
+
+    /// The watched word's value, or `None` if the target is gone, recreated under the same
+    /// name, lapsed, or itself terminated.
+    fn watched_value(&self, target: Target, word: WatchedWord, now_ns: u64) -> Option<u64> {
+        if !self.target_alive(target, now_ns) {
             return None;
         }
+        let words = self.words_of(target)?;
         let value = match word {
             WatchedWord::OpenCount => words.open_count.load(Ordering::Acquire),
             WatchedWord::ClosedCount => words.closed_count.load(Ordering::Acquire),
@@ -534,8 +699,11 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The first grid line strictly after `now_ms`, or `None` on overflow.
+/// The first grid line strictly after `now_ms`, or `None` on a zero interval or overflow.
 pub fn next_grid_line(now_ms: u64, interval_ms: u64) -> Option<u64> {
+    if interval_ms == 0 {
+        return None;
+    }
     (now_ms / interval_ms)
         .checked_add(1)?
         .checked_mul(interval_ms)
@@ -551,8 +719,11 @@ mod tests {
     }
 
     fn create_bare(r: &mut Registry, name: &str) -> (u64, InterlockHandle) {
-        r.create(name.into(), Tier::Interlock, None, None, None, None)
-            .unwrap()
+        r.create(CreateSpec {
+            name: name.into(),
+            ..Default::default()
+        })
+        .unwrap()
     }
 
     fn create_counter(
@@ -561,14 +732,13 @@ mod tests {
         watched: &str,
         word: u8,
     ) -> Result<(u64, InterlockHandle)> {
-        r.create(
-            name.into(),
-            Tier::WaitCounter,
-            Some(watched.into()),
-            Some(word),
-            None,
-            None,
-        )
+        r.create(CreateSpec {
+            name: name.into(),
+            tier: Tier::WaitCounter,
+            watched_name: Some(watched.into()),
+            watched_word: Some(word),
+            ..Default::default()
+        })
     }
 
     fn now_ms() -> u64 {
@@ -578,7 +748,7 @@ mod tests {
     #[test]
     fn clock_has_id_zero_and_is_attachable() {
         let r = registry();
-        let (id, handle) = r.attach(CLOCK_NAME).unwrap();
+        let (id, _, handle) = r.attach(CLOCK_NAME).unwrap();
         assert_eq!(id, CLOCK_ID);
         assert_eq!(handle.as_raw_fd(), r.clock().as_raw_fd());
         assert!(interlock_read_expiration(r.clock()) > monotonic_now_nanos());
@@ -588,7 +758,10 @@ mod tests {
     fn create_clock_name_rejected() {
         let mut r = registry();
         let err = r
-            .create(CLOCK_NAME.into(), Tier::Interlock, None, None, None, None)
+            .create(CreateSpec {
+                name: CLOCK_NAME.into(),
+                ..Default::default()
+            })
             .unwrap_err();
         assert!(matches!(err, Condition::InvalidRequest { .. }));
     }
@@ -597,19 +770,18 @@ mod tests {
     fn name_limits() {
         let mut r = registry();
         assert!(matches!(
-            r.create(String::new(), Tier::Interlock, None, None, None, None),
+            r.create(CreateSpec {
+                name: String::new(),
+                ..Default::default()
+            }),
             Err(Condition::InvalidRequest { .. })
         ));
         assert!(create_bare(&mut r, &"n".repeat(MAX_NAME_LEN)).0 > 0);
         assert!(matches!(
-            r.create(
-                "n".repeat(MAX_NAME_LEN + 1),
-                Tier::Interlock,
-                None,
-                None,
-                None,
-                None
-            ),
+            r.create(CreateSpec {
+                name: "n".repeat(MAX_NAME_LEN + 1),
+                ..Default::default()
+            }),
             Err(Condition::InvalidRequest { .. })
         ));
     }
@@ -621,7 +793,10 @@ mod tests {
         create_bare(&mut r, "b");
         assert_eq!(r.live_count(), 2);
         let err = r
-            .create("c".into(), Tier::Interlock, None, None, None, None)
+            .create(CreateSpec {
+                name: "c".into(),
+                ..Default::default()
+            })
             .unwrap_err();
         assert!(
             matches!(err, Condition::InvalidRequest { ref message } if message.contains("limit"))
@@ -658,18 +833,21 @@ mod tests {
         let mut r = registry();
         create_bare(&mut r, "src");
         assert!(matches!(
-            r.create("w".into(), Tier::WaitCounter, None, Some(0), None, None),
+            r.create(CreateSpec {
+                name: "w".into(),
+                tier: Tier::WaitCounter,
+                watched_word: Some(0),
+                ..Default::default()
+            }),
             Err(Condition::InvalidRequest { .. })
         ));
         assert!(matches!(
-            r.create(
-                "w".into(),
-                Tier::WaitCounter,
-                Some("src".into()),
-                None,
-                None,
-                None
-            ),
+            r.create(CreateSpec {
+                name: "w".into(),
+                tier: Tier::WaitCounter,
+                watched_name: Some("src".into()),
+                ..Default::default()
+            }),
             Err(Condition::InvalidRequest { .. })
         ));
         assert!(matches!(
@@ -688,22 +866,30 @@ mod tests {
     fn cron_validation_and_first_target() {
         let mut r = registry();
         assert!(matches!(
-            r.create("c".into(), Tier::WaitCron, None, None, Some(0), None),
+            r.create(CreateSpec {
+                name: "c".into(),
+                tier: Tier::WaitCron,
+                interval_ns: Some(0),
+                ..Default::default()
+            }),
             Err(Condition::InvalidRequest { .. })
         ));
         assert!(matches!(
-            r.create("c".into(), Tier::WaitCron, None, None, Some(500_000), None),
+            r.create(CreateSpec {
+                name: "c".into(),
+                tier: Tier::WaitCron,
+                interval_ns: Some(500_000),
+                ..Default::default()
+            }),
             Err(Condition::InvalidRequest { .. })
         ));
         let (_, h) = r
-            .create(
-                "c".into(),
-                Tier::WaitCron,
-                None,
-                None,
-                Some(10_000_000),
-                None,
-            )
+            .create(CreateSpec {
+                name: "c".into(),
+                tier: Tier::WaitCron,
+                interval_ns: Some(10_000_000),
+                ..Default::default()
+            })
             .unwrap();
         let clock_ms = r.clock().words().open_count.load(Ordering::Acquire);
         let open = h.words().open_count.load(Ordering::Acquire);
@@ -717,40 +903,38 @@ mod tests {
         let mut r = registry();
         create_bare(&mut r, "a");
         assert!(matches!(
-            r.create("b".into(), Tier::WaitBarrier, None, None, None, None),
+            r.create(CreateSpec {
+                name: "b".into(),
+                tier: Tier::WaitBarrier,
+                ..Default::default()
+            }),
             Err(Condition::InvalidRequest { .. })
         ));
         assert!(matches!(
-            r.create(
-                "b".into(),
-                Tier::WaitBarrier,
-                None,
-                None,
-                None,
-                Some(vec![])
-            ),
+            r.create(CreateSpec {
+                name: "b".into(),
+                tier: Tier::WaitBarrier,
+                barrier_conditions: Some(vec![]),
+                ..Default::default()
+            }),
             Err(Condition::InvalidRequest { .. })
         ));
         assert!(matches!(
-            r.create(
-                "b".into(),
-                Tier::WaitBarrier,
-                None,
-                None,
-                None,
-                Some(vec![("a".into(), 0, 1), ("zz".into(), 0, 1)])
-            ),
+            r.create(CreateSpec {
+                name: "b".into(),
+                tier: Tier::WaitBarrier,
+                barrier_conditions: Some(vec![("a".into(), 0, 1), ("zz".into(), 0, 1)]),
+                ..Default::default()
+            }),
             Err(Condition::InterlockNotFound { .. })
         ));
         let (_, h) = r
-            .create(
-                "b".into(),
-                Tier::WaitBarrier,
-                None,
-                None,
-                None,
-                Some(vec![("a".into(), 1, 3)]),
-            )
+            .create(CreateSpec {
+                name: "b".into(),
+                tier: Tier::WaitBarrier,
+                barrier_conditions: Some(vec![("a".into(), 1, 3)]),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(h.words().open_count.load(Ordering::Acquire), 1);
         assert_eq!(h.words().closed_count.load(Ordering::Acquire), 0);
@@ -781,7 +965,11 @@ mod tests {
     fn timer_fires_at_target_not_before() {
         let mut r = registry();
         let (_, h) = r
-            .create("t".into(), Tier::WaitTimer, None, None, None, None)
+            .create(CreateSpec {
+                name: "t".into(),
+                tier: Tier::WaitTimer,
+                ..Default::default()
+            })
             .unwrap();
         let base = h.words().open_count.load(Ordering::Acquire);
         h.words().open_count.store(base + 5, Ordering::Release);
@@ -843,14 +1031,12 @@ mod tests {
     fn cron_fires_rearms_and_skips_missed_lines() {
         let mut r = registry();
         let (_, h) = r
-            .create(
-                "c".into(),
-                Tier::WaitCron,
-                None,
-                None,
-                Some(10_000_000),
-                None,
-            )
+            .create(CreateSpec {
+                name: "c".into(),
+                tier: Tier::WaitCron,
+                interval_ns: Some(10_000_000),
+                ..Default::default()
+            })
             .unwrap();
         let first = h.words().open_count.load(Ordering::Acquire);
         let created_at = h.words().closed_count.load(Ordering::Acquire);
@@ -872,14 +1058,12 @@ mod tests {
         let (_, a) = create_bare(&mut r, "a");
         let (_, b) = create_bare(&mut r, "b");
         let (_, bar) = r
-            .create(
-                "bar".into(),
-                Tier::WaitBarrier,
-                None,
-                None,
-                None,
-                Some(vec![("a".into(), 1, 3), ("b".into(), 1, 3)]),
-            )
+            .create(CreateSpec {
+                name: "bar".into(),
+                tier: Tier::WaitBarrier,
+                barrier_conditions: Some(vec![("a".into(), 1, 3), ("b".into(), 1, 3)]),
+                ..Default::default()
+            })
             .unwrap();
         a.words().closed_count.store(3, Ordering::Release);
         r.evaluate_all(now_ms(), monotonic_now_nanos());
@@ -912,14 +1096,12 @@ mod tests {
         let mut r = registry();
         let (_, a) = create_bare(&mut r, "a");
         let (_, bar) = r
-            .create(
-                "bar".into(),
-                Tier::WaitBarrier,
-                None,
-                None,
-                None,
-                Some(vec![("a".into(), 0, 1)]),
-            )
+            .create(CreateSpec {
+                name: "bar".into(),
+                tier: Tier::WaitBarrier,
+                barrier_conditions: Some(vec![("a".into(), 0, 1)]),
+                ..Default::default()
+            })
             .unwrap();
         abacus_core::interlock::interlock_free(&a);
         r.evaluate_all(now_ms(), monotonic_now_nanos());

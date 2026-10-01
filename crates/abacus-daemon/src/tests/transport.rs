@@ -324,7 +324,7 @@ fn transport__next_request_decodes_complete_frame() {
     let path = unique_path("complete");
     let server = Server::create(&path, &SocketOptions::default()).expect("server");
     let mut raw = UnixStream::connect(&path).expect("connect");
-    let payload = [1u8, 0x02, 3, 0, b'a', b'b', b'c'];
+    let payload = [2u8, 0x02, 3, 0, b'a', b'b', b'c'];
     let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
     frame.extend_from_slice(&payload);
     raw.write_all(&frame).expect("write");

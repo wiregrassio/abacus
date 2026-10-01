@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use abacus_client::{AbacusClient, WaitState, WatchedWord};
-use abacus_tests::{unique_socket_path, wait_for, wait_for_daemon};
+use abacus_tests::{unique_name, unique_socket_path, wait_for, wait_for_daemon};
 
 /// A thread daemon that can be stopped: the stoppable form of `ThreadDaemon`.
 struct StoppableThreadDaemon {
@@ -87,7 +87,7 @@ fn daemon__stop_flag_exits_loop_and_removes_socket() {
 #[test]
 fn client__is_connected_true_then_false_after_daemon_stops() {
     let mut d = StoppableThreadDaemon::start("d14-connected");
-    let client = AbacusClient::connect(d.socket_path()).expect("connect");
+    let client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).expect("connect");
     assert!(
         client.is_connected(),
         "fresh connection reports disconnected"
@@ -104,7 +104,8 @@ fn client__is_connected_true_then_false_after_daemon_stops() {
 #[test]
 fn wait_counter__timeout_after_daemon_stop_is_timeout_state() {
     let mut d = StoppableThreadDaemon::start("d14-counter");
-    let mut client = AbacusClient::connect(d.socket_path()).expect("connect");
+    let mut client =
+        AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).expect("connect");
     let src = client.create_interlock("src").expect("create src");
     let counter = client
         .create_wait_counter("c", "src", WatchedWord::ClosedCount)

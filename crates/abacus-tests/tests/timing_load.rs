@@ -41,7 +41,8 @@ use std::time::{Duration, Instant};
 use abacus_client::{AbacusClient, WaitState};
 use abacus_tests::{
     abacus_binary, all_cores_except, daemon_core, describe_exit, nproc, pin_current_thread,
-    proc_status_field, role_args, role_command, run_child, serialized, Load, ProcessDaemon, Stats,
+    proc_status_field, role_args, role_command, run_child, serialized, unique_name, Load,
+    ProcessDaemon, Stats,
 };
 
 // ---------------------------------------------------------------------------
@@ -224,7 +225,7 @@ fn role__bench_wait_ms() {
     let sock = Path::new(&args[0]);
     let ms: u64 = args[1].parse().expect("ms");
     let n: usize = args[2].parse().expect("n");
-    let mut client = AbacusClient::connect(sock).expect("connect");
+    let mut client = AbacusClient::connect(sock, &unique_name("role"), &[]).expect("connect");
     let timer = client.create_wait_timer("bench").expect("create timer");
     let mut stats = Stats::new("elapsed_us", "us");
     let mut overrun = 0u64;

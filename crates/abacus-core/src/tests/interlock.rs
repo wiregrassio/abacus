@@ -139,6 +139,17 @@ fn interlock__arm_never_decrements() {
     assert_eq!(e2, e1, "arm 10 ms moved expiration from {e1} to {e2}");
 }
 
+#[test]
+fn interlock__arm_with_a_huge_ttl_does_not_terminate() {
+    let h = interlock_create().expect("create");
+    assert!(interlock_arm(&h, u64::MAX).is_ok());
+    assert!(
+        !interlock_is_terminated(&h),
+        "a huge TTL terminated the interlock"
+    );
+    assert_eq!(interlock_read_expiration(&h), SENTINEL - 1);
+}
+
 /// CONTRACTS.md TTL rules: interlock_arm checks expiration_ns == SENTINEL first and returns
 /// InterlockReaped without writing.
 #[test]

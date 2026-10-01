@@ -135,6 +135,13 @@ pub enum ProtocolFault {
         /// The field name.
         field: &'static str,
     },
+    /// A flag byte carried a value other than the expected set (e.g. owner flag not 0 or 1).
+    InvalidFlag {
+        /// Which field the flag belongs to.
+        field: &'static str,
+        /// The byte value received.
+        value: u8,
+    },
     /// A response carried more fds than its tag allows (e.g. an Error frame with an fd).
     UnexpectedFd,
 }
@@ -154,6 +161,9 @@ impl fmt::Display for ProtocolFault {
             Self::UnknownTag { tag } => write!(f, "unknown tag: 0x{tag:02x}"),
             Self::InvalidUtf8 => write!(f, "invalid UTF-8"),
             Self::MissingField { field } => write!(f, "missing field: {field}"),
+            Self::InvalidFlag { field, value } => {
+                write!(f, "invalid flag for {field}: {value}")
+            }
             Self::UnexpectedFd => write!(f, "unexpected fd on response"),
         }
     }

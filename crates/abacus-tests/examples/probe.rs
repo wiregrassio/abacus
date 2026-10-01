@@ -32,7 +32,9 @@ fn pct(v: &[u64], q: f64) -> u64 {
 }
 
 fn bench(sock: &Path, n: usize, ms: u64) {
-    let mut client = AbacusClient::connect(sock).expect("connect");
+    let pid = std::process::id();
+    let mut client =
+        AbacusClient::connect(sock, &format!("probe-bench-{pid}"), &[]).expect("connect");
     let timer = client
         .create_wait_timer(&format!("bench-{}", std::process::id()))
         .expect("create timer");
@@ -62,7 +64,9 @@ fn bench(sock: &Path, n: usize, ms: u64) {
 }
 
 fn cron(sock: &Path, interval_ms: u64, n: usize) {
-    let mut client = AbacusClient::connect(sock).expect("connect");
+    let pid = std::process::id();
+    let mut client =
+        AbacusClient::connect(sock, &format!("probe-cron-{pid}"), &[]).expect("connect");
     let c = client
         .create_wait_cron(&format!("cron-{}", std::process::id()), interval_ms)
         .expect("create cron");
@@ -94,7 +98,9 @@ fn cron(sock: &Path, interval_ms: u64, n: usize) {
 }
 
 fn barrier(sock: &Path) {
-    let mut client = AbacusClient::connect(sock).expect("connect");
+    let pid = std::process::id();
+    let mut client =
+        AbacusClient::connect(sock, &format!("probe-barrier-{pid}"), &[]).expect("connect");
     let src = client.create_interlock("b-src").expect("create src");
     let b = client
         .create_wait_barrier(

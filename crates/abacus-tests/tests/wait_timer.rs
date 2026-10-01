@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use abacus_client::{AbacusClient, SdkError, WaitState};
 use abacus_tests::{
-    describe_exit, on_thread, recv_within, role_args, role_command, wait_child, wait_for,
-    ThreadDaemon,
+    describe_exit, on_thread, recv_within, role_args, role_command, unique_name, wait_child,
+    wait_for, ThreadDaemon,
 };
 
 /// SURFACE.md WaitTimer: wait_ms(W) returns Normal or Overrun after about W, and
@@ -126,7 +126,8 @@ fn role__wait_until_past() {
     let Some(args) = role_args("role__wait_until_past") else {
         return;
     };
-    let mut client = AbacusClient::connect(Path::new(&args[0])).expect("connect");
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
     let timer = client.create_wait_timer("past").expect("create timer");
     let created_at = client.clock().now_ms();
     wait_for(Duration::from_millis(200), Duration::from_millis(1), || {

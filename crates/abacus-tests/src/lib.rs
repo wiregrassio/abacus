@@ -7,7 +7,7 @@
 //! Rules the kit enforces by shape:
 //! - [`wait_for`] is the only way a test waits for a condition. No fixed sleeps as sync.
 //! - Every daemon gets its own socket path ([`unique_socket_path`]).
-//! - Hostile clients speak wire ABI v1 by hand ([`RawClient`]), independent of the SDK.
+//! - Hostile clients speak wire ABI v2 by hand ([`RawClient`]), independent of the SDK.
 //! - Child processes are this test binary re-executed with a role ([`role_command`]).
 //! - Anything that maps an interlock a hostile client can poison runs in a child process,
 //!   never in the test process itself (a shrunk memfd SIGBUSes every mapper).
@@ -17,7 +17,7 @@
 pub mod permissions;
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -30,7 +30,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use abacus_client::{AbacusClient, TimeoutPolicy};
-use abacus_core::error::TransportError;
+use abacus_core::error::{ProtocolFault, TransportError};
 use abacus_core::interlock::{interlock_map, interlock_map_clock, InterlockHandle};
 use abacus_daemon::daemon::{daemon_run_with, DaemonConfig};
 use abacus_wire::{
@@ -44,7 +44,8 @@ use abacus_wire::{
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// A socket path no other test shares: `<tmp>/abacus-test-<label>-<pid>-<n>.sock`.
-/// Labels are capped at 40 bytes so the path fits `sun_path` (108 bytes).
+/// The label is capped at 40 bytes and the whole path is checked against `sun_path`
+/// (108 bytes).
 pub fn unique_socket_path(label: &str) -> PathBuf {
     assert!(
         label.len() <= 40,
@@ -53,7 +54,14 @@ pub fn unique_socket_path(label: &str) -> PathBuf {
     );
     let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("abacus-test-{label}-{pid}-{id}.sock"))
+    let path = std::env::temp_dir().join(format!("abacus-test-{label}-{pid}-{id}.sock"));
+    assert!(
+        path.as_os_str().len() < 108,
+        "socket path {} is {} bytes; sun_path holds 107 plus the NUL",
+        path.display(),
+        path.as_os_str().len()
+    );
+    path
 }
 
 /// An interlock name no other call in this process returns: `<prefix>-<n>`.
@@ -239,16 +247,6 @@ impl ThreadDaemon {
         }
     }
 
-    /// Stop, then start again on the same path.
-    pub fn restart(&mut self, label: &str) {
-        self.stop();
-        let config = DaemonConfig::new(self.path.clone());
-        let fresh = Self::start_with(label, config);
-        self.stop = fresh.stop.clone();
-        let mut fresh = fresh;
-        self.thread = fresh.thread.take();
-    }
-
     /// Connect an SDK client to this daemon, panicking with the error if it fails. Timers
     /// this client creates use `TimeoutPolicy::Error`, not the SDK's `Abort` default: a
     /// missed fatal margin in the test process must not `process::abort()` the test binary
@@ -256,14 +254,27 @@ impl ThreadDaemon {
     /// via `role_command` connect their own `AbacusClient` directly and keep the `Abort`
     /// default, since they are meant to abort on timeout.
     pub fn client(&self) -> AbacusClient {
-        let mut client = AbacusClient::connect(&self.path).unwrap_or_else(|e| {
-            panic!(
-                "connect to thread daemon {} failed: {e}",
-                self.path.display()
-            )
-        });
+        let mut client =
+            AbacusClient::connect(&self.path, &unique_name("pc"), &[]).unwrap_or_else(|e| {
+                panic!(
+                    "connect to thread daemon {} failed: {e}",
+                    self.path.display()
+                )
+            });
         client.set_timeout_policy(TimeoutPolicy::Error);
         client
+    }
+
+    /// Connect with an explicit clock name and dependencies. Returns the error instead of
+    /// panicking. Error policy.
+    pub fn client_with(
+        &self,
+        clock_name: &str,
+        dependencies: &[&str],
+    ) -> Result<AbacusClient, abacus_client::SdkError> {
+        let mut client = AbacusClient::connect(&self.path, clock_name, dependencies)?;
+        client.set_timeout_policy(TimeoutPolicy::Error);
+        Ok(client)
     }
 }
 
@@ -419,10 +430,15 @@ impl ProcessDaemon {
 
     /// Send `signal` (a `libc::SIG*` constant) to the daemon.
     pub fn kill(&mut self, signal: i32) {
+        let pid = self.child.id() as libc::pid_t;
         // SAFETY: plain kill(2) on a pid this guard owns.
-        unsafe {
-            libc::kill(self.child.id() as libc::pid_t, signal);
-        }
+        let rc = unsafe { libc::kill(pid, signal) };
+        assert_eq!(
+            rc,
+            0,
+            "kill({pid}, {signal}) failed: {}",
+            io::Error::last_os_error()
+        );
     }
 
     /// Wait for the daemon to exit, reaping it. Fails with the observed state on deadline.
@@ -490,10 +506,12 @@ impl ProcessDaemon {
             .collect()
     }
 
-    /// SIGKILL the daemon, reap it, and start a fresh one on the same socket path. The stale
-    /// socket file is left for the new daemon to replace, as a real restart would.
+    /// SIGKILL the daemon if it is still running, reap it, and start a fresh one on the same socket path.
+    /// The stale socket file is left for the new daemon to replace, as a real restart would.
     pub fn restart(&mut self) {
-        self.kill(libc::SIGKILL);
+        if self.is_alive() {
+            self.kill(libc::SIGKILL);
+        }
         self.wait_exit(Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("restart: old daemon did not exit: {e}"));
         let t0 = Instant::now();
@@ -514,14 +532,27 @@ impl ProcessDaemon {
     /// created via `role_command` connect their own `AbacusClient` directly and keep the
     /// `Abort` default, since they are meant to abort on timeout.
     pub fn client(&self) -> AbacusClient {
-        let mut client = AbacusClient::connect(&self.path).unwrap_or_else(|e| {
-            panic!(
-                "connect to process daemon {} failed: {e}",
-                self.path.display()
-            )
-        });
+        let mut client =
+            AbacusClient::connect(&self.path, &unique_name("pc"), &[]).unwrap_or_else(|e| {
+                panic!(
+                    "connect to process daemon {} failed: {e}",
+                    self.path.display()
+                )
+            });
         client.set_timeout_policy(TimeoutPolicy::Error);
         client
+    }
+
+    /// Connect with an explicit clock name and dependencies. Returns the error instead of
+    /// panicking. Error policy.
+    pub fn client_with(
+        &self,
+        clock_name: &str,
+        dependencies: &[&str],
+    ) -> Result<AbacusClient, abacus_client::SdkError> {
+        let mut client = AbacusClient::connect(&self.path, clock_name, dependencies)?;
+        client.set_timeout_policy(TimeoutPolicy::Error);
+        Ok(client)
     }
 }
 
@@ -847,10 +878,118 @@ pub fn signal_name(signal: i32) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Wire ABI v1 by hand
+// Child output pipes
 // ---------------------------------------------------------------------------
 
-pub const WIRE_VERSION: u8 = 1;
+/// Lines read from a child's pipe, each stamped with the instant the reader thread read it.
+pub type LineRx = Receiver<(Instant, String)>;
+
+/// Spawn a thread that reads `pipe` line by line, sending (Instant, line) over a channel.
+/// A read error is sent as one final `<{label} read error: ...>` line.
+fn spawn_line_reader<R: Read + Send + 'static>(pipe: R, label: &'static str) -> LineRx {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        // A reader that stops early closes the child's pipe and makes the child's next write fail with EPIPE.
+        let mut receiver_gone = false;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = line.trim_end_matches(['\n', '\r']).to_string();
+                    if !receiver_gone && tx.send((Instant::now(), line)).is_err() {
+                        receiver_gone = true;
+                    }
+                }
+                Err(e) => {
+                    if !receiver_gone {
+                        let _ = tx.send((Instant::now(), format!("<{label} read error: {e}>")));
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// Spawn a thread that reads a child's stdout line by line, sending (Instant, line) over a
+/// channel. Start right after spawn. `wait_for_ready` takes stdout itself, so use one or the
+/// other on a child.
+pub fn spawn_stdout_reader(child: &mut Child) -> LineRx {
+    let stdout = child.stdout.take().expect("child stdout not piped");
+    spawn_line_reader(stdout, "stdout")
+}
+
+/// Spawn a thread that reads a child's stderr line by line, sending (Instant, line) over a
+/// channel. Start right after spawn.
+pub fn spawn_stderr_reader(child: &mut Child) -> LineRx {
+    let stderr = child.stderr.take().expect("child stderr not piped");
+    spawn_line_reader(stderr, "stderr")
+}
+
+/// Wait for a child to print `ready` on stdout, within 5 s. `role_command` runs the role
+/// under libtest's own `--exact --nocapture`, which writes a `test <name> ... ` status
+/// prefix to stdout before the role's own output, on the same line (no newline between
+/// them) -- so the line the role's `println!("ready")` lands on is never `ready` alone. A
+/// line counts when its last whitespace-separated word is exactly `ready`: an exact-word
+/// match, not a raw substring search that would also fire on a word like `already`.
+/// Panics on deadline.
+pub fn wait_for_ready(child: &mut std::process::Child) {
+    let rx = spawn_stdout_reader(child);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("child pid {} did not print ready within 5 s", child.id());
+        }
+        match rx.recv_timeout(remaining) {
+            Ok((_, line)) if line.split_whitespace().last() == Some("ready") => return,
+            Ok(_) => continue,
+            Err(_) => panic!("child pid {} did not print ready within 5 s", child.id()),
+        }
+    }
+}
+
+/// The first `abacus: ` line from a stderr reader, if it was read by `deadline`. A line
+/// already buffered when the deadline passes is still examined, but its read timestamp
+/// decides: a line read after the deadline is an error naming how late it was, never a pass.
+pub fn recv_abacus_line(rx: &LineRx, deadline: Instant) -> Result<(Instant, String), String> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let next = if remaining.is_zero() {
+            rx.try_recv().ok()
+        } else {
+            rx.recv_timeout(remaining).ok()
+        };
+        match next {
+            Some((t, line)) if line.starts_with("abacus: ") => {
+                if t > deadline {
+                    return Err(format!(
+                        "first abacus: line was read {} ms after the deadline: {line}",
+                        (t - deadline).as_millis()
+                    ));
+                }
+                return Ok((t, line));
+            }
+            Some(_) => continue,
+            None => return Err("no abacus: line by the deadline".to_string()),
+        }
+    }
+}
+
+/// The reason field of an SDK diagnostic line `abacus: <Reason>: <detail>`, for an exact
+/// comparison.
+pub fn abacus_reason(line: &str) -> Option<&str> {
+    line.strip_prefix("abacus: ")?.split(':').next()
+}
+
+// ---------------------------------------------------------------------------
+// Wire ABI v2 by hand
+// ---------------------------------------------------------------------------
+
+pub const WIRE_VERSION: u8 = 2;
 pub const TAG_CREATE: u8 = 0x01;
 pub const TAG_ATTACH: u8 = 0x02;
 pub const TAG_CREATED: u8 = 0x81;
@@ -871,7 +1010,7 @@ pub const TIER_WAIT_BARRIER: u8 = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawResponse {
     Created { id: u64 },
-    Attached { id: u64 },
+    Attached { id: u64, tier: u8 },
     Error { code: u8, message: String },
 }
 
@@ -889,6 +1028,7 @@ fn put_string(buf: &mut Vec<u8>, s: &[u8]) {
 
 /// Create request payload (no length prefix). `watched` is (name, word) for tier 1;
 /// `interval_ns` for tier 3; `conditions` as (name, word, threshold) for tier 4.
+/// `owner` is (name, id); `dependencies` is a list of names.
 pub fn create_payload(
     name: &[u8],
     tier: u8,
@@ -896,9 +1036,36 @@ pub fn create_payload(
     interval_ns: Option<u64>,
     conditions: Option<&[(&[u8], u8, u64)]>,
 ) -> Vec<u8> {
+    create_payload_v2(name, tier, None, &[], watched, interval_ns, conditions)
+}
+
+/// Full v2 create payload with owner and dependencies.
+pub fn create_payload_v2(
+    name: &[u8],
+    tier: u8,
+    owner: Option<(&[u8], u64)>,
+    dependencies: &[&[u8]],
+    watched: Option<(&[u8], u8)>,
+    interval_ns: Option<u64>,
+    conditions: Option<&[(&[u8], u8, u64)]>,
+) -> Vec<u8> {
     let mut p = vec![WIRE_VERSION, TAG_CREATE];
     put_string(&mut p, name);
     p.push(tier);
+    match owner {
+        Some((oname, oid)) => {
+            p.push(1);
+            put_string(&mut p, oname);
+            p.extend_from_slice(&oid.to_le_bytes());
+        }
+        None => {
+            p.push(0);
+        }
+    }
+    p.extend_from_slice(&(dependencies.len() as u16).to_le_bytes());
+    for dep in dependencies {
+        put_string(&mut p, dep);
+    }
     if let Some((wn, ww)) = watched {
         put_string(&mut p, wn);
         p.push(ww);
@@ -938,16 +1105,20 @@ pub fn parse_response(payload: &[u8]) -> Result<RawResponse, String> {
     }
     let rest = &payload[2..];
     match payload[1] {
-        TAG_CREATED | TAG_ATTACHED => {
+        TAG_CREATED => {
             if rest.len() < 8 {
                 return Err(format!("id truncated: {} bytes", rest.len()));
             }
             let id = u64::from_le_bytes(rest[..8].try_into().unwrap());
-            Ok(if payload[1] == TAG_CREATED {
-                RawResponse::Created { id }
-            } else {
-                RawResponse::Attached { id }
-            })
+            Ok(RawResponse::Created { id })
+        }
+        TAG_ATTACHED => {
+            if rest.len() < 9 {
+                return Err(format!("attached truncated: {} bytes", rest.len()));
+            }
+            let id = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            let tier = rest[8];
+            Ok(RawResponse::Attached { id, tier })
         }
         TAG_ERROR => {
             if rest.is_empty() {
@@ -1088,7 +1259,7 @@ pub fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
     Ok(payload)
 }
 
-/// A `UnixStream` that speaks wire ABI v1 by hand. This is how hostile and protocol tests
+/// A `UnixStream` that speaks wire ABI v2 by hand. This is how hostile and protocol tests
 /// are written, independent of the SDK. Defaults to a 2 s read timeout so a wedged daemon
 /// fails the test instead of hanging it.
 pub struct RawClient {
@@ -1164,9 +1335,11 @@ impl RawClient {
     ) -> io::Result<()> {
         let conds: Option<Vec<(&[u8], u8, u64)>> =
             conditions.map(|c| c.iter().map(|(n, w, t)| (n.as_bytes(), *w, *t)).collect());
-        let payload = create_payload(
+        let payload = create_payload_v2(
             name.as_bytes(),
             tier,
+            None,
+            &[],
             watched.map(|(n, w)| (n.as_bytes(), w)),
             interval_ns,
             conds.as_deref(),
@@ -1281,16 +1454,23 @@ impl RawClient {
     pub fn recv_response(&mut self) -> Result<(Response, Vec<OwnedFd>), TransportError> {
         let (prefix, fds) = recv_prefix_with_fds(&mut self.stream)?;
         let len = u32::from_le_bytes(prefix) as usize;
+        if len > MAX_PAYLOAD {
+            return Err(TransportError::Protocol {
+                fault: ProtocolFault::FrameTooLarge {
+                    len,
+                    max: MAX_PAYLOAD,
+                },
+            });
+        }
         let mut payload = vec![0u8; len];
         read_exact(&mut self.stream, &mut payload)?;
         let resp = decode_response(&payload).map_err(|fault| TransportError::Protocol { fault })?;
         Ok((resp, fds))
     }
 
-    /// True if the daemon has closed this connection (read returns EOF within the timeout).
-    /// Alias for [`peer_closed`].
+    /// True if the daemon closes this connection within 500 ms. Bounded wait, not a single peek: the daemon's close can land just after the request that caused it.
     pub fn is_closed_by_peer(&mut self) -> bool {
-        self.peer_closed()
+        self.wait_peer_closed(Duration::from_millis(500)).is_ok()
     }
 
     /// Mutable reference to the underlying stream.
@@ -1423,9 +1603,10 @@ impl FakeConn {
         self.send_frame_with_fds(&p, fds)
     }
 
-    pub fn send_attached(&mut self, id: u64, fds: &[RawFd]) -> io::Result<()> {
+    pub fn send_attached(&mut self, id: u64, tier: u8, fds: &[RawFd]) -> io::Result<()> {
         let mut p = vec![WIRE_VERSION, TAG_ATTACHED];
         p.extend_from_slice(&id.to_le_bytes());
+        p.push(tier);
         self.send_frame_with_fds(&p, fds)
     }
 
@@ -1524,10 +1705,12 @@ impl Rng {
 
     /// Seed from `ABACUS_TEST_SEED` when set, else `default`.
     pub fn from_env(default: u64) -> Self {
-        let seed = std::env::var("ABACUS_TEST_SEED")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default);
+        let seed = match std::env::var("ABACUS_TEST_SEED") {
+            Ok(s) => s
+                .parse()
+                .unwrap_or_else(|e| panic!("ABACUS_TEST_SEED={s:?} is not a u64: {e}")),
+            Err(_) => default,
+        };
         Self::new(seed)
     }
 

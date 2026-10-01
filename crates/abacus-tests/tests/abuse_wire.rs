@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 
 use abacus_client::{AbacusClient, WaitState};
 use abacus_tests::{
-    abacus_binary, attach_payload, create_payload, describe_exit, frame, role_args, role_command,
-    serialized, wait_child, wait_for, ProcessDaemon, RawClient, RawResponse, Rng,
-    ERR_INVALID_REQUEST, TIER_INTERLOCK, TIER_WAIT_BARRIER, TIER_WAIT_COUNTER, TIER_WAIT_CRON,
-    TIER_WAIT_TIMER,
+    abacus_binary, attach_payload, create_payload, create_payload_v2, describe_exit, frame,
+    role_args, role_command, serialized, unique_name, wait_child, wait_for, ProcessDaemon,
+    RawClient, RawResponse, Rng, ERR_INVALID_REQUEST, TIER_INTERLOCK, TIER_WAIT_BARRIER,
+    TIER_WAIT_COUNTER, TIER_WAIT_CRON, TIER_WAIT_TIMER,
 };
 
 /// Seeds; override with `ABACUS_TEST_SEED` to replay. Printed on every failure.
@@ -134,7 +134,8 @@ fn role__health_client() {
     let Some(args) = role_args("role__health_client") else {
         return;
     };
-    let mut client = AbacusClient::connect(Path::new(&args[0])).expect("connect");
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
     let timer = client.create_wait_timer("health").expect("create timer");
     let r = timer.wait_ms(5).expect("wait_ms");
     assert!(
@@ -247,7 +248,7 @@ fn random_frame(rng: &mut Rng, _c: usize, _f: usize) -> Vec<u8> {
 
 fn mutated_frame(rng: &mut Rng, c: usize, f: usize) -> Vec<u8> {
     let name = format!("m-{c}-{f}");
-    let payload = match rng.below(7) {
+    let payload = match rng.below(9) {
         0 => create_payload(name.as_bytes(), TIER_INTERLOCK, None, None, None),
         1 => create_payload(
             name.as_bytes(),
@@ -272,6 +273,24 @@ fn mutated_frame(rng: &mut Rng, c: usize, f: usize) -> Vec<u8> {
             Some(&[(b"clock", 0, 1), (b"clock", 1, 1)]),
         ),
         5 => attach_payload(b"clock"),
+        6 => create_payload_v2(
+            name.as_bytes(),
+            TIER_INTERLOCK,
+            Some((b"pc", 42)),
+            &[],
+            None,
+            None,
+            None,
+        ),
+        7 => create_payload_v2(
+            name.as_bytes(),
+            TIER_INTERLOCK,
+            Some((b"pc", 1)),
+            &[b"a", b"bb", b"ccc"],
+            None,
+            None,
+            None,
+        ),
         _ => attach_payload(name.as_bytes()),
     };
     let mut bytes = frame(&payload);

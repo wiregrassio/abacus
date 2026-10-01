@@ -18,8 +18,8 @@ use abacus_client::{AbacusClient, WaitState};
 use abacus_core::interlock::{interlock_arm, interlock_free, InterlockHandle};
 use abacus_tests::{
     abacus_binary, attach_payload, describe_exit, frame, map_fd, raise_fd_limit, role_args,
-    role_command, send_with_fds, serialized, wait_child, wait_for, ProcessDaemon, RawClient,
-    RawResponse, ERR_ALLOCATION_FAILED, ERR_INVALID_REQUEST, TIER_INTERLOCK,
+    role_command, send_with_fds, serialized, unique_name, wait_child, wait_for, ProcessDaemon,
+    RawClient, RawResponse, ERR_ALLOCATION_FAILED, ERR_INVALID_REQUEST, TIER_INTERLOCK,
 };
 
 const IDLE_CONNECTIONS: usize = 1000;
@@ -146,7 +146,8 @@ fn role__health_client() {
     let Some(args) = role_args("role__health_client") else {
         return;
     };
-    let mut client = AbacusClient::connect(Path::new(&args[0])).expect("connect");
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
     let timer = client.create_wait_timer("health").expect("create timer");
     let r = timer.wait_ms(5).expect("wait_ms");
     assert!(

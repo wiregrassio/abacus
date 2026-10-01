@@ -182,6 +182,19 @@ fn types__sdk_error_every_variant_displays() {
             },
             "0x99",
         ),
+        (
+            SdkError::DependencyTimeout {
+                waited: std::time::Duration::from_secs(1),
+                missing: "dep".into(),
+            },
+            "dep",
+        ),
+        (
+            SdkError::KeepaliveSpawnFailed {
+                message: "EAGAIN".into(),
+            },
+            "EAGAIN",
+        ),
     ];
     for (err, token) in cases {
         let s = err.to_string();

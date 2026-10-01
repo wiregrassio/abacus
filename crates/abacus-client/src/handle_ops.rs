@@ -27,10 +27,10 @@ fn word_of(handle: &InterlockHandle, word: Word) -> &AtomicU64 {
 /// Read both counters: (open_count, closed_count).
 pub(crate) fn peek(handle: &InterlockHandle) -> (u64, u64) {
     let words = handle.words();
-    (
-        words.open_count.load(Ordering::Acquire),
-        words.closed_count.load(Ordering::Acquire),
-    )
+    // closed first: open only grows, and grows before closed, so this pair never reads closed past open.
+    let closed = words.closed_count.load(Ordering::Acquire);
+    let open = words.open_count.load(Ordering::Acquire);
+    (open, closed)
 }
 
 /// Signed difference open_count minus closed_count, wrapping. Counters above 2^63 are outside
@@ -43,8 +43,9 @@ pub(crate) fn value(handle: &InterlockHandle) -> i64 {
 /// The lifecycle state, read against CLOCK_MONOTONIC.
 pub(crate) fn state(handle: &InterlockHandle) -> InterlockState {
     let words = handle.words();
-    let open = words.open_count.load(Ordering::Acquire);
+    // closed first: open only grows, and grows before closed, so this pair never reads closed past open.
     let closed = words.closed_count.load(Ordering::Acquire);
+    let open = words.open_count.load(Ordering::Acquire);
     let expiration_ns = words.expiration_ns.load(Ordering::Acquire);
     interlock_state(open, closed, expiration_ns, monotonic_now_nanos())
 }
@@ -64,20 +65,27 @@ pub(crate) fn touch(handle: &InterlockHandle, ms: u64) -> Result<(), SdkError> {
     interlock_arm(handle, ms_to_nanos(ms)).map_err(SdkError::from)
 }
 
-/// Add `h` to a counter and wake its waiters. Sentinel-aware: if the word was already at
-/// SENTINEL, or the addition would carry it past SENTINEL, the sentinel is restored and
-/// `InterlockReaped` is returned, so a free() by another holder cannot be undone by a
-/// wrapping increment. Restoring is idempotent, so the race with a concurrent free is benign.
+/// Add `h` to a counter and wake its waiters. A word at SENTINEL is never written; an addition that would reach or pass SENTINEL terminates the word. Either returns `InterlockReaped`.
 pub(crate) fn increment(handle: &InterlockHandle, word: Word, h: u64) -> Result<(), SdkError> {
     let w = word_of(handle, word);
-    let old = w.fetch_add(h, Ordering::AcqRel);
-    if old == SENTINEL || old >= SENTINEL - h {
-        w.store(SENTINEL, Ordering::Release);
-        futex_wake(w);
-        return Err(SdkError::InterlockReaped);
+    // Never touch a terminated word, and never carry a live word onto or past SENTINEL.
+    let r = w.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+        (cur != SENTINEL && cur < SENTINEL - h).then(|| cur + h)
+    });
+    match r {
+        Ok(_) => {
+            futex_wake(w);
+            Ok(())
+        }
+        Err(cur) => {
+            // An increment that would reach SENTINEL terminates the word, as before.
+            if cur != SENTINEL {
+                w.store(SENTINEL, Ordering::Release);
+            }
+            futex_wake(w);
+            Err(SdkError::InterlockReaped)
+        }
     }
-    futex_wake(w);
-    Ok(())
 }
 
 /// Block until `word` reaches `target`. `timeout` bounds the whole wait; `None` blocks
@@ -115,7 +123,8 @@ pub(crate) fn wait_word(
         // Check the daemon-owned clock's expiration. The client keepalive cannot re-arm
         // the clock (it is read-only), so after daemon death this fires within one clock TTL.
         let clock_exp = clock.words().expiration_ns.load(Ordering::Acquire);
-        if clock_exp != SENTINEL && clock_exp < now {
+        // A terminated daemon clock (SENTINEL) is dead, not alive.
+        if clock_exp == SENTINEL || clock_exp < now {
             return Err(SdkError::InterlockReaped);
         }
         let mut wait_ns = DEFAULT_TIMEOUT_NANOS;

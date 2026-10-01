@@ -50,7 +50,8 @@ fn main() {
     // Three clients, one per thread. Each client is one daemon connection with its own
     // keepalive thread.
 
-    let mut coord = AbacusClient::connect(sock).expect("connect coordinator");
+    let mut coord =
+        AbacusClient::connect(sock, &format!("pod-{pid}-coord"), &[]).expect("connect coordinator");
     coord.set_timeout_policy(TimeoutPolicy::Error);
 
     // Coordinator creates the shared interlocks so names exist before threads start.
@@ -71,7 +72,8 @@ fn main() {
     let cam_sock = sock.to_owned();
     let cam_frame = frame_name.clone();
     let cam_handle = thread::spawn(move || {
-        let mut client = AbacusClient::connect(&cam_sock).expect("connect producer");
+        let mut client = AbacusClient::connect(&cam_sock, &format!("pod-{pid}-cam"), &[])
+            .expect("connect producer");
         client.set_timeout_policy(TimeoutPolicy::Error);
         let frame = client.attach_interlock(&cam_frame).expect("attach frame");
 
@@ -87,7 +89,8 @@ fn main() {
     let inf_frame = frame_name.clone();
     let inf_result = result_name.clone();
     let inf_handle = thread::spawn(move || {
-        let mut client = AbacusClient::connect(&inf_sock).expect("connect consumer");
+        let mut client = AbacusClient::connect(&inf_sock, &format!("pod-{pid}-inf"), &[])
+            .expect("connect consumer");
         client.set_timeout_policy(TimeoutPolicy::Error);
 
         // Watch the producer's frame count.

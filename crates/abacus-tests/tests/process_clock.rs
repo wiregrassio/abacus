@@ -13,10 +13,8 @@ use abacus_tests::{wait_for, ThreadDaemon};
 #[test]
 fn process_clock__uptime_advances_and_start_is_fixed() {
     let d = ThreadDaemon::start("pc-uptime");
-    let mut client = d.client();
-    let pc = client
-        .create_process_clock("pc")
-        .expect("create process clock");
+    let client = d.client();
+    let pc = client.process_clock();
     let start = pc.start_time_ms();
     assert!(start > 0, "start_time_ms is zero");
     assert!(pc.last_seen_ms() >= start);
@@ -44,43 +42,23 @@ fn process_clock__uptime_advances_and_start_is_fixed() {
     assert!(!pc.is_reaped());
 }
 
-/// CONTRACTS.md UDS surface: recreating the name reaps the old process clock;
-/// its touch thread observes the reap and is_reaped() turns true.
-#[test]
-fn process_clock__is_reaped_after_recreate() {
-    let d = ThreadDaemon::start("pc-recreate");
-    let mut client = d.client();
-    let old = client.create_process_clock("pc").expect("create 1");
-    assert!(!old.is_reaped(), "fresh process clock reports reaped");
-    let _new = client.create_process_clock("pc").expect("create 2");
-    let elapsed = wait_for(Duration::from_millis(300), Duration::from_millis(2), || {
-        old.is_reaped()
-    })
-    .unwrap_or_else(|e| {
-        panic!(
-            "old process clock never reported reaped: {e}; uptime={}",
-            old.uptime_ms()
-        )
-    });
-    assert!(
-        elapsed < Duration::from_millis(150),
-        "is_reaped took {elapsed:?} (touch interval is 40 ms)"
-    );
-}
+// process_clock__is_reaped_after_recreate: REMOVED. The claim (a second user-created
+// ProcessClock on the same client) no longer exists. connect creates the one and only
+// ProcessClock; there is no create_process_clock. Replacement semantics are tested by
+// liveness__recreated_clock_aborts_the_old_process (Stage 4, two processes).
 
 /// LIFECYCLE.md ProcessClock pattern: a WaitCounter watching the process clock's open_count
 /// fires at an uptime threshold.
 #[test]
 fn process_clock__watcher_fires_at_uptime_threshold() {
     let d = ThreadDaemon::start("pc-watch");
-    let mut client = d.client();
-    let pc = client
-        .create_process_clock("pc")
-        .expect("create process clock");
+    let mut client = d.client_with("pc-watch-clock", &[]).unwrap();
+    let pc_name = client.process_clock().name().to_string();
+    let start = client.process_clock().start_time_ms();
     let counter = client
-        .create_wait_counter("uptime-50", "pc", WatchedWord::OpenCount)
+        .create_wait_counter("uptime-50", &pc_name, WatchedWord::OpenCount)
         .expect("create counter");
-    let target = pc.start_time_ms() + 50;
+    let target = start + 50;
     let t0 = Instant::now();
     let r = counter.wait_until(target, 500);
     let elapsed = t0.elapsed();
@@ -100,6 +78,6 @@ fn process_clock__watcher_fires_at_uptime_threshold() {
     assert!(
         elapsed >= Duration::from_millis(10) && elapsed < Duration::from_millis(200),
         "uptime watcher fired after {elapsed:?}; uptime={}",
-        pc.uptime_ms()
+        client.process_clock().uptime_ms()
     );
 }

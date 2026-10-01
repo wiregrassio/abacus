@@ -1,15 +1,16 @@
 //! AbacusClient: the connection to the daemon, the SDK error type, and the create and attach
 //! calls that hand back typed handles.
 
+use std::collections::HashSet;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use abacus_core::error::{Condition, IoOperation, ProtocolFault, TransportError};
 use abacus_core::interlock::{
-    interlock_map, interlock_map_barrier, interlock_map_clock, interlock_map_counter,
-    interlock_map_cron, interlock_map_timer, InterlockHandle,
+    interlock_free, interlock_map, interlock_map_barrier, interlock_map_clock,
+    interlock_map_counter, interlock_map_cron, interlock_map_timer, InterlockHandle, CLOCK_NAME,
 };
 use abacus_wire::{
     decode_response, encode_request, expected_fd_count, read_exact, recv_prefix_with_fds,
@@ -20,7 +21,10 @@ use abacus_wire::{
 use crate::interlock::{AttachedInterlock, AttachedWaitCounter, ClockHandle, Interlock};
 use crate::process_clock::ProcessClock;
 use crate::touch::Keepalive;
-use crate::types::{TimeoutPolicy, WatchedWord, DEFAULT_TRANSPORT_TIMEOUT, MIN_FATAL_MARGIN_MS};
+use crate::types::{
+    Liveness, TimeoutPolicy, WatchedWord, CONNECT_RETRY_INTERVAL, DEFAULT_TRANSPORT_TIMEOUT,
+    MIN_FATAL_MARGIN_MS,
+};
 use crate::wait_barrier::WaitBarrier;
 use crate::wait_counter::WaitCounter;
 use crate::wait_cron::WaitCron;
@@ -64,6 +68,19 @@ pub enum SdkError {
     },
     /// A WaitTimer's fatal margin elapsed without delivery, under `TimeoutPolicy::Error`.
     DeliveryTimeout,
+    /// A dependency or the daemon did not appear within the ceiling passed to `connect_waiting`.
+    DependencyTimeout {
+        /// How long the wait ran.
+        waited: Duration,
+        /// The dependency name or socket path that was still missing.
+        missing: String,
+    },
+    /// The SDK could not start its keepalive thread (for example EAGAIN at the thread
+    /// limit). Nothing was registered.
+    KeepaliveSpawnFailed {
+        /// The spawn error.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for SdkError {
@@ -80,6 +97,12 @@ impl std::fmt::Display for SdkError {
                 f,
                 "DeliveryTimeout: daemon did not deliver within the margin"
             ),
+            Self::DependencyTimeout { waited, missing } => {
+                write!(f, "dependency timeout: waited {waited:?} for \"{missing}\"")
+            }
+            Self::KeepaliveSpawnFailed { message } => {
+                write!(f, "keepalive thread spawn failed: {message}")
+            }
         }
     }
 }
@@ -220,39 +243,122 @@ impl ClientConn {
 /// A client connection to the Abacus daemon.
 ///
 /// Holds the clock handle attached on connect, one keepalive thread shared by every handle
-/// this client creates, and the timeout policy handed to WaitTimers.
+/// this client creates, the process clock, and the timeout policy handed to WaitTimers.
 pub struct AbacusClient {
     conn: ClientConn,
     clock: ClockHandle,
     keepalive: Keepalive,
     timeout_policy: TimeoutPolicy,
     min_fatal_margin_ms: u64,
+    process_clock: ProcessClock,
+    clock_name: String,
+    clock_id: u64,
 }
 
 impl AbacusClient {
-    /// Connect to the daemon at `socket_path` with the default 1 s transport timeout and
-    /// attach to the clock.
-    pub fn connect(socket_path: &Path) -> Result<Self> {
-        Self::connect_with_timeout(socket_path, DEFAULT_TRANSPORT_TIMEOUT)
+    /// Connect to the daemon at `socket_path` with the default 1 s transport timeout.
+    /// Creates a ProcessClock named `clock_name` with the given dependencies.
+    pub fn connect(socket_path: &Path, clock_name: &str, dependencies: &[&str]) -> Result<Self> {
+        Self::connect_with_timeout(
+            socket_path,
+            clock_name,
+            dependencies,
+            DEFAULT_TRANSPORT_TIMEOUT,
+        )
     }
 
-    /// Connect with an explicit transport timeout. Every create and attach that the daemon
-    /// does not answer within `timeout` fails with `Transport(Io { errno: ETIMEDOUT })`.
-    pub fn connect_with_timeout(socket_path: &Path, timeout: Duration) -> Result<Self> {
+    /// Connect with an explicit transport timeout. Creates a ProcessClock named `clock_name`
+    /// with the given dependencies. A missing dependency surfaces as
+    /// `SdkError::InterlockNotFound` and no client is returned.
+    pub fn connect_with_timeout(
+        socket_path: &Path,
+        clock_name: &str,
+        dependencies: &[&str],
+        timeout: Duration,
+    ) -> Result<Self> {
         let mut conn = ClientConn::connect(socket_path, timeout)?;
-        let clock_handle = do_attach(&mut conn, "clock", interlock_map_clock)?;
+        let clock_handle = do_attach(&mut conn, CLOCK_NAME, interlock_map_clock)?.1;
+        let (id, pc_handle) = do_create(
+            &mut conn,
+            create_request(clock_name, 0, None, dependencies),
+            interlock_map,
+        )?;
+        let keepalive = Keepalive::new();
+        let process_clock =
+            ProcessClock::new(pc_handle.clone(), &clock_handle, clock_name.to_string(), id)?;
+        bind_or_free(&keepalive, pc_handle, clock_name, id, clock_handle.clone())?;
         Ok(Self {
             conn,
             clock: ClockHandle::new(clock_handle),
-            keepalive: Keepalive::new(),
+            keepalive,
             timeout_policy: TimeoutPolicy::default(),
             min_fatal_margin_ms: MIN_FATAL_MARGIN_MS,
+            process_clock,
+            clock_name: clock_name.to_string(),
+            clock_id: id,
         })
     }
 
+    /// Connect to the daemon, retrying when the socket is absent or refused, or a dependency
+    /// is missing, up to `max_wait`. Retries a socket connect failure only when its errno is
+    /// `ENOENT`, `ECONNREFUSED`, or `EACCES`; every other connect errno, and every other error, returns
+    /// at once. Logs one line on stderr per distinct reason for the whole wait.
+    pub fn connect_waiting(
+        socket_path: &Path,
+        clock_name: &str,
+        dependencies: &[&str],
+        max_wait: Duration,
+    ) -> Result<Self> {
+        let start = Instant::now();
+        let mut logged_reasons: HashSet<String> = HashSet::new();
+        let mut last_missing = String::new();
+
+        loop {
+            match Self::connect(socket_path, clock_name, dependencies) {
+                Ok(client) => return Ok(client),
+                Err(SdkError::Transport(TransportError::Io {
+                    operation: IoOperation::Connect,
+                    errno,
+                })) if retryable_connect_errno(errno) => {
+                    last_missing = socket_path.display().to_string();
+                    let reason = format!("daemon:{}", last_missing);
+                    if logged_reasons.insert(reason) {
+                        eprintln!(
+                            "abacus: waiting up to {:?} for the Abacus daemon at {}",
+                            max_wait,
+                            socket_path.display()
+                        );
+                    }
+                }
+                Err(SdkError::InterlockNotFound { name }) => {
+                    last_missing.clone_from(&name);
+                    let reason = format!("dep:{name}");
+                    if logged_reasons.insert(reason) {
+                        eprintln!(
+                            "abacus: waiting up to {:?} for dependency \"{name}\"",
+                            max_wait
+                        );
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+
+            if start.elapsed() >= max_wait {
+                return Err(SdkError::DependencyTimeout {
+                    waited: start.elapsed(),
+                    missing: last_missing,
+                });
+            }
+
+            std::thread::sleep(CONNECT_RETRY_INTERVAL);
+        }
+    }
+
     /// The policy WaitTimers created after this call use on a missed fatal margin.
+    /// Also sets the keepalive's liveness policy.
     pub fn set_timeout_policy(&mut self, policy: TimeoutPolicy) {
         self.timeout_policy = policy;
+        self.keepalive.set_policy(policy);
     }
 
     /// The current timeout policy.
@@ -281,35 +387,51 @@ impl AbacusClient {
         &self.keepalive
     }
 
+    /// The client's ProcessClock.
+    pub fn process_clock(&self) -> &ProcessClock {
+        &self.process_clock
+    }
+
+    /// Process liveness as last observed by the keepalive thread. Under `TimeoutPolicy::Abort`
+    /// a dead process never observes anything but `Alive`, since the keepalive aborts the
+    /// process first; under `TimeoutPolicy::Error` this is how a host learns its process clock
+    /// was reaped or the Abacus daemon died.
+    pub fn liveness(&self) -> Liveness {
+        self.keepalive.liveness()
+    }
+
     /// Create a bare interlock (tier 0) with the keepalive running.
     pub fn create_interlock(&mut self, name: &str) -> Result<Interlock> {
-        let handle = self.do_create(create_request(name, 0), interlock_map)?;
-        Ok(Interlock::new(
-            handle,
-            self.clock.handle().clone(),
-            self.keepalive.clone(),
-        ))
+        let owner = Some((self.clock_name.clone(), self.clock_id));
+        let (_, handle) = self.do_create(create_request(name, 0, owner, &[]), interlock_map)?;
+        Interlock::new(handle, self.clock.handle().clone(), self.keepalive.clone())
     }
 
     /// Attach to an existing interlock by name: counters r/w, expiration r/o.
     ///
     /// "clock" is reserved; use `client.clock()`.
     pub fn attach_interlock(&mut self, name: &str) -> Result<AttachedInterlock> {
-        if name == "clock" {
+        if name == CLOCK_NAME {
             return Err(SdkError::InvalidRequest {
                 message: "use client.clock() to access the system clock".to_string(),
             });
         }
-        let handle = do_attach(&mut self.conn, name, interlock_map)?;
+        let (_, handle) = do_attach(&mut self.conn, name, interlock_map)?;
         Ok(AttachedInterlock::new(handle, self.clock.handle().clone()))
     }
 
-    /// Attach to a WaitCounter by name, read-only.
-    ///
-    /// The Attached response carries no tier, so the caller must know the name is a
-    /// WaitCounter; attaching any other tier returns a handle with the wrong contract.
+    /// Attach to a WaitCounter by name, read-only. Refuses any tier other than 1, without
+    /// mapping the descriptor.
     pub fn attach_wait_counter(&mut self, name: &str) -> Result<AttachedWaitCounter> {
-        let handle = do_attach(&mut self.conn, name, interlock_map_counter)?;
+        let (tier, fd) = do_attach_request(&mut self.conn, name)?;
+        if tier != 1 {
+            return Err(SdkError::InvalidRequest {
+                message: format!("\"{name}\" is tier {tier}, not a WaitCounter"),
+            });
+        }
+        let handle = interlock_map_counter(fd).map_err(|e| SdkError::MmapFailed {
+            message: e.to_string(),
+        })?;
         Ok(AttachedWaitCounter::new(handle))
     }
 
@@ -320,7 +442,8 @@ impl AbacusClient {
         watched_name: &str,
         watched_word: WatchedWord,
     ) -> Result<WaitCounter> {
-        let mut req = create_request(name, 1);
+        let owner = Some((self.clock_name.clone(), self.clock_id));
+        let mut req = create_request(name, 1, owner, &[]);
         if let Request::CreateInterlock {
             watched_name: wn,
             watched_word: ww,
@@ -330,21 +453,23 @@ impl AbacusClient {
             *wn = Some(watched_name.to_string());
             *ww = Some(watched_word.to_u8());
         }
-        let handle = self.do_create(req, interlock_map_counter)?;
-        Ok(WaitCounter::new(handle, &self.keepalive))
+        let (_, handle) = self.do_create(req, interlock_map_counter)?;
+        WaitCounter::new(handle, &self.keepalive)
     }
 
     /// Create a WaitTimer (tier 2) watching the clock, with this client's timeout policy and
     /// fatal-margin floor.
     pub fn create_wait_timer(&mut self, name: &str) -> Result<WaitTimer> {
-        let handle = self.do_create(create_request(name, 2), interlock_map_timer)?;
-        Ok(WaitTimer::new(
+        let owner = Some((self.clock_name.clone(), self.clock_id));
+        let (_, handle) =
+            self.do_create(create_request(name, 2, owner, &[]), interlock_map_timer)?;
+        WaitTimer::new(
             handle,
             self.clock.handle().clone(),
             &self.keepalive,
             self.timeout_policy,
             self.min_fatal_margin_ms,
-        ))
+        )
     }
 
     /// Create a WaitCron (tier 3): a recurring timer on the `interval_ms` grid aligned to the
@@ -355,17 +480,23 @@ impl AbacusClient {
                 message: "WaitCron interval_ms must be > 0".to_string(),
             });
         }
-        let mut req = create_request(name, 3);
-        if let Request::CreateInterlock { interval_ns, .. } = &mut req {
-            *interval_ns = Some(interval_ms.saturating_mul(1_000_000));
+        let interval_ns = checked_interval_ns(interval_ms)?;
+        let owner = Some((self.clock_name.clone(), self.clock_id));
+        let mut req = create_request(name, 3, owner, &[]);
+        if let Request::CreateInterlock {
+            interval_ns: req_interval_ns,
+            ..
+        } = &mut req
+        {
+            *req_interval_ns = Some(interval_ns);
         }
-        let handle = self.do_create(req, interlock_map_cron)?;
-        Ok(WaitCron::new(
+        let (_, handle) = self.do_create(req, interlock_map_cron)?;
+        WaitCron::new(
             handle,
             self.clock.handle().clone(),
             &self.keepalive,
             interval_ms,
-        ))
+        )
     }
 
     /// Create a WaitBarrier (tier 4) that fires when every `(watched_name, watched_word,
@@ -379,27 +510,13 @@ impl AbacusClient {
             .into_iter()
             .map(|(n, w, t)| (n, w.to_u8(), t))
             .collect();
-        let mut req = create_request(name, 4);
+        let owner = Some((self.clock_name.clone(), self.clock_id));
+        let mut req = create_request(name, 4, owner, &[]);
         if let Request::CreateInterlock { conditions: c, .. } = &mut req {
             *c = Some(wire_conditions);
         }
-        let handle = self.do_create(req, interlock_map_barrier)?;
-        Ok(WaitBarrier::new(
-            handle,
-            self.clock.handle().clone(),
-            &self.keepalive,
-        ))
-    }
-
-    /// Create a ProcessClock: a bare interlock whose keepalive also stamps open_count with
-    /// the clock, so other processes can read liveness and uptime.
-    pub fn create_process_clock(&mut self, name: &str) -> Result<ProcessClock> {
-        let handle = self.do_create(create_request(name, 0), interlock_map)?;
-        Ok(ProcessClock::new(
-            handle,
-            self.clock.handle().clone(),
-            &self.keepalive,
-        ))
+        let (_, handle) = self.do_create(req, interlock_map_barrier)?;
+        WaitBarrier::new(handle, self.clock.handle().clone(), &self.keepalive)
     }
 
     /// The system clock, attached on connect. Read-only.
@@ -413,6 +530,9 @@ impl AbacusClient {
     /// `MSG_PEEK | MSG_DONTWAIT` sees EOF (false) or EAGAIN or data (true). It does not
     /// prove the daemon is serving requests; only a completed request does.
     pub fn is_connected(&self) -> bool {
+        if self.conn.poisoned {
+            return false;
+        }
         let fd = self.conn.stream.as_raw_fd();
         let mut buf = [0u8; 1];
         let ret = unsafe {
@@ -439,22 +559,37 @@ impl AbacusClient {
         &mut self,
         req: Request,
         map_fn: fn(OwnedFd) -> std::result::Result<InterlockHandle, Condition>,
-    ) -> Result<InterlockHandle> {
-        let (resp, fds) = self.conn.send_recv(&req)?;
-        match resp {
-            Response::Created { .. } => map_handle(fds, map_fn),
-            Response::Error { code, message } => Err(daemon_error(code, message)),
-            _ => Err(SdkError::UnexpectedResponse {
-                message: "unexpected response type for create".to_string(),
-            }),
-        }
+    ) -> Result<(u64, InterlockHandle)> {
+        do_create(&mut self.conn, req, map_fn)
     }
 }
 
-fn create_request(name: &str, tier: u8) -> Request {
+/// Bind the process clock to the keepalive. On failure, free the clock so the daemon
+/// reaps it on its next pass instead of it reading alive until its TTL lapses (a
+/// dependent could otherwise bind to a process that never ran).
+fn bind_or_free(
+    keepalive: &Keepalive,
+    pc_handle: InterlockHandle,
+    clock_name: &str,
+    id: u64,
+    abacus_clock: InterlockHandle,
+) -> Result<()> {
+    keepalive
+        .bind_process(pc_handle.clone(), clock_name.to_string(), id, abacus_clock)
+        .inspect_err(|_| interlock_free(&pc_handle))
+}
+
+fn create_request(
+    name: &str,
+    tier: u8,
+    owner: Option<(String, u64)>,
+    dependencies: &[&str],
+) -> Request {
     Request::CreateInterlock {
         name: name.to_string(),
         tier,
+        owner,
+        dependencies: dependencies.iter().map(|s| s.to_string()).collect(),
         watched_name: None,
         watched_word: None,
         interval_ns: None,
@@ -462,22 +597,67 @@ fn create_request(name: &str, tier: u8) -> Request {
     }
 }
 
-fn do_attach(
+/// `interval_ms` converted to nanoseconds for the wire. Rejected before any wire traffic if
+/// the multiplication would overflow a `u64`.
+fn checked_interval_ns(interval_ms: u64) -> Result<u64> {
+    interval_ms
+        .checked_mul(1_000_000)
+        .ok_or_else(|| SdkError::InvalidRequest {
+            message: "WaitCron interval_ms overflows nanoseconds".to_string(),
+        })
+}
+
+fn do_create(
     conn: &mut ClientConn,
-    name: &str,
+    req: Request,
     map_fn: fn(OwnedFd) -> std::result::Result<InterlockHandle, Condition>,
-) -> Result<InterlockHandle> {
+) -> Result<(u64, InterlockHandle)> {
+    let (resp, fds) = conn.send_recv(&req)?;
+    match resp {
+        Response::Created { id } => {
+            let handle = map_handle(fds, map_fn)?;
+            Ok((id, handle))
+        }
+        Response::Error { code, message } => Err(daemon_error(code, message)),
+        _ => Err(SdkError::UnexpectedResponse {
+            message: "unexpected response type for create".to_string(),
+        }),
+    }
+}
+
+/// Connect errnos `connect_waiting` retries: no socket yet, nobody listening yet, or a
+/// socket whose mode and group the daemon has not applied yet.
+fn retryable_connect_errno(errno: i32) -> bool {
+    matches!(errno, libc::ENOENT | libc::ECONNREFUSED | libc::EACCES)
+}
+
+/// Send an AttachInterlock request and return the daemon's tier and the raw descriptor,
+/// unmapped. Callers that need to inspect the tier before mapping (`attach_wait_counter`) use
+/// this directly; `do_attach` wraps it for callers that always map.
+fn do_attach_request(conn: &mut ClientConn, name: &str) -> Result<(u8, OwnedFd)> {
     let req = Request::AttachInterlock {
         name: name.to_string(),
     };
     let (resp, fds) = conn.send_recv(&req)?;
     match resp {
-        Response::Attached { .. } => map_handle(fds, map_fn),
+        Response::Attached { tier, .. } => Ok((tier, extract_single_fd(fds)?)),
         Response::Error { code, message } => Err(daemon_error(code, message)),
         _ => Err(SdkError::UnexpectedResponse {
             message: "unexpected response type for attach".to_string(),
         }),
     }
+}
+
+fn do_attach(
+    conn: &mut ClientConn,
+    name: &str,
+    map_fn: fn(OwnedFd) -> std::result::Result<InterlockHandle, Condition>,
+) -> Result<(u8, InterlockHandle)> {
+    let (tier, fd) = do_attach_request(conn, name)?;
+    let handle = map_fn(fd).map_err(|e| SdkError::MmapFailed {
+        message: e.to_string(),
+    })?;
+    Ok((tier, handle))
 }
 
 fn map_handle(
@@ -518,7 +698,10 @@ fn extract_single_fd(mut fds: Vec<OwnedFd>) -> Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use abacus_core::clock::ms_to_nanos;
     use abacus_core::error::AllocationStep;
+    use abacus_core::interlock::{interlock_arm, interlock_create, interlock_is_terminated};
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn conditions_convert_to_sdk_errors() {
@@ -594,6 +777,13 @@ mod tests {
                 message: "m".into(),
             },
             SdkError::DeliveryTimeout,
+            SdkError::DependencyTimeout {
+                waited: Duration::from_secs(1),
+                missing: "m".into(),
+            },
+            SdkError::KeepaliveSpawnFailed {
+                message: "m".into(),
+            },
         ];
         for v in variants {
             assert!(!v.to_string().is_empty());
@@ -601,9 +791,29 @@ mod tests {
     }
 
     #[test]
+    fn checked_interval_ns_rejects_an_interval_ms_that_overflows_nanoseconds() {
+        assert_eq!(checked_interval_ns(1_000), Ok(1_000_000_000));
+        assert_eq!(
+            checked_interval_ns(u64::MAX),
+            Err(SdkError::InvalidRequest {
+                message: "WaitCron interval_ms overflows nanoseconds".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn retryable_connect_errnos_are_absent_refused_and_not_yet_permitted() {
+        assert!(retryable_connect_errno(libc::ENOENT));
+        assert!(retryable_connect_errno(libc::ECONNREFUSED));
+        assert!(retryable_connect_errno(libc::EACCES));
+        assert!(!retryable_connect_errno(libc::ENOTDIR));
+        assert!(!retryable_connect_errno(libc::EPERM));
+    }
+
+    #[test]
     fn connect_to_missing_socket_is_transport_error() {
         let path = std::env::temp_dir().join("abacus-no-such-socket.sock");
-        let err = AbacusClient::connect(&path)
+        let err = AbacusClient::connect(&path, "test", &[])
             .err()
             .expect("connect must fail");
         assert!(matches!(
@@ -613,5 +823,27 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn failed_bind_frees_the_process_clock() {
+        let k = Keepalive::new();
+        k.fail_next_spawn(true);
+        let pc = interlock_create().unwrap();
+        let abacus_clock = interlock_create().unwrap();
+        interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
+        abacus_clock
+            .words()
+            .open_count
+            .store(1000, Ordering::Release);
+        let r = bind_or_free(&k, pc.clone(), "pc", 1, abacus_clock);
+        assert!(
+            matches!(r, Err(SdkError::KeepaliveSpawnFailed { .. })),
+            "{r:?}"
+        );
+        assert!(
+            interlock_is_terminated(&pc),
+            "a clock whose bind failed must be freed, not left alive until its TTL lapses"
+        );
     }
 }

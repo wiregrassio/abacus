@@ -327,7 +327,8 @@ fn interlock__start_touch_thread_replaces_previous() {
     let mut client = d.client();
     let mut il = client.create_interlock("r").expect("create");
     let view = attach_words(d.socket_path(), "r");
-    il.start_touch_thread(400, 2000);
+    il.start_touch_thread(400, 2000)
+        .expect("start_touch_thread");
     wait_for(Duration::from_millis(200), Duration::from_millis(2), || {
         let (_, _, e) = interlock_words(&view);
         e > monotonic_now_nanos() + 600 * MS
@@ -338,7 +339,7 @@ fn interlock__start_touch_thread_replaces_previous() {
             interlock_words(&view)
         )
     });
-    il.start_touch_thread(10, 200);
+    il.start_touch_thread(10, 200).expect("start_touch_thread");
     let (ahead_ms, settled) =
         wait_for_value(Duration::from_secs(3), Duration::from_millis(5), || {
             let (o, _, e) = interlock_words(&view);

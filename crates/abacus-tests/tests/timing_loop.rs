@@ -22,8 +22,8 @@ use abacus_client::{AbacusClient, WaitState, WatchedWord};
 use abacus_core::interlock::interlock_arm;
 use abacus_tests::{
     abacus_binary, clock_ticks_per_second, describe_exit, map_fd, raise_fd_limit, role_args,
-    role_command, run_child, serialized, wait_for, ProcessDaemon, RawClient, RawResponse, Stats,
-    TIER_INTERLOCK,
+    role_command, run_child, serialized, unique_name, wait_for, ProcessDaemon, RawClient,
+    RawResponse, Stats, TIER_INTERLOCK,
 };
 
 // ---------------------------------------------------------------------------
@@ -158,7 +158,7 @@ fn role__bench_wait_ms() {
     let sock = Path::new(&args[0]);
     let ms: u64 = args[1].parse().expect("ms");
     let n: usize = args[2].parse().expect("n");
-    let mut client = AbacusClient::connect(sock).expect("connect");
+    let mut client = AbacusClient::connect(sock, &unique_name("role"), &[]).expect("connect");
     let timer = client.create_wait_timer("bench").expect("create timer");
     let mut stats = Stats::new("elapsed_us", "us");
     let mut overrun = 0u64;

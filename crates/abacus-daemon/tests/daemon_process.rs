@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use abacus_client::{AbacusClient, SdkError, WaitState, WatchedWord};
 use abacus_tests::{
-    describe_exit, role_args, role_command, unique_socket_path, wait_child, wait_for,
+    describe_exit, role_args, role_command, unique_name, unique_socket_path, wait_child, wait_for,
     wait_for_daemon, wait_for_value, ProcessDaemon,
 };
 use common::{bin, fresh_client_works, RawDaemon, DEFAULT_SOCKET_PATH};
@@ -49,7 +49,7 @@ fn daemon__default_socket_path_and_flag_forms() {
     // Form 1: --socket-path=<path>, the form ProcessDaemon uses.
     let d = ProcessDaemon::start(bin(), "flag-eq");
     assert!(
-        AbacusClient::connect(d.socket_path()).is_ok(),
+        AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).is_ok(),
         "--socket-path= form did not serve on {}",
         d.socket_path().display()
     );
@@ -70,7 +70,7 @@ fn daemon__default_socket_path_and_flag_forms() {
         )
     });
     assert!(
-        AbacusClient::connect(&path).is_ok(),
+        AbacusClient::connect(&path, &unique_name("pc"), &[]).is_ok(),
         "two-arg form did not serve on {}",
         path.display()
     );
@@ -466,7 +466,8 @@ fn role__create_and_advance() {
     let Some(args) = role_args("role__create_and_advance") else {
         return;
     };
-    let mut client = AbacusClient::connect(Path::new(&args[0])).expect("connect");
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
     let il = client.create_interlock(&args[1]).expect("create");
     let n: u64 = args[2].parse().expect("count");
     il.open(n).expect("open");
@@ -484,7 +485,8 @@ fn role__timer_waiter() {
     let Some(args) = role_args("role__timer_waiter") else {
         return;
     };
-    let mut client = AbacusClient::connect(Path::new(&args[0])).expect("connect");
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
     let timer = client.create_wait_timer(&args[1]).expect("create timer");
     let ms: u64 = args[2].parse().expect("ms");
     match timer.wait_ms(ms) {

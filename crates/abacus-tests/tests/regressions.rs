@@ -8,14 +8,14 @@ use abacus_client::{
     MIN_FATAL_MARGIN_MS, MIN_TOUCH_TTL_MS,
 };
 use abacus_core::error::{IoOperation, TransportError};
-use abacus_tests::{wait_for, RawClient, ThreadDaemon};
+use abacus_tests::{unique_name, wait_for, RawClient, ThreadDaemon};
 use abacus_wire::{Request, Response, ERR_INVALID_REQUEST};
 
 /// WaitCron fires on the grid and does not drift.
 #[test]
 fn cron_fires_on_grid_without_drift() {
     let d = ThreadDaemon::start("cron-grid");
-    let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+    let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
     let cron = client.create_wait_cron("c10", 10).unwrap();
     assert_eq!(cron.interval_ms(), 10);
 
@@ -58,7 +58,7 @@ fn cron_fires_on_grid_without_drift() {
 #[test]
 fn timer_error_policy_returns_rts_timeout_within_margin() {
     let mut d = ThreadDaemon::start("rts-timeout");
-    let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+    let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
     client.set_timeout_policy(TimeoutPolicy::Error);
     assert_eq!(client.timeout_policy(), TimeoutPolicy::Error);
     assert_eq!(client.min_fatal_margin_ms(), MIN_FATAL_MARGIN_MS);
@@ -101,7 +101,7 @@ fn timer_abort_policy_aborts_the_process() {
     if std::env::var("ABACUS_CHILD_ABORT").is_ok() {
         // Child: create a timer, stop the daemon, wait. Never returns.
         let mut d = ThreadDaemon::start("abort-child");
-        let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+        let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
         let timer = client.create_wait_timer("t-abort").unwrap();
         d.stop();
         let _ = timer.wait_ms(5);
@@ -133,7 +133,7 @@ fn timer_abort_policy_aborts_the_process() {
 #[test]
 fn timer_wait_zero_returns_immediately() {
     let d = ThreadDaemon::start("wait-zero");
-    let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+    let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
     let timer = client.create_wait_timer("t0").unwrap();
     let before = timer.peek();
     let t0 = Instant::now();
@@ -165,6 +165,8 @@ fn daemon_rejects_invalid_requests() {
         Request::CreateInterlock {
             name: name.into(),
             tier,
+            owner: None,
+            dependencies: vec![],
             watched_name: wn.map(String::from),
             watched_word: ww,
             interval_ns: ival,
@@ -201,8 +203,8 @@ fn daemon_rejects_invalid_requests() {
 
     // A tier-1 frame with no watched_name cannot be encoded by a conforming client; hand
     // build one so the daemon's decoder sees a truncated payload and closes the connection.
-    let mut short = vec![abacus_wire::PROTOCOL_VERSION, 0x01, 1, 0, b'w', 1];
-    short.push(0);
+    // v2: version, tag, name("w"), tier(1), owner_flag(0), dep_count(0), then truncated.
+    let short = vec![abacus_wire::PROTOCOL_VERSION, 0x01, 1, 0, b'w', 1, 0, 0, 0];
     let mut hostile = RawClient::connect(d.socket_path()).expect("connect");
     hostile.send_frame(&short).unwrap();
     match hostile.recv_response() {
@@ -215,12 +217,11 @@ fn daemon_rejects_invalid_requests() {
         "protocol fault closes the connection"
     );
 
-    // the cap. Three creates succeed, the fourth is InvalidRequest, a replacement is fine.
-    let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+    // The cap is 3. Connect creates a ProcessClock (1 entry), leaving room for 2 more.
+    let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
     let _a = client.create_interlock("a").unwrap();
     let _b = client.create_interlock("b").unwrap();
-    let _c = client.create_interlock("c").unwrap();
-    match client.create_interlock("dd") {
+    match client.create_interlock("cc") {
         Err(SdkError::InvalidRequest { message }) => {
             assert!(message.contains("limit"), "{message}")
         }
@@ -233,8 +234,8 @@ fn daemon_rejects_invalid_requests() {
 #[test]
 fn multiple_clients_share_interlocks() {
     let d = ThreadDaemon::start("multi-client");
-    let mut a = AbacusClient::connect(d.socket_path()).unwrap();
-    let mut b = AbacusClient::connect(d.socket_path()).unwrap();
+    let mut a = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
+    let mut b = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
     let src = a.create_interlock("shared-src").unwrap();
     let attached = b.attach_interlock("shared-src").unwrap();
     let counter = b
@@ -253,7 +254,7 @@ fn multiple_clients_share_interlocks() {
 #[test]
 fn attacher_free_cannot_be_undone_by_owner_open() {
     let d = ThreadDaemon::start("sentinel-inc");
-    let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+    let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
     let owner = client.create_interlock("s2").unwrap();
     let attached = client.attach_interlock("s2").unwrap();
     attached.free();
@@ -273,7 +274,7 @@ fn attacher_free_cannot_be_undone_by_owner_open() {
 #[test]
 fn counter_dies_with_its_target() {
     let d = ThreadDaemon::start("target-dies");
-    let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+    let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
     let mut x = client.create_interlock("x").unwrap();
     let counter = client
         .create_wait_counter("wx", "x", WatchedWord::ClosedCount)
@@ -308,7 +309,7 @@ fn counter_dies_with_its_target() {
 #[test]
 fn touch_ttl_survives_100ms_stall() {
     let d = ThreadDaemon::start("ttl-stall");
-    let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+    let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
     let il = client.create_interlock("stall").unwrap();
     let now = abacus_core::clock::monotonic_now_nanos();
     let exp = il.expiration_ns();
@@ -325,7 +326,10 @@ fn touch_ttl_survives_100ms_stall() {
     assert!(!il.is_reaped());
     assert!(il.touch(300).is_ok());
     // Custom cadence and TTL.
-    let reaped = il.start_touch_thread(10, 400).is_reaped();
+    let reaped = il
+        .start_touch_thread(10, 400)
+        .expect("start_touch_thread")
+        .is_reaped();
     assert!(!reaped);
     assert!(il.expiration_ns() >= abacus_core::clock::monotonic_now_nanos() + 390_000_000);
 }
@@ -334,7 +338,7 @@ fn touch_ttl_survives_100ms_stall() {
 #[test]
 fn bounded_waits_time_out() {
     let d = ThreadDaemon::start("wait-for");
-    let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+    let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
     let il = client.create_interlock("never").unwrap();
     let t0 = Instant::now();
     assert_eq!(
@@ -387,7 +391,7 @@ fn client_transport_times_out_against_a_silent_listener() {
         drop(stream);
     });
     let t0 = Instant::now();
-    let err = AbacusClient::connect_with_timeout(&path, Duration::from_millis(200))
+    let err = AbacusClient::connect_with_timeout(&path, "pc", &[], Duration::from_millis(200))
         .err()
         .expect("must time out");
     assert!(t0.elapsed() >= Duration::from_millis(200));
@@ -407,7 +411,7 @@ fn client_transport_times_out_against_a_silent_listener() {
 #[test]
 fn is_reaped_on_every_owning_type() {
     let d = ThreadDaemon::start("is-reaped");
-    let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+    let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
     let mut il = client.create_interlock("r-il").unwrap();
     let mut wc = client
         .create_wait_counter("r-wc", "r-il", WatchedWord::OpenCount)
@@ -420,19 +424,17 @@ fn is_reaped_on_every_owning_type() {
             vec![("r-il".to_string(), WatchedWord::OpenCount, 1)],
         )
         .unwrap();
-    let mut pc = client.create_process_clock("r-pc").unwrap();
     assert!(
         !il.is_reaped()
             && !wc.is_reaped()
             && !wt.is_reaped()
             && !cr.is_reaped()
             && !br.is_reaped()
-            && !pc.is_reaped()
+            && !client.process_clock().is_reaped()
     );
     wt.free();
     cr.free();
-    pc.free();
-    assert!(wt.is_reaped() && cr.is_reaped() && pc.is_reaped());
+    assert!(wt.is_reaped() && cr.is_reaped());
     // Free the target: the counter and barrier die on the daemon's next cycle.
     il.free();
     wait_for(Duration::from_millis(50), Duration::from_millis(1), || {
@@ -457,22 +459,24 @@ fn is_reaped_on_every_owning_type() {
 fn one_keepalive_thread_per_client() {
     if std::env::var("ABACUS_CHILD_THREADS").is_ok() {
         let d = ThreadDaemon::start("threads-child");
-        let mut client = AbacusClient::connect(d.socket_path()).unwrap();
+        let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
+        // The keepalive thread starts at connect (bind_process).
         let before = abacus_tests::proc_status_field(std::process::id(), "Threads");
         let handles: Vec<_> = (0..20)
             .map(|i| client.create_interlock(&format!("k{i}")).unwrap())
             .collect();
-        let _pc = client.create_process_clock("k-pc").unwrap();
         let after = abacus_tests::proc_status_field(std::process::id(), "Threads");
-        if after != before + 1 {
+        if after != before {
             eprintln!("threads before {before}, after {after}");
             std::process::exit(1);
         }
-        if client.keepalive().registered() != 21 {
+        if client.keepalive().registered() != 20 {
+            eprintln!("registered {}", client.keepalive().registered());
             std::process::exit(2);
         }
         drop(handles);
-        if client.keepalive().registered() != 1 {
+        if client.keepalive().registered() != 0 {
+            eprintln!("registered after drop {}", client.keepalive().registered());
             std::process::exit(3);
         }
         std::process::exit(0);

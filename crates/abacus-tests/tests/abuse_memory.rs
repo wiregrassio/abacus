@@ -21,8 +21,8 @@ use abacus_core::error::{AllocationStep, Condition};
 use abacus_core::interlock::{interlock_map, SENTINEL};
 use abacus_tests::{
     abacus_binary, attach_words, attach_words_readonly, describe_exit, interlock_words, role_args,
-    role_command, run_child, serialized, wait_child, wait_for, ProcessDaemon, RawClient,
-    RawResponse, Rng, TIER_WAIT_CRON,
+    role_command, run_child, serialized, unique_name, wait_child, wait_for, ProcessDaemon,
+    RawClient, RawResponse, Rng, TIER_WAIT_CRON,
 };
 
 const STORM_CLIENTS: usize = 100;
@@ -123,7 +123,8 @@ fn role__health_client() {
     let Some(args) = role_args("role__health_client") else {
         return;
     };
-    let mut client = AbacusClient::connect(Path::new(&args[0])).expect("connect");
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
     let timer = client.create_wait_timer("health").expect("create timer");
     let r = timer.wait_ms(5).expect("wait_ms");
     assert!(
@@ -142,7 +143,8 @@ fn role__holder() {
     let Some(args) = role_args("role__holder") else {
         return;
     };
-    let mut client = AbacusClient::connect(Path::new(&args[0])).expect("connect");
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
     let hold_ms: u64 = args[1].parse().expect("hold_ms");
     let _il = client.create_interlock("h-il").expect("create h-il");
     let _timer = client.create_wait_timer("h-timer").expect("create h-timer");
@@ -217,7 +219,7 @@ fn abuse__name_collision_storm() {
         .map(|i| {
             let sock = sock.clone();
             thread::spawn(move || -> Interlock {
-                let mut c = AbacusClient::connect(&sock)
+                let mut c = AbacusClient::connect(&sock, &unique_name("pc"), &[])
                     .unwrap_or_else(|e| panic!("client {i} connect failed: {e}"));
                 c.create_interlock("storm")
                     .unwrap_or_else(|e| panic!("client {i} create failed: {e}"))

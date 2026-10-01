@@ -9,6 +9,10 @@ use std::sync::Arc;
 use crate::clock::monotonic_now_nanos;
 use crate::error::{AllocationStep, Condition, Result};
 
+/// The reserved name of the daemon-owned clock interlock. The daemon refuses to create
+/// it; the SDK attaches it on connect.
+pub const CLOCK_NAME: &str = "clock";
+
 /// Size of one interlock in bytes: three u64 words.
 pub const INTERLOCK_SIZE: usize = 24;
 /// TTL a freshly created interlock starts with, in nanoseconds (100 ms).
@@ -168,9 +172,13 @@ pub fn interlock_map_barrier(fd: OwnedFd) -> Result<InterlockHandle> {
 
 /// Extend the expiration to `max(current, now + ttl_nanos)`. CAS-max: never decrements.
 /// Returns `InterlockReaped` if expiration already reads SENTINEL.
+/// A TTL past the end of the clock arms to SENTINEL - 1, never to SENTINEL.
 pub fn interlock_arm(handle: &InterlockHandle, ttl_nanos: u64) -> Result<()> {
     let expiration_ns = &handle.words().expiration_ns;
-    let deadline = monotonic_now_nanos().saturating_add(ttl_nanos);
+    // Never arm to SENTINEL: a saturated deadline would terminate the interlock.
+    let deadline = monotonic_now_nanos()
+        .saturating_add(ttl_nanos)
+        .min(SENTINEL - 1);
     loop {
         let current = expiration_ns.load(Ordering::Acquire);
         if current == SENTINEL {

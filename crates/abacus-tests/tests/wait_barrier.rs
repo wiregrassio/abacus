@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use abacus_client::{SdkError, WaitState, WatchedWord};
 use abacus_core::clock::monotonic_now_nanos;
 use abacus_core::interlock::SENTINEL;
-use abacus_daemon::registry::{Registry, Tier};
+use abacus_daemon::registry::{CreateSpec, Registry, Tier};
 use abacus_tests::{on_thread, recv_within, wait_for, ThreadDaemon};
 
 /// LIFECYCLE.md wait contract (WaitBarrier): fires only when every condition is met. One of
@@ -163,17 +163,18 @@ fn wait_barrier__wait_on_already_reaped_returns_error() {
 fn registry__evaluate_barrier_stamps_per_contract() {
     let mut reg = Registry::new().expect("registry");
     let (_, src) = reg
-        .create("src".to_string(), Tier::Interlock, None, None, None, None)
+        .create(CreateSpec {
+            name: "src".to_string(),
+            ..Default::default()
+        })
         .expect("create src");
     let (_, barrier) = reg
-        .create(
-            "b".to_string(),
-            Tier::WaitBarrier,
-            None,
-            None,
-            None,
-            Some(vec![("src".to_string(), 1u8, 3u64)]),
-        )
+        .create(CreateSpec {
+            name: "b".to_string(),
+            tier: Tier::WaitBarrier,
+            barrier_conditions: Some(vec![("src".to_string(), 1u8, 3u64)]),
+            ..Default::default()
+        })
         .expect("create barrier");
     let now_ms = || monotonic_now_nanos() / 1_000_000;
     assert_eq!(

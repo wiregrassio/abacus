@@ -18,8 +18,13 @@ pub const MIN_TOUCH_TTL_MS: u64 = 200;
 
 /// The TTL the keepalive writes for `interval_ms`: five intervals or `MIN_TOUCH_TTL_MS`,
 /// whichever is larger.
-pub fn default_touch_ttl_ms(interval_ms: u64) -> u64 {
-    interval_ms.saturating_mul(5).max(MIN_TOUCH_TTL_MS)
+pub const fn default_touch_ttl_ms(interval_ms: u64) -> u64 {
+    let five_intervals = interval_ms.saturating_mul(5);
+    if five_intervals > MIN_TOUCH_TTL_MS {
+        five_intervals
+    } else {
+        MIN_TOUCH_TTL_MS
+    }
 }
 
 /// Default keepalive TTL in milliseconds: `default_touch_ttl_ms(DEFAULT_TOUCH_INTERVAL_MS)`.
@@ -34,7 +39,22 @@ pub const MIN_FATAL_MARGIN_MS: u64 = 50;
 /// Default read and write timeout on the daemon connection.
 pub const DEFAULT_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(1);
 
-const _: () = assert!(DEFAULT_TOUCH_TTL_MS == MIN_TOUCH_TTL_MS);
+/// Retry interval for `connect_waiting` when the daemon or a dependency is absent.
+pub const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+const _: () = assert!(DEFAULT_TOUCH_TTL_MS == default_touch_ttl_ms(DEFAULT_TOUCH_INTERVAL_MS));
+
+/// Process liveness as last observed by the client's keepalive thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// The process clock is healthy: touched on schedule, the Abacus clock has not lapsed.
+    Alive,
+    /// The keepalive found this client's process clock terminated (SENTINEL after an arm or
+    /// stamp attempt).
+    ProcessClockReaped,
+    /// The keepalive found the Abacus clock's expiration lapsed.
+    DaemonClockLapsed,
+}
 
 /// What a WaitTimer does when the daemon misses its fatal margin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

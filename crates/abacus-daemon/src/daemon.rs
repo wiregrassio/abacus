@@ -10,7 +10,7 @@ use abacus_core::error::{IoOperation, StartupError, TransportError};
 use abacus_core::interlock::interlock_dup_fd;
 use abacus_wire::{Request, Response};
 
-use crate::registry::{Registry, Tier, DEFAULT_MAX_INTERLOCKS};
+use crate::registry::{CreateSpec, Registry, Tier, DEFAULT_MAX_INTERLOCKS};
 use crate::transport::{Connection, Server, SocketOptions};
 
 /// Daemon configuration. Defaults match the `abacus` binary's flags.
@@ -58,8 +58,8 @@ pub fn daemon_run_with(config: &DaemonConfig, stop: &AtomicBool) -> Result<(), S
 
     eprintln!("abacus: daemon running on {}", config.socket_path.display());
 
-    let anchor = monotonic_now_nanos();
-    let mut next_due = anchor + NANOS_PER_MS;
+    let anchor = first_tick_boundary(monotonic_now_nanos());
+    let mut next_due = anchor;
     let mut clients: Vec<Connection> = Vec::new();
     let mut pollfds: Vec<libc::pollfd> = Vec::new();
     rebuild_pollfds(&mut pollfds, &server, &clients);
@@ -152,6 +152,13 @@ pub fn daemon_run_with(config: &DaemonConfig, stop: &AtomicBool) -> Result<(), S
     Ok(())
 }
 
+/// The first absolute millisecond boundary strictly after `now_ns`. Ticks anchored on
+/// absolute boundaries keep `now / 1 ms` advancing by exactly one per tick; an anchor at
+/// an arbitrary phase lets wake latency flip the floor, and the clock stutters (0, then 2).
+fn first_tick_boundary(now_ns: u64) -> u64 {
+    (now_ns / NANOS_PER_MS + 1) * NANOS_PER_MS
+}
+
 /// Rebuild the pollfds vector in place: clear and refill without deallocating.
 /// The server listener is always index 0; clients follow.
 fn rebuild_pollfds(pollfds: &mut Vec<libc::pollfd>, server: &Server, clients: &[Connection]) {
@@ -240,6 +247,8 @@ fn handle_request(
         Request::CreateInterlock {
             name,
             tier,
+            owner,
+            dependencies,
             watched_name,
             watched_word,
             interval_ns,
@@ -249,26 +258,32 @@ fn handle_request(
                 return client
                     .send_response(&Response::invalid_request(&format!("invalid tier: {tier}")));
             };
-            match registry.create(
+            let spec = CreateSpec {
                 name,
                 tier,
                 watched_name,
                 watched_word,
                 interval_ns,
-                conditions,
-            ) {
-                Ok((id, handle)) => match interlock_dup_fd(&handle) {
-                    Ok(fd) => {
-                        client.send_response_with_fds(&Response::Created { id }, &[fd.as_fd()])
-                    }
-                    Err(e) => client.send_response(&Response::from_condition(&e)),
-                },
+                barrier_conditions: conditions,
+                owner,
+                dependencies,
+            };
+            match registry.create_with_fd(spec) {
+                Ok((id, _handle, fd)) => {
+                    client.send_response_with_fds(&Response::Created { id }, &[fd.as_fd()])
+                }
                 Err(e) => client.send_response(&Response::from_condition(&e)),
             }
         }
         Request::AttachInterlock { name } => match registry.attach(&name) {
-            Ok((id, handle)) => match interlock_dup_fd(&handle) {
-                Ok(fd) => client.send_response_with_fds(&Response::Attached { id }, &[fd.as_fd()]),
+            Ok((id, tier, handle)) => match interlock_dup_fd(&handle) {
+                Ok(fd) => client.send_response_with_fds(
+                    &Response::Attached {
+                        id,
+                        tier: tier.to_wire(),
+                    },
+                    &[fd.as_fd()],
+                ),
                 Err(e) => client.send_response(&Response::from_condition(&e)),
             },
             Err(e) => client.send_response(&Response::from_condition(&e)),
@@ -319,5 +334,13 @@ mod tests {
             operation: IoOperation::Write,
             errno: libc::ENOMEM
         }));
+    }
+
+    #[test]
+    fn first_tick_boundary_is_the_next_absolute_millisecond() {
+        assert_eq!(first_tick_boundary(0), NANOS_PER_MS);
+        assert_eq!(first_tick_boundary(NANOS_PER_MS - 1), NANOS_PER_MS);
+        assert_eq!(first_tick_boundary(NANOS_PER_MS), 2 * NANOS_PER_MS);
+        assert_eq!(first_tick_boundary(5_500_000), 6_000_000);
     }
 }

@@ -239,9 +239,13 @@ fn wait_counter__wait_until_zero_timeout_returns_immediately() {
     let counter = client
         .create_wait_counter("c", "src", WatchedWord::ClosedCount)
         .expect("create counter");
-    let t0 = Instant::now();
-    let r = counter.wait_until(100, 0);
-    let elapsed = t0.elapsed();
+    let rx = on_thread(move || {
+        let t0 = Instant::now();
+        let r = counter.wait_until(100, 0);
+        (r, t0.elapsed())
+    });
+    let (r, elapsed) = recv_within(&rx, Duration::from_secs(1))
+        .unwrap_or_else(|e| panic!("wait_until(100, 0) blocked instead of returning: {e}"));
     match r {
         Ok(WaitResult {
             state: WaitState::Timeout,

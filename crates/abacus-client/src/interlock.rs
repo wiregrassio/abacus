@@ -22,18 +22,18 @@ impl Interlock {
         handle: InterlockHandle,
         clock: InterlockHandle,
         keepalive: Keepalive,
-    ) -> Self {
+    ) -> Result<Self, SdkError> {
         let touch = Some(keepalive.register(
             handle.clone(),
             DEFAULT_TOUCH_INTERVAL_MS,
             default_touch_ttl_ms(DEFAULT_TOUCH_INTERVAL_MS),
-        ));
-        Self {
+        )?);
+        Ok(Self {
             handle,
             clock,
             keepalive,
             touch,
-        }
+        })
     }
 
     /// The underlying shared-memory handle.
@@ -113,13 +113,18 @@ impl Interlock {
     }
 
     /// Replace the keepalive registration: arm `ttl_ms` every `interval_ms`.
-    pub fn start_touch_thread(&mut self, interval_ms: u64, ttl_ms: u64) -> &TouchHandle {
+    /// Errors as `Keepalive::register`; on error the interlock has no keepalive.
+    pub fn start_touch_thread(
+        &mut self,
+        interval_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<&TouchHandle, SdkError> {
         self.touch.take();
         self.touch = Some(
             self.keepalive
-                .register(self.handle.clone(), interval_ms, ttl_ms),
+                .register(self.handle.clone(), interval_ms, ttl_ms)?,
         );
-        self.touch.as_ref().expect("just set")
+        Ok(self.touch.as_ref().expect("just set"))
     }
 
     /// Stop the keepalive without terminating. The TTL lapses unless touched manually.

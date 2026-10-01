@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use abacus_client::{AbacusClient, InterlockState, SdkError, WaitState};
 use abacus_tests::{
-    describe_exit, role_args, role_command, wait_child, wait_for, wait_for_value, ProcessDaemon,
+    describe_exit, role_args, role_command, unique_name, wait_child, wait_for, wait_for_value,
+    ProcessDaemon,
 };
 use common::{bin, remaining};
 
@@ -82,8 +83,8 @@ fn daemon__ten_clients_hundred_interlocks_all_fire() {
         .map(|c| {
             let sock: PathBuf = sock.clone();
             std::thread::spawn(move || -> Result<Vec<WaitState>, String> {
-                let mut client =
-                    AbacusClient::connect(&sock).map_err(|e| format!("client {c} connect: {e}"))?;
+                let mut client = AbacusClient::connect(&sock, &unique_name("pc"), &[])
+                    .map_err(|e| format!("client {c} connect: {e}"))?;
                 let mut timers = Vec::with_capacity(10);
                 for i in 0..10 {
                     timers.push(
@@ -183,7 +184,8 @@ fn role__hold_interlock() {
     let Some(args) = role_args("role__hold_interlock") else {
         return;
     };
-    let mut client = AbacusClient::connect(Path::new(&args[0])).expect("connect");
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
     let _il = client.create_interlock(&args[1]).expect("create");
     let hold: u64 = args[2].parse().expect("hold ms");
     // The hold is the stimulus: the parent kills this process mid-hold.
@@ -199,7 +201,8 @@ fn role__wait_ms_zero() {
     let Some(args) = role_args("role__wait_ms_zero") else {
         return;
     };
-    let mut client = AbacusClient::connect(Path::new(&args[0])).expect("connect");
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
     let timer = client.create_wait_timer("zero").expect("create timer");
     let (created_at, _) = timer.peek();
     wait_for(Duration::from_secs(1), Duration::from_millis(1), || {

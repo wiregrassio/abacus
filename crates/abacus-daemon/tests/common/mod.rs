@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use abacus_client::{AbacusClient, WaitState};
 use abacus_tests::{
-    describe_exit, role_args, role_command, unique_socket_path, wait_child, RawClient,
+    describe_exit, role_args, role_command, unique_name, unique_socket_path, wait_child, RawClient,
 };
 
 /// The daemon binary cargo built for this test target.
@@ -120,7 +120,8 @@ fn role__well_behaved_timer() {
         return;
     };
     let t0 = Instant::now();
-    let mut client = AbacusClient::connect(Path::new(&args[0])).expect("connect");
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
     let timer = client
         .create_wait_timer("fresh-check")
         .expect("create timer");

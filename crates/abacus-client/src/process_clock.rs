@@ -1,47 +1,40 @@
-//! ProcessClock: an interlock used as a liveness and uptime beacon.
+//! ProcessClock: a read-only view of the client's liveness beacon.
 //!
-//! The keepalive refreshes expiration and stores the clock's current ms into open_count on
-//! every touch. closed_count holds the start time. Other processes attach read-only and read
-//! value for uptime. If the process dies, touches stop, the TTL lapses, the daemon reaps,
-//! and watchers get InterlockReaped.
+//! The keepalive thread owns the touch cycle and the liveness checks; this type exposes
+//! the handle's counters (uptime, last seen, start time) and reaped state.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use abacus_core::interlock::{interlock_free, interlock_is_terminated, InterlockHandle};
+use abacus_core::interlock::{interlock_is_terminated, InterlockHandle, SENTINEL};
 
+use crate::client::SdkError;
 use crate::handle_ops;
-use crate::touch::{Keepalive, TouchHandle};
-use crate::types::{default_touch_ttl_ms, DEFAULT_TOUCH_INTERVAL_MS};
 
-/// A liveness and uptime beacon. closed_count = start time, open_count = last touch time,
-/// value = uptime in milliseconds.
+/// A read-only view of the client's ProcessClock. The keepalive stamps open_count with the
+/// daemon clock on every touch; closed_count holds the start time. Other processes attach
+/// and read uptime. If the process dies, touches stop, the daemon reaps, and watchers get
+/// InterlockReaped.
 pub struct ProcessClock {
     handle: InterlockHandle,
-    touch: Option<TouchHandle>,
+    name: String,
+    id: u64,
 }
 
 impl ProcessClock {
     pub(crate) fn new(
         handle: InterlockHandle,
-        clock: InterlockHandle,
-        keepalive: &Keepalive,
-    ) -> Self {
+        clock: &InterlockHandle,
+        name: String,
+        id: u64,
+    ) -> Result<Self, SdkError> {
         let start_time = clock.words().open_count.load(Ordering::Acquire);
-        handle
-            .words()
-            .closed_count
-            .store(start_time, Ordering::Release);
-        handle
-            .words()
-            .open_count
-            .store(start_time, Ordering::Release);
-        let touch = Some(keepalive.register_with_clock(
-            handle.clone(),
-            clock,
-            DEFAULT_TOUCH_INTERVAL_MS,
-            default_touch_ttl_ms(DEFAULT_TOUCH_INTERVAL_MS),
-        ));
-        Self { handle, touch }
+        if !stamp_word(&handle.words().closed_count, start_time) {
+            return Err(SdkError::InterlockReaped);
+        }
+        if !stamp_word(&handle.words().open_count, start_time) {
+            return Err(SdkError::InterlockReaped);
+        }
+        Ok(Self { handle, name, id })
     }
 
     /// Uptime in milliseconds: open_count minus closed_count.
@@ -59,14 +52,49 @@ impl ProcessClock {
         handle_ops::completed_at(&self.handle)
     }
 
-    /// True once the interlock is terminated.
-    pub fn is_reaped(&self) -> bool {
-        interlock_is_terminated(&self.handle) || self.touch.as_ref().is_none_or(|t| t.is_reaped())
+    /// The ProcessClock name passed to connect.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    /// Terminate: stop the keepalive and stamp SENTINEL on expiration.
-    pub fn free(&mut self) {
-        self.touch.take();
-        interlock_free(&self.handle);
+    /// The registry id assigned at creation.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// True once the interlock is terminated.
+    pub fn is_reaped(&self) -> bool {
+        interlock_is_terminated(&self.handle)
+    }
+}
+
+/// Store `value` into `word` unless it already holds SENTINEL (the interlock was reaped or
+/// freed out from under the stamp). Same shape as `touch.rs::stamp_last_seen`.
+fn stamp_word(word: &AtomicU64, value: u64) -> bool {
+    word.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+        (cur != SENTINEL).then_some(value)
+    })
+    .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use abacus_core::interlock::interlock_create;
+
+    #[test]
+    fn new_refuses_to_overwrite_a_reaped_open_count() {
+        let handle = interlock_create().unwrap();
+        let clock = interlock_create().unwrap();
+        handle.words().open_count.store(SENTINEL, Ordering::Release);
+        match ProcessClock::new(handle.clone(), &clock, "test".into(), 1) {
+            Err(err) => assert_eq!(err, SdkError::InterlockReaped),
+            Ok(_) => panic!("ProcessClock::new must refuse a SENTINEL open_count"),
+        }
+        assert_eq!(
+            handle.words().open_count.load(Ordering::Acquire),
+            SENTINEL,
+            "open_count must not be overwritten once it reads SENTINEL"
+        );
     }
 }
