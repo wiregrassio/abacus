@@ -23,36 +23,41 @@ Non-isolated operation is best-effort and explicitly out of contract.
 ### SDK
 
 - **`WaitTimer` aborts the process by default.** A missed fatal margin means the coordination plane is gone and there is nothing correct left to do. Hosts that cannot be aborted select `TimeoutPolicy::Error`.
-- **Wait targets are CAS-max.** Waiters on one handle are not isolated from each other. One handle is one shared object, not a per-caller channel; a second waiter cannot lower the target. Use separate interlocks for independent waits.
+- **WaitCounter targets are CAS-max; a WaitTimer takes one waiter.** Waiters on one WaitCounter are not isolated from each other: one handle is one shared object, not a per-caller channel, and a second waiter cannot lower the target. A WaitTimer refuses a second concurrent wait with `InvalidRequest`. Use separate interlocks for independent waits.
 - **`is_connected` detects EOF, not health.** It reports true for a daemon that is alive but wedged. Only a completed request proves service.
+- **Selecting `TimeoutPolicy::Error` leaves an Abort window.** `connect` starts the keepalive under `Abort`, and `set_timeout_policy` can only run after `connect` returns; a liveness lapse in that gap aborts the process.
+- **Read-only views are SDK convention.** `attach_interlock` maps any tier read-write, and attaching a ProcessClock is read-write; the daemon hands out the same descriptor for every tier. Only the clock is protected by its memfd seals.
+- **`WatchedWord` discriminants are defined twice.** The SDK (`types::WatchedWord`) and the daemon (`registry::WatchedWord`) each define 0 and 1; nothing shared ties them together.
 
 ### Daemon
 
 - **Crash-only, no state recovery, no restart notification.** A restart comes back empty; existing mappings stay valid but orphaned. Waiters discover the restart through the clock's 100 ms TTL. Recreate and resume, or crash and let the supervisor restart the consumer. This is the design, not a gap.
-- **No peer authentication.** No `SO_PEERCRED` check: any process that can open the socket can create over any name and terminate any writable object. Security rests on socket ownership and mode, stated plainly rather than half-enforced.
+- **No peer authentication.** No `SO_PEERCRED` check: any process that can open the socket can create over any name and terminate any writable object. Recreating any name reaps its holder with no ownership check. Security rests on socket ownership and group mode, stated plainly rather than half-enforced.
 - **No rate limiting or per-peer quota.** Only the global `max_interlocks` cap applies.
 - **Slow readers are dropped, not buffered.** `EAGAIN` on write is treated as connection death, because the protocol is strict request/response and a client not draining its socket is broken.
 - **No metrics, health endpoint, structured logging, or admin tool.** Diagnostics are stderr lines; the registry is observable only through the SDK. The daemon's budget is a 1 ms loop; an observability surface is a design problem of its own.
 - **Real-time scheduling and CPU pinning assume an isolated core.** The unit pins to core 4 with SCHED_FIFO priority 50, correct only where the host boots with `isolcpus` covering core 4. Without kernel-level isolation the pin is a half-measure that reads as a guarantee, so check the boot parameters before deploying.
-- **Socket is listening before its mode is applied.** `UnixListener::bind` sockets, binds, and listens in one call; the chmod follows. In the window the socket accepts connections at umask-derived permissions. The runtime directory's `0755` mode limits exposure to processes that can reach the path.
+- **Socket is listening before its mode is applied.** `UnixListener::bind` sockets, binds, and listens in one call; the chmod and chown follow. In the window the socket accepts connections at umask-derived permissions. The runtime directory's `0755` mode limits exposure to processes that can reach the path. Clients retry `EACCES` (`connect_waiting`); the daemon does not close the window.
+- **The daemon clock's TTL has no slack beyond a CFS period.** The clock is armed for 100 ms each tick, against the SDK's 200 ms keepalive floor. A daemon stall longer than 100 ms lapses the clock, and every `Abort`-policy client aborts with `DaemonClockLapsed`.
+- **Diagnostics are blocking stderr writes.** The keepalive's abort line and the daemon's log lines are plain writes to stderr. A stalled log sink can delay an abort or stall the daemon loop.
 
 ## Deferred implementation
 
-### Attached response does not carry the tier
+### WaitRace polling
 
-The Attached wire response carries only the id, not the tier. The SDK cannot enforce tier-specific permissions on attach, and an attacher cannot verify whether `free()` via `open_count` is appropriate for the tier it attached to. Fix requires wire ABI v2 (add a tier byte to the Attached response payload); the SDK can then refuse `attach_wait_counter` on a bare interlock and pick the right `free()` path. `WaitRace` polling (SDK-side 1 ms poll, scheduling overhead proportional to raced counters) is also retired by wire v2: `WaitOr` replaces it with daemon-side evaluation.
+`WaitRace` performs SDK-side 1 ms polling (scheduling overhead proportional to raced counters). `WaitOr` replaces it with daemon-side evaluation, requiring a new daemon tier.
 
-**When:** when a third-party consumer attaches to interlocks it did not create, or when `WaitRace` polling shows up in a profile.
+**When:** when `WaitRace` polling shows up in a profile.
 
-### WaitCounter waits cannot see a dead daemon
+### WaitCounter waits cannot see a dead daemon under Error policy
 
-`WaitCounter` is the one wait tier built without the clock handle. `wait_until` checks its own words for the sentinel, but a dead daemon neither reaps nor delivers, so every wait returns `Timeout` forever. `Interlock`, `AttachedInterlock`, `ClockHandle`, `WaitTimer`, `WaitCron`, and `WaitBarrier` all check the clock's expiration and return `InterlockReaped` within its 100 ms TTL. Fix: `WaitCounter` carries the clock, as `WaitTimer` does, and `wait_until` checks it on every loop. Until then a consumer polls: Convoy's rider waits in 100 ms slices and, on each timeout, runs a zero-time `wait_close_for` on the watched interlock to reach the clock check.
+Under `TimeoutPolicy::Abort` (default) the keepalive aborts the process within the clock's TTL (100 ms) plus one keepalive interval (40 ms), so a dead daemon is detected. Under `TimeoutPolicy::Error`, `WaitCounter` is the one wait tier built without the clock handle. `wait_until` checks its own words for the sentinel, but a dead daemon neither reaps nor delivers, so every wait returns `Timeout` forever. Fix: `WaitCounter` carries the clock, as `WaitTimer` does, and `wait_until` checks it on every loop. Until then an Error-policy consumer polls: Convoy's rider waits in 100 ms slices and, on each timeout, runs a zero-time `wait_close_for` on the watched interlock to reach the clock check.
 
-**When:** before a second consumer relies on a WaitCounter alone for liveness, or when Convoy's poll slices show up in a profile.
+**When:** before a second `TimeoutPolicy::Error` consumer relies on a WaitCounter alone for liveness.
 
 ### Boolean compositions
 
-WaitAnd, WaitOr, WaitXor, WaitNand require daemon-side tier discriminants (tiers 5 to 8) not present in wire ABI v1.
+WaitAnd, WaitOr, WaitXor, WaitNand require daemon-side tier discriminants (tiers 5 to 8) not present in wire ABI v2.
 
 **When:** when a consumer needs instantaneous boolean state composition (all open, any open).
 
@@ -83,13 +88,9 @@ The unit runs as root with no `User=`, `NoNewPrivileges`, `ProtectSystem`, `Priv
 ## Known defects (narrow, deferred for v0)
 
 - **Descriptor exhaustion spins the accept loop.** `try_accept` error leaves the listener in the pollset with POLLIN asserted; the daemon busy-loops. Requires exhausting the fd table.
-- **ProcessClock keepalive can erase a SENTINEL.** Unconditional `open_count` store from the clock overwrites a concurrent `free()`. Requires a specific race with the 40 ms tick.
+
 - **Stale-socket detection can unlink a live socket.** A connect failure from permissions or transient backlog leads to `remove_file` on a path another daemon may own.
 - **Decoders accept trailing bytes.** `decode_request`/`decode_response` do not check the cursor consumed the full payload.
-- **Keepalive thread spawn panics from a library API.** Thread exhaustion produces a panic from `create_interlock` where every other failure returns `SdkError`.
-- **Cron interval converts lossily at the boundary.** `saturating_mul` silently clamps a very large interval.
-- **`interlock_arm` can CAS SENTINEL into `expiration_ns`.** `saturating_add` to `u64::MAX` is SENTINEL. `interlock_create` uses plain addition. Reachable only near `u64::MAX`.
-- **`state()` and `value()` can report a false `Overrun`.** `handle_ops::state` and `handle_ops::peek` (behind `value()`) load `open_count` before `closed_count`. A writer that advances both between the two loads, open then closed as every transaction does, makes a Closed or Open interlock read closed past open: `value()` negative, `state()` `Overrun`. Fix: load `closed_count` first; open only grows, and grows before closed, so the pair can never read inverted. The wait paths already load closed first. Convoy's BusDriver avoids it by calling `interlock_state` on its own ordered loads. Requires contention with a concurrent writer.
 
 ### Verification gaps (no test identified)
 
@@ -101,7 +102,10 @@ The unit runs as root with no `User=`, `NoNewPrivileges`, `ProtectSystem`, `Priv
 
 ### Test kit defects
 
-`ThreadDaemon::restart` is broken and dead. `raise_fd_limit` changes the process-wide soft limit permanently. `start_daemon` leaks via `mem::forget`. `RawClient::recv_response` allocates with no `MAX_PAYLOAD` check. Role dispatch is string-keyed.
+`raise_fd_limit` changes the process-wide soft limit permanently. `start_daemon` leaks its `ThreadDaemon`: it is never dropped, so the daemon runs until process exit. Role dispatch is string-keyed.
+
+- **Timing tests fail intermittently off an isolated core.** `daemon__loop_keeps_1ms_cadence_after_request_burst`, `wait_cron__reports_overrun_when_off_grid`, and `cron_fires_on_grid_without_drift` depend on scheduling the host does not guarantee without isolation. `wait_cron__reports_overrun_when_off_grid` assumes the SIGSTOP lands within one 10 ms grid step of a fire; measured in docker under load it failed 3 of 40 at `a909452`, and 0 of 20 on the AGX.
+- **Test doc comments cite documents that no longer exist.** Many cite `CONTRACTS.md`, `LIFECYCLE.md`, and `SURFACE.md`.
 
 ### Unsafe blocks lack SAFETY comments
 

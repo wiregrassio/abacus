@@ -76,6 +76,7 @@ The daemon writes one line per event to stderr (`journalctl -u abacus`):
 | `abacus: read error, closing client: <errno>` | a client socket failed mid-read |
 | `abacus: response error, closing client: <errno>` | a response could not be written for a reason other than a dead peer |
 | `abacus: PR_SET_TIMERSLACK failed, errno=<n>` | timer slack stayed at the kernel default; timing degrades by up to 50 us |
+| `abacus: warning: mlockall failed, errno=<n> (page faults possible in hot loop)` | memory stayed unlocked; the daemon runs, with possible page-fault jitter (raise `LimitMEMLOCK`) |
 
 A client that disconnects, is dropped for not reading its responses, or is dropped for a dead
 socket produces no line. Interlocks are never logged: the registry is observable only through
@@ -84,20 +85,42 @@ the SDK.
 ## What a consumer sees when the daemon restarts
 
 The daemon holds no durable state; a restart comes back empty. Existing mappings stay valid
-(the memfds live as long as any holder maps them) but nothing evaluates them:
+(the memfds live as long as any holder maps them) but nothing evaluates them, and the clock
+stops being refreshed. What the consumer sees first depends on its `TimeoutPolicy`.
 
-- A WaitTimer waiting through the restart hits its fatal margin, `max(2 * W, 50 ms)`: under
-  `TimeoutPolicy::Abort` (default) the process aborts with an `DeliveryTimeout` line on stderr;
-  under `TimeoutPolicy::Error` the call returns `Err(DeliveryTimeout)`.
-- Every wait path (bare interlocks, WaitCron, WaitBarrier, and the clock) returns
-  `InterlockReaped` within 100 ms (the clock's TTL). The clock interlock is daemon-owned and
-  read-only to clients; after daemon death its expiration lapses and every wait loop detects it.
+Under `TimeoutPolicy::Abort` (the default) the keepalive decides. Within the clock's TTL
+(100 ms) plus one keepalive interval (40 ms) of the daemon's death it finds the Abacus clock
+lapsed, writes `abacus: DaemonClockLapsed: ...` on stderr, and aborts the process. There is
+nothing to reconnect: the supervisor restarts the consumer, which connects to the new daemon
+and recreates its names. A WaitTimer whose margin is shorter than that window can abort first,
+with a `DeliveryTimeout` line instead.
+
+Under `TimeoutPolicy::Error` the process keeps running and every call reports the death:
+
+- `client.liveness()` reads `Liveness::DaemonClockLapsed` once the keepalive sees the lapse.
+- A WaitTimer waiting through the restart hits its fatal margin, `max(2 * W, 50 ms)`, and the
+  call returns `Err(DeliveryTimeout)`.
+- Every wait path that carries the clock (bare interlocks, WaitCron, WaitBarrier, and the
+  clock) returns `InterlockReaped` within 100 ms (the clock's TTL). The clock interlock is
+  daemon-owned and read-only to clients; after daemon death its expiration lapses and every
+  such wait loop detects it.
 - A WaitCounter's `wait_until` returns `WaitState::Timeout` at its cadence and never delivers.
 - The old connection is dead: `is_connected()` reads false and the next create or attach
-  fails with `Transport(Io { errno: ETIMEDOUT })` or `ConnectionClosed`. Reconnect and recreate.
+  fails with `Transport(Io { errno: ETIMEDOUT })` or `ConnectionClosed`. Reconnect, which
+  creates a new ProcessClock, and recreate.
 
-The design response to every case is the same: recreate and resume, or crash and let the
-supervisor restart the consumer.
+The design response is the same either way: recreate and resume, or crash and let the
+supervisor restart the consumer. Abort makes the second choice for the consumer.
+
+## Abort and crash handler latency
+
+A client that aborts (ProcessClockReaped or DaemonClockLapsed under `TimeoutPolicy::Abort`)
+calls `std::process::abort()`, which raises SIGABRT. On a host whose
+`/proc/sys/kernel/core_pattern` pipes to a crash handler (Ubuntu's apport on the AGX), the
+aborting process is not reaped by its parent until the handler finishes. Measured on the AGX
+(5.10-tegra, apport enabled): 192 to 259 ms for a test binary, about 1.2 s for `sh`. The
+daemon-side cascade does not wait for the client's exit; a supervisor's restart does. Disabling
+apport eliminates the delay; the cost is losing crash reports.
 
 ## Measured numbers
 
@@ -145,6 +168,24 @@ margin.
 **Burst recovery (2000 pipelined attach requests)**
 
 Clock resumed advancing within 1.0 ms (one evaluation cadence). The burst took 27.9 ms total.
+
+**Liveness cascade (process clock ownership and dependencies)**
+
+Measured 2026-09-30 by `tests/timing_liveness.rs`, release, 3 runs of 20. Unlike the tables
+above, daemon, harness, and child processes ran at default affinity (cores 0-3) and default
+scheduling, power mode not recorded: these bound an unpinned deployment. Chain A <- B <- C,
+C owning one interlock. Per run: random 0 to 40 ms delays before starting B and C (so the
+keepalives do not share a touch phase), a random 0 to 80 ms delay before SIGKILLing A.
+
+| Metric (ms) | n | min | p50 | max | Bound asserted |
+|--------|---|-----|-----|-----|-----|
+| SIGKILL of A to C's clock and interlock reaped | 60 | 161 | 183 to 185 | 200 | TTL + 3 + 10 = 213 |
+| C's clock reaped to C's `ProcessClockReaped` line | 60 | 0 | 22 to 26 | 38 | interval + 10 = 50 |
+| C's clock reaped to C's process exit (apport enabled) | 60 | 198 | 232 to 233 | 270 | none (host crash handler) |
+
+The reap floor is TTL minus one touch interval (the kill lands anywhere in A's last interval);
+the detection spread is one touch interval. Exit is dominated by apport; see "Abort and crash
+handler latency".
 
 Reading the numbers: on an idle isolated core the loop lands on the boundary (median 4999 us
 for a 5 ms wait). Under load the median is unchanged and the tail reaches 12 to 18 ms,

@@ -11,7 +11,7 @@ Integration-test crate and shared test infrastructure for validating Abacus clie
 ## Dependencies
 - Workspace crates:
   - `abacus-core`: core interlock mapping and transport error types used by the shared testkit.
-  - `abacus-wire`: ABI-v1 framing, encoding/decoding, and descriptor-receipt behavior exercised by wire tests and raw clients.
+  - `abacus-wire`: ABI-v2 framing, encoding/decoding, and descriptor-receipt behavior exercised by wire tests and raw clients.
   - `abacus-daemon`: in-process and process-backed daemon instances under test.
   - `abacus-client`: SDK clients, handles, waits, and permission boundaries under test.
 - External:
@@ -30,7 +30,7 @@ Integration-test crate and shared test infrastructure for validating Abacus clie
 <data-flow>
 
 ## Data Flow
-- Test cases and operational probes provide daemon configuration, socket paths, SDK calls, raw ABI-v1 payloads, timing thresholds, CPU assignments, and child-process role arguments.
+- Test cases and operational probes provide daemon configuration, socket paths, SDK calls, raw ABI-v2 payloads, timing thresholds, CPU assignments, and child-process role arguments.
 - The shared `src/` testkit starts daemon instances, connects SDK or raw Unix-socket clients, sends normal or malformed protocol frames, receives responses and passed file descriptors, and gathers process/resource measurements.
 - Integration tests in `tests/` assert client, daemon, shared-memory interlock, timer, cron, barrier, permission, timeout, reaping, resource-recovery, and wire-format behavior.
 - The `examples/` probe accepts command-line parameters, drives a live daemon, and emits benchmark/timing summaries or partial-frame behavior observations to stdout.
@@ -65,7 +65,7 @@ Integration-test crate and shared test infrastructure for validating Abacus clie
 <notes>
 
 ## Notes
-This crate intentionally keeps normal SDK-driven testing separate from hostile protocol testing. The raw-client infrastructure speaks ABI v1 directly, allowing malformed-input coverage without depending on SDK validation behavior.
+This crate intentionally keeps normal SDK-driven testing separate from hostile protocol testing. The raw-client infrastructure speaks ABI v2 directly, allowing malformed-input coverage without depending on SDK validation behavior.
 
 Dangerous shared-memory mapping scenarios are run in re-executed child process roles because an intentionally malformed or truncated interlock can terminate its mapper with `SIGBUS`.
 

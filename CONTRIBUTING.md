@@ -59,7 +59,7 @@ cargo run -p abacus-tests --example probe -- cron /tmp/abacus-probe.sock 10 200
 | Path | Contents |
 |------|----------|
 | `crates/abacus-core` | Interlock layout, clock, futex, shared errors |
-| `crates/abacus-wire` | Protocol v1 framing, codec, `SCM_RIGHTS` transfer |
+| `crates/abacus-wire` | Protocol v2 framing, codec, `SCM_RIGHTS` transfer |
 | `crates/abacus-daemon` | The `abacus` binary plus `daemon`, `registry`, `transport` |
 | `crates/abacus-client` | Typed SDK handles and compositions |
 | `crates/abacus-tests` | Shared test kit, integration suites, probes |
@@ -160,7 +160,7 @@ These come from `PHILOSOPHY.md`. A change that contradicts one is rejected as a 
 - **Authority is kernel-enforced.** Every memfd is sealed at creation with `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`; the clock adds `F_SEAL_FUTURE_WRITE` and maps `PROT_READ` only. The daemon does not gate `open` or `close` on caller identity. The trust boundary is the socket, stated rather than implied.
 - **The crate split is an ABI.** Pin invariants with compile-time assertions where possible and with exhaustive tests where not: `size_of::<Interlock>() == INTERLOCK_SIZE`, offsets at 0, 8, 16, truncation at every offset returning `Truncated { needed > have }`, bit-flip and random-input fuzz that must never panic, descriptor counts checked against `expected_fd_count`.
 
-Where the ABI is currently insufficient (wire v1's `Attached` response carries an ID but no tier), that gap is recorded in `docs/BACKLOG.md` with an integration trigger. Do not patch a named gap with a runtime heuristic.
+Where the ABI is currently insufficient (`WaitRace` polls at 1 ms in the SDK instead of a daemon-side `WaitOr` tier), that gap is recorded in `docs/BACKLOG.md` with an integration trigger. Do not patch a named gap with a runtime heuristic.
 
 ## Code style
 

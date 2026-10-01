@@ -46,14 +46,14 @@ MEDIUM: The runtime directory is mode `0755`; socket confidentiality and authori
 ## Files
 | File | Purpose |
 |------|---------|
-| `abacus.service` | Configures systemd startup, runtime-directory creation, resource limits, restart behavior, shutdown handling, and optional real-time scheduling for the daemon. |
+| `abacus.service` | Configures systemd startup, runtime-directory creation, resource limits, restart behavior, shutdown handling, and real-time scheduling (SCHED_FIFO priority 50, pinned to CPU 4) for the daemon. |
 
 </files>
 
 <notes>
 
 ## Notes
-The real-time scheduling and CPU-affinity settings are intentionally disabled until operational probes justify deployment-specific pinning.
+The unit enables real-time scheduling and pinning: `CPUSchedulingPolicy=fifo`, `CPUSchedulingPriority=50`, `CPUAffinity=4`. Core 4 is assumed to be the first isolated core on the target (`isolcpus=4-11`); the loop yields every cycle in `ppoll`, so SCHED_FIFO cannot starve the core it owns. The unit's own comment asks for the probe numbers to be recorded against an unpinned run before these are treated as settled. `LimitMEMLOCK=infinity` lets the daemon's `mlockall(MCL_CURRENT | MCL_FUTURE)` lock every page.
 
 The file-descriptor limit assumes approximately one descriptor per interlock and leaves headroom above the documented default capacity.
 

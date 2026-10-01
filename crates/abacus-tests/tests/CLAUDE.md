@@ -57,15 +57,18 @@ Integration, regression, abuse, soak, and hardware-timing test suites that exerc
 | `attached.rs` | L1 tests for attached interlock mutation/wait/free behavior and attached wait-counter visibility. |
 | `bounded_waits.rs` | Focused tests for bounded interlock, attached-interlock, and clock futex waits. |
 | `client.rs` | L1 tests for client connection setup, clock attachment, reserved-name handling, SDK-side rejection, and daemon error mapping. |
+| `connect_waiting.rs` | L1 tests that `connect_waiting` rides out an absent dependency or daemon, times out with `DependencyTimeout`, logs each distinct reason once even when reasons alternate, returns other errors at once, and returns a non-retryable connect errno (`ENOTDIR`) in under one retry interval. |
 | `interlock.rs` | L1 tests for interlock arithmetic, state, TTL, futex wakeups, sentinels, keepalive threads, freeing, drops, and create-over-existing-name replacement. |
 | `is_reaped.rs` | Tests `is_reaped()` across owning handle types, replacement, and TTL expiry. |
+| `liveness.rs` | L1 process-level tests of ProcessClock ownership and dependency cascade against a `ProcessDaemon`: SIGKILL reaps owned interlocks and aborts dependents, a three-level chain aborts every dependent, a missing dependency is refused until it exists, daemon death aborts the client, a recreated clock aborts the old process, a stale client cannot create or displace, a clean exit lapses owned interlocks; under `TimeoutPolicy::Error`, `liveness()` reports `DaemonClockLapsed` after daemon death and `ProcessClockReaped` after the clock is recreated, without aborting. |
 | `permissions.rs` | Runtime validation of the permission-model rows for creators, attachers, wait objects, and clock handles. |
-| `process_clock.rs` | L1 tests for process-clock uptime, fixed start time, replacement reaping, and wait-counter observation. |
+| `process_clock.rs` | L1 tests for the client's process-clock uptime, fixed start time, and wait-counter observation. |
 | `regressions.rs` | Consolidated in-process regression coverage for cron, barriers, races, timeout policy, invalid requests, sentinel safety, target lifetime, keepalive, and bounded waits. |
 | `sentinel_increments.rs` | Focused tests ensuring increments cannot resurrect or wrap through sentinel values. |
 | `soak_hour.rs` | Ignored long-running process-daemon soak checking wait liveness, cron semantics, RSS stability, and fd stability. |
 | `stop_flag.rs` | Tests the stoppable daemon-loop API, socket cleanup, connection-state transition, and wait-counter timeout after daemon shutdown. |
 | `timeout_policy.rs` | Tests timeout-policy behavior, timer TTL margins, zero-duration waits, daemon stalls, and daemon restart semantics. |
+| `timing_liveness.rs` | Ignored L3 timing of the A, B, C cascade over 20 runs with randomized start and kill delays: kill of A to C's clock and owned interlock reaped within `DEFAULT_TOUCH_TTL_MS` + 13 ms, C's `ProcessClockReaped` line within `DEFAULT_TOUCH_INTERVAL_MS` + 10 ms of the reap, kill to that line within TTL + interval + 13 ms; C's exit time is reported, not asserted. |
 | `timing_load.rs` | Ignored hardware timing/load benchmarks across oversubscribed, production-affinity, and stress-affinity profiles. |
 | `timing_loop.rs` | Ignored idle-hardware timing benchmarks for daemon CPU, timers, cron drift, wake latency, and large registries. |
 | `touch.rs` | L1 test that the default keepalive TTL survives a 100 ms owner-process stall. |

@@ -24,7 +24,7 @@ Consumed by `abacus-client` and `abacus-daemon` (see their `Cargo.toml`).
 
 ## Data Flow
 - Callers construct protocol `Request` or `Response` values.
-- The `src` implementation serializes values into v1 payloads, prefixes each payload with a four-byte little-endian frame length, and transports frames over Unix streams.
+- The `src` implementation serializes values into v2 payloads, prefixes each payload with a four-byte little-endian frame length, and transports frames over Unix streams.
 - File descriptors, when required, travel separately as `SCM_RIGHTS` ancillary data associated with initial frame bytes.
 - Receiving callers obtain decoded request/response values plus zero or more owned descriptors, and must validate descriptor cardinality for the response type.
 
@@ -34,7 +34,7 @@ Consumed by `abacus-client` and `abacus-daemon` (see their `Cargo.toml`).
 
 ## Known Hazards
 - HIGH: Received descriptor cardinality is not enforced by the receive helper; consumers must compare received descriptors with the response's expected FD count or may accept missing or unexpected descriptors.
-- MEDIUM: Request and response decoding accepts trailing bytes after a valid message; consumers requiring canonical v1 payloads must reject nonexhaustive decoding.
+- MEDIUM: Request and response decoding accepts trailing bytes after a valid message; consumers requiring canonical v2 payloads must reject nonexhaustive decoding.
 - MEDIUM: Raw numeric protocol values,including tier discriminants, wait-counter words, cron intervals, and barrier conditions,are not validated by the codec; daemon-side request validation is required.
 - MEDIUM: Incremental frame reading can fill its bounded buffer before detecting an oversized frame prefix; callers must invoke frame extraction after fills and close protocol-faulted connections.
 - LOW: FD-frame sending treats `EAGAIN` as an I/O failure rather than asynchronously retrying; callers must consider the peer unusable under that condition.

@@ -37,6 +37,13 @@ depends on. New capability comes from composition in the SDK, not from new tier 
 the daemon. When a proposed feature would require the daemon to understand what the
 counters *mean*, it belongs in the application, not here.
 
+Process liveness is the test case. A process's liveness is an ordinary record that its SDK keeps
+extending. That a record is owned by a process, or that a process depends on another, is a
+watch: the record names what it dies with, resolved to an identity when it is created, and the
+daemon reaps it when that identity is gone, exactly as it reaps any watcher whose target is gone.
+The daemon never learns what a process is. Create gains the list of what the new record dies
+with; the vocabulary does not gain a word.
+
 </one-primitive>
 
 <computed-state>
@@ -83,6 +90,12 @@ already failed its deadline, and the only honest outcomes are stop or be restart
 error-returning policy exists for callers that can genuinely recover, and it is opt-in
 precisely so the recovery path is a decision someone made rather than a default someone
 inherited.
+
+The same rule governs dependencies. A process whose dependency died aborts: a producer whose
+storage is gone, or a consumer whose producer is gone, has nothing correct left to do. The
+coordination daemon is every process's first dependency, so its death aborts everyone. No
+notification carries the news; each process reads its own death from the record it already
+has mapped, and the deaths cascade down the declared dependencies on their own.
 
 Configuration follows the same rule. The daemon parses its flags up front and exits on
 anything unknown or malformed. A socket path occupied by a live daemon is refused. Failures

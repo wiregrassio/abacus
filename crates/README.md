@@ -45,7 +45,7 @@ Start reading with `abacus-core` and `abacus-wire` to understand the binary cont
 
 ## Test Inventory
 - Shared-memory interlocks, client operations, daemon behavior, timers, cron waits, barriers, permissions, timeouts, reaping, resource recovery, and wire behavior have integration coverage in `abacus-tests`.
-- Raw ABI-v1 and malformed-frame behavior is tested independently of SDK validation.
+- Raw ABI-v2 and malformed-frame behavior is tested independently of SDK validation.
 - Descriptor receipt and protocol framing have wire-level coverage.
 - Dangerous malformed-memory cases use child-process isolation to contain possible `SIGBUS`.
 - Daemon process, signal, socket, shared-memory, and SDK integration scenarios are represented.

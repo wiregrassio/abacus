@@ -9,14 +9,14 @@ The `examples/` directory contains an operational probe rather than a test harne
 <contracts>
 
 ## Contracts
-- The crate provides test-only infrastructure for starting and addressing in-thread or process-backed daemons, creating SDK clients, and issuing raw ABI-v1 Unix-socket requests.
+- The crate provides test-only infrastructure for starting and addressing in-thread or process-backed daemons, creating SDK clients, and issuing raw ABI-v2 Unix-socket requests.
 - Raw-client helpers permit deliberately malformed frames and descriptor-transfer scenarios; callers must not assume SDK-level validation applies.
 - Hostile interlock mappings are unsafe in the current process because backing-memory truncation can cause `SIGBUS`; callers must isolate untrusted mappings in child-process roles.
 - Process and `/proc` measurement helpers are best-effort and may return zero when data is unavailable or unparsable; consumers requiring strict accounting must distinguish measurement failure externally.
 - Timing and affinity helpers require Linux facilities and valid, permitted CPU assignments; constrained containers or cpusets may cause failures.
 - Ignored L3/L4 tests require explicit opt-in and suitable host conditions; they are not guaranteed to be reliable or green on arbitrary CI infrastructure.
 - Permission doctests require `abacus-client`'s public type and ownership model to preserve the intended compile-time capability boundaries.
-- Wire tests require `abacus-wire` ABI-v1 frame layout, numeric tags, error codes, fixed limits, and SCM_RIGHTS handling to remain coordinated with expectations in the testkit.
+- Wire tests require `abacus-wire` ABI-v2 frame layout, numeric tags, error codes, fixed limits, and SCM_RIGHTS handling to remain coordinated with expectations in the testkit.
 
 </contracts>
 
@@ -52,7 +52,7 @@ The `examples/` directory contains an operational probe rather than a test harne
 ## Cross-Boundary Verification
 - `abacus-client` SDK behavior against daemon operations: verified by default client, interlock, wait, clock, and permission integration tests.
 - `abacus-daemon` lifecycle and socket cleanup behavior: verified by daemon-stop, timeout-policy, regression, and process-daemon tests; some real-process scenarios are ignored.
-- `abacus-wire` ABI-v1 encoding/decoding and malformed-frame handling: verified by `tests/wire_crate.rs` and ignored abuse-wire coverage.
+- `abacus-wire` ABI-v2 encoding/decoding and malformed-frame handling: verified by `tests/wire_crate.rs` and ignored abuse-wire coverage.
 - SCM_RIGHTS descriptor receipt and hostile FD behavior: partially verified by raw-client/fake-daemon support and ignored abuse suites; exhaustive hostile descriptor-flood behavior is NOT VERIFIED by the default test run.
 - Shared-memory interlock behavior and reaping: verified by default attached, interlock, wait-counter, wait-barrier, process-clock, and reaping tests.
 - Unsafe hostile-mapping isolation through process roles: verified by process-role-oriented abuse tests where enabled; NOT VERIFIED by the default test run if those ignored cases are excluded.

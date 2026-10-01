@@ -16,7 +16,7 @@ Start with the public exports in `src/lib.rs`, then read `src/client.rs` for con
 - The client refreshes TTLs only while its keepalive thread receives sufficient CPU time; no TTL-survival guarantee exists during long process stalls.
 - `SENTINEL` is an implicit cross-process reserved value representing reaped state and must not be produced by ordinary counter writes.
 - Timer behavior is policy-dependent; the default timeout policy may abort rather than return an ordinary failure result.
-- Concurrent waiters on a shared counter or timer coordinate through monotonic CAS-max target state rather than waiter-private targets.
+- Concurrent waiters on a shared `WaitCounter` coordinate through monotonic CAS-max target state rather than waiter-private targets. A `WaitTimer` admits one waiter at a time; a concurrent second wait returns `InvalidRequest`.
 
 </contracts>
 
@@ -48,7 +48,7 @@ Start with the public exports in `src/lib.rs`, then read `src/client.rs` for con
 ## Cross-Boundary Verification
 - `abacus-wire` request/response encoding and daemon-response validation: **NOT VERIFIED** by tests identified in supplied material beyond pure wire-discriminant coverage.
 - Daemon-to-client shared-memory file-descriptor transfer and mapping: **NOT VERIFIED**.
-- Daemon-controlled tier semantics versus `attach_wait_counter`'s assumed tier-1 mapping: **NOT VERIFIED**.
+- Daemon-controlled tier semantics versus `attach_wait_counter`: the SDK checks the daemon-reported tier and refuses anything but tier 1 before mapping; `attach_interlock` maps any tier read-write.
 - Daemon expiration/reaping behavior versus client keepalive refresh: **NOT VERIFIED**.
 - Shared `SENTINEL` convention between daemon/core/client writers and readers: **NOT VERIFIED**.
 - Shared-memory futex wake/wait interoperability across processes: **NOT VERIFIED**.

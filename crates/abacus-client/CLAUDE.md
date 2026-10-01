@@ -40,13 +40,13 @@ The Abacus Rust client SDK: daemon-backed shared-memory interlocks and wait prim
 <known-hazards>
 
 ## Known Hazards
-- **HIGH:** `attach_wait_counter` receives no tier information from the daemon and maps any attached interlock as a read-only `WaitCounter`; callers must independently know that the name identifies tier 1.
+- **HIGH:** `attach_interlock` maps any tier read-write, and attaching a ProcessClock is read-write: the daemon hands out the same descriptor for every tier, so read-only views are SDK convention. `attach_wait_counter` checks the daemon-reported tier before mapping and refuses anything but tier 1 (`InvalidRequest`).
 - **HIGH:** `WaitTimer` defaults to `TimeoutPolicy::Abort`; missing its fatal delivery margin terminates the process rather than returning an error.
 - **HIGH:** `WaitRace` performs SDK-side 1 ms polling rather than daemon-side synchronization, adding scheduling overhead proportional to raced counters and failing the entire race if any member is reaped.
 - **MEDIUM:** Shared counter correctness depends on `SENTINEL` remaining globally reserved; direct or wrapping writes that use it can make a live interlock appear reaped.
-- **MEDIUM:** `WaitCounter::wait_until` and `WaitTimer` use CAS-max targets, so concurrent users of one handle cannot independently lower or isolate targets; one waiter can observe another waiter's delivery.
+- **MEDIUM:** `WaitCounter::wait_until` uses a CAS-max target, so concurrent users of one handle cannot independently lower or isolate targets; one waiter can observe another waiter's delivery. A `WaitTimer` admits one waiter at a time and refuses a concurrent second wait (`InvalidRequest`).
 - **MEDIUM:** Keepalive liveness depends on its single worker thread running before TTL expiry; sufficiently long process stalls allow daemon reaping.
-- **LOW:** `AbacusClient::is_connected` detects socket EOF but cannot establish that the daemon remains able to serve requests.
+- **LOW:** `AbacusClient::is_connected` detects socket EOF, and reads false once a failed send or receive has poisoned the connection, but cannot establish that the daemon remains able to serve requests.
 
 </known-hazards>
 

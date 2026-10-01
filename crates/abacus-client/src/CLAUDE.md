@@ -39,13 +39,13 @@ Implements the Rust SDK: daemon connection, interlock creation/attachment, TTL m
 <known-hazards>
 
 ## Known Hazards
-- **HIGH:** `attach_wait_counter` receives no tier information from the daemon and maps any attached interlock as a read-only `WaitCounter`; callers must independently know that the name identifies tier 1.
+- **HIGH:** `attach_interlock` maps any tier read-write, and attaching a ProcessClock is read-write: the daemon hands out the same descriptor for every tier, so read-only views are SDK convention. `attach_wait_counter` checks the daemon-reported tier before mapping and refuses anything but tier 1 (`InvalidRequest`).
 - **HIGH:** `WaitTimer` defaults to `TimeoutPolicy::Abort`; a missed fatal margin terminates the entire process rather than returning an error.
 - **HIGH:** `WaitRace` is SDK-side polling at 1 ms rather than daemon-side synchronization; it adds wake/scheduling overhead proportional to raced counters and treats any reaped member as failure of the entire race.
 - **MEDIUM:** Shared counter semantics rely on the `SENTINEL` value remaining reserved globally; direct or wrapping writes that violate this convention can make live interlocks appear reaped.
-- **MEDIUM:** `WaitCounter::wait_until` and `WaitTimer` use CAS-max targets, so concurrent users of the same handle cannot independently lower or isolate requested targets; one waiter may observe another waiter's delivery.
+- **MEDIUM:** `WaitCounter::wait_until` uses a CAS-max target, so concurrent users of the same handle cannot independently lower or isolate requested targets; one waiter may observe another waiter's delivery. A `WaitTimer` admits one waiter at a time and refuses a concurrent second wait (`InvalidRequest`).
 - **MEDIUM:** Keepalive liveness depends on its single background thread receiving CPU time before TTL expiration; long process stalls beyond the configured TTL cause daemon reaping.
-- **LOW:** `AbacusClient::is_connected` only distinguishes socket EOF from no immediately observable closure; it does not establish that the daemon can serve a request.
+- **LOW:** `AbacusClient::is_connected` reads false once a failed send or receive has poisoned the connection, and otherwise only distinguishes socket EOF from no immediately observable closure; it does not establish that the daemon can serve a request.
 
 </known-hazards>
 

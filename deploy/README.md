@@ -47,7 +47,7 @@ No test files are supplied for this directory.
 - Restart-loop behavior: NO TEST
 - SIGTERM shutdown within two seconds: NO TEST
 - File-descriptor capacity assumptions: NO TEST
-- Optional FIFO scheduling and CPU affinity: NO TEST
+- FIFO scheduling and CPU affinity: NO TEST
 
 </test-inventory>
 
@@ -61,7 +61,7 @@ No test files are supplied for this directory.
 - Daemon creation of `/run/abacus/abacus.sock`: NOT VERIFIED.
 - Daemon SIGTERM handling within two seconds: NOT VERIFIED.
 - One descriptor and one mapping per interlock: NOT VERIFIED.
-- Host support for optional FIFO priority and CPU affinity: NOT VERIFIED.
+- Host support for FIFO priority and CPU affinity: NOT VERIFIED.
 
 </cross-boundary-verification>
 

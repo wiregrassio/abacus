@@ -32,8 +32,9 @@ Shared Linux-focused testkit for L0 through L4 tests: daemon lifecycle control, 
 
 ## Data Flow
 - Tests provide labels, daemon binary paths, daemon options, socket paths, wire payloads, process-role names, CPU sets, and timing thresholds.
-- `ThreadDaemon` starts `abacus_daemon` in a test-owned thread; `ProcessDaemon` starts the daemon binary as a child process and captures stderr.
-- `RawClient` constructs or accepts ABI-v1 frames, sends them over Unix-domain sockets, receives daemon responses and SCM_RIGHTS file descriptors, and can map received interlock FDs.
+- `ThreadDaemon` starts `abacus_daemon` in a test-owned thread and stops it with `stop()` or drop; it has no restart. `ProcessDaemon` starts the daemon binary as a child process and captures stderr; `ProcessDaemon::kill` asserts that kill(2) succeeded, and `ProcessDaemon::restart` SIGKILLs the daemon only if it is still alive, reaps it, and starts a fresh one on the same socket path.
+- The "Child output pipes" section reads role children's output: `spawn_stdout_reader` and `spawn_stderr_reader` stream a child's lines, each stamped with the `Instant` it was read; `wait_for_ready` waits for a child to print `ready`; `recv_abacus_line` returns the first `abacus: ` line read by a deadline, judged by its read timestamp; `abacus_reason` extracts the reason field of an SDK diagnostic line.
+- `RawClient` constructs or accepts wire v2 frames, sends them over Unix-domain sockets, receives daemon responses and SCM_RIGHTS file descriptors, and can map received interlock FDs.
 - `FakeDaemon` accepts SDK connections and returns deliberately crafted protocol frames or FD counts to test SDK error handling.
 - Process and `/proc` helpers expose child process state as tick counts, FD counts, thread counts, RSS KiB, stderr lines, and exit status.
 - Helpers return Rust values, mapped `InterlockHandle`s, child-process output, percentile statistics, or panic with test-oriented diagnostics.
@@ -45,7 +46,6 @@ Shared Linux-focused testkit for L0 through L4 tests: daemon lifecycle control, 
 ## Known Hazards
 - HIGH: `start_daemon` intentionally leaks its `ThreadDaemon`; callers receive only a socket path and have no supported shutdown path, leaving daemon threads alive until process exit.
 - HIGH: `map_fd` maps hostile received FDs in the current process; callers must use child-process roles for untrusted interlocks because a maliciously truncated memfd can SIGBUS every mapper.
-- MEDIUM: `ProcessDaemon::kill` ignores `kill(2)` failure, so tests may proceed as though a daemon was signaled when its PID is already invalid or inaccessible.
 - MEDIUM: `/proc` helpers silently return zero on missing, unreadable, or malformed process data, which can make resource-accounting assertions indistinguishable from measurement failure.
 - MEDIUM: CPU-affinity helpers assume supplied CPU indices are valid and permitted by the test environment; restricted containers or cpusets can make pinned tests panic.
 - MEDIUM: `role_command` serializes role arguments with U+001F; arguments containing that separator cannot round-trip.
@@ -59,7 +59,7 @@ Shared Linux-focused testkit for L0 through L4 tests: daemon lifecycle control, 
 ## Files
 | File | Purpose |
 |---|---|
-| `lib.rs` | Shared daemon, socket, wire, process, measurement, load, RNG, and statistics test infrastructure. |
+| `lib.rs` | Shared daemon, socket, wire, process, child-output-pipe, measurement, load, RNG, and statistics test infrastructure. |
 | `permissions.rs` | Compile-fail doctests enforcing SDK permission boundaries from the permission contract. |
 
 </files>
@@ -67,7 +67,7 @@ Shared Linux-focused testkit for L0 through L4 tests: daemon lifecycle control, 
 <notes>
 
 ## Notes
-The kit deliberately separates ordinary SDK-driven tests from hostile protocol tests: `RawClient` speaks ABI v1 directly so malformed-input coverage is independent of SDK behavior.
+The kit deliberately separates ordinary SDK-driven tests from hostile protocol tests: `RawClient` speaks wire v2 directly so malformed-input coverage is independent of SDK behavior.
 
 Process roles exist because mapping an attacker-controlled interlock can terminate the mapper with SIGBUS; dangerous mapping scenarios therefore run in a re-executed test-binary child.
 

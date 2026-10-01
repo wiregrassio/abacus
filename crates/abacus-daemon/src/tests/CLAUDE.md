@@ -2,7 +2,7 @@
 
 # tests/
 
-L0 unit and integration-style tests for the daemon registry, Unix-domain transport, and v1 wire codec without running the daemon event loop.
+L0 unit and integration-style tests for the daemon registry, Unix-domain transport, and v2 wire codec without running the daemon event loop.
 
 </purpose>
 

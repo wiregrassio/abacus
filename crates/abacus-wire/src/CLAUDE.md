@@ -2,7 +2,7 @@
 
 # src/
 
-Shared wire-protocol implementation for Abacus v1: codec, length-prefixed Unix-stream framing, and SCM_RIGHTS file-descriptor passing.
+Shared wire-protocol implementation for Abacus v2: codec, length-prefixed Unix-stream framing, and SCM_RIGHTS file-descriptor passing.
 
 </purpose>
 
@@ -26,7 +26,7 @@ Shared wire-protocol implementation for Abacus v1: codec, length-prefixed Unix-s
 
 ## Data Flow
 - Client or daemon constructs a `Request` or `Response` value.
-- `codec` serializes it into a v1 payload and a four-byte little-endian frame-length prefix.
+- `codec` serializes it into a v2 payload and a four-byte little-endian frame-length prefix.
 - `framing` transports ordinary frame bytes over `UnixStream`, either incrementally through `FrameReader` or synchronously through `read_exact` / `write_all`.
 - `fdpass` sends or receives the first frame bytes using `sendmsg` / `recvmsg` and associates up to one `SCM_RIGHTS` descriptor with the frame prefix.
 - Received payload bytes are decoded back into `Request` or `Response`; received descriptors are returned as `OwnedFd` values for the caller to validate against the response type.
@@ -36,7 +36,7 @@ Shared wire-protocol implementation for Abacus v1: codec, length-prefixed Unix-s
 <known-hazards>
 
 ## Known Hazards
-MEDIUM: `decode_request` and `decode_response` accept trailing payload bytes after a valid message; consumers that require canonical v1 encodings must independently reject nonexhaustive decoding.  
+MEDIUM: `decode_request` and `decode_response` accept trailing payload bytes after a valid message; consumers that require canonical v2 encodings must independently reject nonexhaustive decoding.  
 HIGH: Descriptor cardinality is not enforced by `recv_prefix_with_fds`; callers must compare received descriptors against `expected_fd_count(response)` or risk accepting an FD-less success response or an unexpected descriptor.  
 MEDIUM: Tier discriminants, WaitCounter word values, cron intervals, and barrier-condition semantics are encoded as raw numeric values and are not validated by the codec; daemon-side request validation is required.  
 MEDIUM: `FrameReader` is intentionally bounded to one maximum frame and reports a full incomplete buffer as progress until `next_frame` detects the oversized prefix; callers must invoke `next_frame` after fills and terminate protocol-faulted connections.  
@@ -49,7 +49,7 @@ LOW: `send_frame_with_fds` treats `EAGAIN` as an I/O failure rather than retryin
 ## Files
 | File | Purpose |
 |---|---|
-| `codec.rs` | Defines wire-v1 request/response types, binary encoding and decoding, error-code mapping, frame-size limits, and expected response FD counts. |
+| `codec.rs` | Defines wire-v2 request/response types, binary encoding and decoding, error-code mapping, frame-size limits, and expected response FD counts. |
 | `fdpass.rs` | Sends frames with SCM_RIGHTS descriptors and receives frame prefixes plus owned descriptors over Unix streams. |
 | `framing.rs` | Implements bounded incremental frame reception and blocking exact-read/full-write transport helpers. |
 | `lib.rs` | Exposes the wire crate's public modules and re-exports its protocol and transport API. |

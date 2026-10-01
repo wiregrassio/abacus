@@ -44,8 +44,6 @@ The five workspace crates: shared-memory coordination, wire transport, daemon se
 - **CRITICAL:** Correctness crosses untyped shared-memory and wire boundaries: the client, daemon, core, and raw tests must preserve the same 24-byte layout, sentinel semantics, numeric discriminants, and descriptor expectations.
 - **HIGH:** Core futex waits observe only the low 32 bits of a 64-bit counter and assume little-endian layout; upper-half-only changes may not wake waiters, and big-endian targets are incompatible.
 - **HIGH:** Wire receipt does not enforce descriptor cardinality; every consumer must validate the number of received descriptors against the decoded response.
-- **HIGH:** The daemon contains a separate non-production v1 codec whose tests can remain green while the live `abacus-wire` protocol diverges.
-- **HIGH:** `attach_wait_counter` cannot obtain tier metadata from the daemon, so attaching a name with the wrong tier can produce an incorrectly typed client handle.
 - **HIGH:** Most real-process resilience, timing, soak, and hostile-environment tests are ignored, and some document unresolved behavior rather than a passing release baseline.
 - **HIGH:** `WaitTimer` defaults to process abort when its fatal delivery margin is missed.
 - **MEDIUM:** Shared lifecycle correctness depends on reserving `SENTINEL` globally and recognizing terminal state in any relevant word, although freeing writes only the expiration word.

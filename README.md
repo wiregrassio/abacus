@@ -48,7 +48,7 @@ Every wait type is a contract layered over the one interlock primitive. None is 
 | Crate | Purpose |
 |-------|---------|
 | `abacus-core` | The interlock: memfd allocation and sealing, shared-word layout, futex wait and wake, monotonic clock, shared error types. |
-| `abacus-wire` | Wire protocol v1: length-prefixed binary frames, descriptor passing, incremental frame reading. Shared by both endpoints. |
+| `abacus-wire` | Wire protocol v2: length-prefixed binary frames, descriptor passing, incremental frame reading. Shared by both endpoints. |
 | `abacus-daemon` | The `abacus` binary and library: socket server, named registry, tier evaluation on a 1 ms cadence. |
 | `abacus-client` | The Rust SDK: typed handles, compositions, keepalive, timeout policy. |
 | `abacus-tests` | Shared test kit and the integration, abuse, soak, and timing suites. |
@@ -129,10 +129,10 @@ liveness, and sequencing between processes that need to survive each other's cra
 
 - `docs/PHILOSOPHY.md`: the design constitution, eight laws governing every architectural choice.
 - `docs/DESIGN.md`: mechanism and rationale: the primitive, five tiers, the clock, daemon evaluation, TTL, death detection, trust model.
-- `docs/INTERFACE.md`: frozen interface surface: wire ABI v1, SDK API, per-tier field semantics, permissions, errors, termination.
+- `docs/INTERFACE.md`: frozen interface surface: wire ABI v2, SDK API, per-tier field semantics, permissions, errors, termination.
 - `docs/CONVENTIONS.md`: code style, naming, test conventions (layers, adding tests, timing procedure).
 - `docs/OPERATION.md`: installation, permissions, capacity, scheduling, measured performance.
-- `docs/BACKLOG.md`: design limits, deferred work (wire v2, FFI, boolean compositions), known defects.
+- `docs/BACKLOG.md`: design limits, deferred work (WaitRace polling, FFI, boolean compositions), known defects.
 
 ## License
 
