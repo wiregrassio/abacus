@@ -1,0 +1,27 @@
+# Abacus host tuning that cannot be done with sysctl.d: IRQ pinning and THP policy.
+# Install: sudo install -m 0644 deploy/abacus-host-tuning.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable abacus-host-tuning
+# Runs once at boot, before the daemon and Docker.
+[Unit]
+Description=Abacus host IRQ and memory tuning
+DefaultDependencies=no
+Before=abacus.service docker.service
+After=local-fs.target systemd-sysctl.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Default IRQ affinity to cores 0-3 (the non-isolated cores).
+ExecStart=/bin/sh -c 'echo f > /proc/irq/default_smp_affinity'
+
+# Pin eth0 IRQs (common + DMA channels) to core 5 by name, not by number.
+# IRQ numbers can change across boots; names in /proc/interrupts are stable.
+ExecStart=/bin/sh -c 'for irq in $(awk "/eth0/{print \\$1}" /proc/interrupts | tr -d :); do echo 5 > /proc/irq/$irq/smp_affinity_list; done'
+
+# Transparent huge pages: madvise only (no background compaction for processes that
+# did not request it).
+ExecStart=/bin/sh -c 'echo madvise > /sys/kernel/mm/transparent_hugepage/enabled'
+
+[Install]
+WantedBy=multi-user.target

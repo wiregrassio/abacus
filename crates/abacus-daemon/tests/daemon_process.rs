@@ -453,6 +453,59 @@ fn daemon__two_processes_share_one_interlock() {
     );
 }
 
+/// The daemon writes `<runtime-dir>/heartbeat` once per second with the current epoch
+/// timestamp. The file exists while the daemon runs and is removed on clean shutdown.
+#[test]
+fn daemon__heartbeat_file_exists_while_running_and_is_removed_on_stop() {
+    let mut d = ProcessDaemon::start(bin(), "heartbeat");
+    let heartbeat_path = d.socket_path().parent().unwrap().join("heartbeat");
+
+    // Wait for the heartbeat file to contain a valid timestamp. The daemon writes it once
+    // per second; std::fs::write creates the file before writing, so poll for content, not
+    // just existence.
+    let (epoch_1, _) = wait_for_value(Duration::from_secs(3), Duration::from_millis(50), || {
+        let content = std::fs::read_to_string(&heartbeat_path).ok()?;
+        if !content.ends_with('\n') {
+            return None;
+        }
+        content.trim_end_matches('\n').parse::<u64>().ok()
+    })
+    .expect("heartbeat file never contained a valid timestamp");
+    assert!(epoch_1 > 1_700_000_000, "epoch looks too small: {epoch_1}");
+
+    // Sleep 1.5 s and verify the value has advanced.
+    std::thread::sleep(Duration::from_millis(1500));
+    let content_2 = std::fs::read_to_string(&heartbeat_path).expect("read heartbeat again");
+    let epoch_2: u64 = content_2
+        .trim_end_matches('\n')
+        .parse()
+        .unwrap_or_else(|e| panic!("second read is not a decimal number: {content_2:?}: {e}"));
+    assert!(
+        epoch_2 > epoch_1,
+        "heartbeat did not advance: {epoch_1} then {epoch_2}"
+    );
+
+    // Stop the daemon and verify the file is removed.
+    d.kill(libc::SIGTERM);
+    let status = d
+        .wait_exit(Duration::from_secs(2))
+        .expect("daemon did not exit within 2 s of SIGTERM");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM should exit 0, got {}",
+        describe_exit(&status)
+    );
+    let removed = wait_for(Duration::from_secs(1), Duration::from_millis(5), || {
+        !heartbeat_path.exists()
+    });
+    assert!(
+        removed.is_ok(),
+        "heartbeat file {} still present after clean shutdown",
+        heartbeat_path.display()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Roles
 // ---------------------------------------------------------------------------

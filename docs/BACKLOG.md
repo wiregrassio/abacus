@@ -86,6 +86,16 @@ The gate is fmt, clippy, build, and test on `ubuntu-24.04`. Missing: an aarch64 
 - **Startup probe blocks on a full socket backlog.** `probe_socket` uses a blocking `UnixStream::connect` with no timeout. If the daemon's accept queue is full (a stalled daemon with many queued clients), a new instance's startup probe hangs indefinitely. A non-blocking connect with a 1 to 2 second poll timeout would bound it. The EACCES/unlink half of this issue was fixed in the daemon-hardening sprint (probe now refuses on EACCES instead of unlinking).
 - **Decoders accept trailing bytes.** `decode_request`/`decode_response` do not check the cursor consumed the full payload.
 
+### Wire hardening (deferred)
+
+Three items for hardening against untrusted or buggy clients. Low risk on a locked-down Jetson where every client is Convoy; relevant if the socket becomes reachable by untrusted code or if a container image switches to Alpine (musl).
+
+- **Reject trailing bytes after decode.** `decode_request`/`decode_response` should verify the cursor consumed the full payload (~5 lines per decoder).
+- **Enforce `MAX_MESSAGE_SIZE` on receive.** The frame reader should reject a length prefix above the cap before allocating (~10 lines in `framing.rs`).
+- **musl-compatible ancillary data in `fdpass.rs`.** The SCM_RIGHTS code assumes glibc `cmsghdr` field widths. musl uses different padding on some architectures. Needs conditional compilation or runtime sizing.
+
+**When:** before an Alpine-based container image connects to the daemon, or before the socket is exposed beyond Convoy.
+
 ### Verification gaps (no test identified)
 
 - **Monotonic-forward WaitCounter TTL across SDK and lifecycle contract.** `wait_until` arms `2 * timeout_ms`, but no cross-boundary test verifies the arming stays monotonic forward under contention.

@@ -97,6 +97,43 @@ other work on the pinned core, and the daemon's 1 ms evaluation loop stalls. The
 fatal-margin floor (`min_fatal_margin_ms`) is the defense until that kernel-level isolation
 exists: it absorbs the scheduling jitter that pinning alone does not prevent.
 
+### Host tuning
+
+The timing contract depends on host settings beyond `isolcpus`. Two files in `deploy/` make
+them persistent across reboots:
+
+```bash
+sudo install -m 0644 deploy/90-abacus.conf /etc/sysctl.d/
+sudo install -m 0644 deploy/abacus-host-tuning.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable abacus-host-tuning
+sudo sysctl --system
+sudo systemctl start abacus-host-tuning
+```
+
+`90-abacus.conf` (sysctl.d): disables RT bandwidth control (`sched_rt_runtime_us=-1`) so
+SCHED_FIFO works in containers without per-cgroup budgets, moves the lockup watchdog off
+isolated cores, and reduces `vm.stat_interval` to 10 s.
+
+`abacus-host-tuning.service` (oneshot, Before=abacus.service): sets the default IRQ affinity
+to cores 0-3, pins `eth0` IRQs to core 5 by name (stable across boots, unlike IRQ numbers),
+and sets THP to `madvise`.
+
+Both are non-destructive: the sysctl values are runtime-only (a reboot without the files
+reverts to defaults), and the oneshot unit does nothing that a manual reboot undoes.
+
+Boot parameters for the full deployment (in `/boot/extlinux/extlinux.conf` on Jetson, requires
+a reboot):
+
+```
+isolcpus=managed_irq,domain,4-11 irqaffinity=0-3 skew_tick=1
+```
+
+`managed_irq` prevents the kernel from placing IRQs on isolated cores. `domain` removes them
+from the scheduler's load-balancing domains. `skew_tick=1` offsets each core's timer tick to
+reduce cross-core cache-line contention. These are stronger than the current `isolcpus=4-11`
+alone and are recommended for production.
+
 ### Real-time clients
 
 A client that runs SCHED_FIFO work on its core raises its keepalive above that work with
@@ -126,6 +163,26 @@ The daemon writes one line per event to stderr (`journalctl -u abacus`):
 A client that disconnects, is dropped for not reading its responses, or is dropped for a dead
 socket produces no line. Interlocks are never logged: the registry is observable only through
 the SDK.
+
+## Heartbeat
+
+The daemon writes `<runtime-dir>/heartbeat` once per second with the current epoch
+timestamp. External health checks can verify the daemon is alive without connecting to
+the socket:
+
+```
+test $(($(date +%s) - $(cat /run/abacus/heartbeat))) -lt 5
+```
+
+Docker HEALTHCHECK example:
+
+```dockerfile
+HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
+  CMD test $(($(date +%s) - $(cat /run/abacus/heartbeat))) -lt 5
+```
+
+The file is removed on clean shutdown. After a SIGKILL it remains with a stale
+timestamp; the age check detects this within seconds.
 
 ## What a consumer sees when the daemon restarts
 

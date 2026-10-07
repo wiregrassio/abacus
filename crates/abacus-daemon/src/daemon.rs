@@ -64,6 +64,13 @@ pub fn daemon_run_with(config: &DaemonConfig, stop: &AtomicBool) -> Result<(), S
     let mut pollfds: Vec<libc::pollfd> = Vec::new();
     rebuild_pollfds(&mut pollfds, &server, &clients);
 
+    let heartbeat_path = config
+        .socket_path
+        .parent()
+        .map(|p| p.join("heartbeat"))
+        .unwrap_or_else(|| PathBuf::from("heartbeat"));
+    let mut last_heartbeat_s: u64 = 0;
+
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -142,12 +149,23 @@ pub fn daemon_run_with(config: &DaemonConfig, stop: &AtomicBool) -> Result<(), S
             // The first boundary strictly after now. Boundaries missed during a stall are
             // subsumed by this evaluation, never replayed.
             next_due = anchor + ((now - anchor) / NANOS_PER_MS + 1) * NANOS_PER_MS;
+
+            let epoch_s = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if epoch_s != last_heartbeat_s {
+                let _ = std::fs::write(&heartbeat_path, format!("{epoch_s}\n"));
+                last_heartbeat_s = epoch_s;
+            }
         }
 
         if changed {
             rebuild_pollfds(&mut pollfds, &server, &clients);
         }
     }
+
+    let _ = std::fs::remove_file(&heartbeat_path);
 
     Ok(())
 }
