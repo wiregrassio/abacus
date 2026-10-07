@@ -74,26 +74,40 @@ Long-running timing, soak, and hostile-environment suites are marked `#[ignore]`
 
 ## Deploy
 
-`deploy/abacus.service` is the systemd unit. It creates `/run/abacus` and launches the daemon on `/run/abacus/abacus.sock`. Install steps, the socket permission model, and the file-descriptor limit are in `docs/OPERATION.md`.
+`deploy/` contains a systemd unit, a sysusers entry, a sysctl.d file, and a oneshot tuning
+service. Together they install the daemon as a sandboxed service on an isolated core with
+persistent host tuning that survives reboot. Install steps, the socket permission model,
+container bind-mount pattern, and the heartbeat health check are in `docs/OPERATION.md`.
 
-The daemon is crash-only by design. `panic = "abort"` is deliberate: a panic terminates the process rather than unwinding through a half-evaluated registry. A restart comes back empty, wakes no one, and every timer discovers the restart through its own fatal margin.
+The daemon is crash-only by design. `panic = "abort"` is deliberate: a panic terminates the
+process rather than unwinding through a half-evaluated registry. A restart comes back empty,
+wakes no one, and every timer discovers the restart through its own fatal margin. systemd
+never gives up restarting. The daemon writes `/run/abacus/heartbeat` once per second for
+external health checks.
 
-Every local process that can open the socket can create over names, attach to any object, and terminate writable objects. Deployment security rests on socket ownership and mode.
+Every local process that can open the socket can create over names, attach to any object, and
+terminate writable objects. Deployment security rests on socket ownership and mode.
 
 ## Performance
 
-All guarantees hold on an isolated core (`isolcpus` or cpuset shield). Non-isolated operation is best-effort.
+All guarantees hold on an isolated core (`isolcpus` with host tuning from `deploy/`).
+Non-isolated operation is best-effort. Measured on a Jetson AGX Orin (L4T R35.5, kernel
+5.10.192-tegra, `isolcpus=managed_irq,domain,4-11`, MAXN, clocks pinned).
 
-| Metric | Idle | Production load | Stress (44 threads) |
-|--------|------|-----------------|---------------------|
-| `wait_ms(5)` p99 | 5.0 ms | 6.0 ms | 5.9 ms |
-| `wait_ms(5)` max | 5.6 ms | 12.5 ms | 16.9 ms |
-| Cron 10 ms drift | 0 of 200 off grid | 0 of 200 off grid | |
-| Daemon idle CPU | < 1% | | 0 ticks / 3 s |
-| 1000 interlocks eval | 21 ticks / 10 s | | |
+| Metric | Value |
+|--------|-------|
+| Clock stamp lateness (daemon jitter) | p50 4-6 us, max 18 us |
+| Delivery lateness (10-100 entries) | p50 4-5 us, max 14 us |
+| Delivery lateness (4000 entries) | p50 127-130 us |
+| Futex wake to waiter running | p50 4-5 us, max 9 us |
+| Keepalive soak (FIFO, 100 ms TTL) | survived 600 s |
+| Daemon restart (clean) | 12 ms |
+| Full-line restart (containers) | 1.08 s |
+| Cron 10 ms drift | 0 of 200 off grid |
+| Cyclictest baseline (cores 6-11) | max 4-5 us |
 
-Cadence is 1 ms with sub-millisecond median jitter on an isolated core. Full measurement
-tables with conditions in `docs/OPERATION.md`.
+720,000 samples per metric, 60 s per cell. Full tables with environment and conditions in
+`docs/OPERATION.md`.
 
 ## Why not X?
 
