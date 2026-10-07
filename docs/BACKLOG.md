@@ -36,8 +36,8 @@ Non-isolated operation is best-effort and explicitly out of contract.
 - **No rate limiting or per-peer quota.** Only the global `max_interlocks` cap applies.
 - **Slow readers are dropped, not buffered.** `EAGAIN` on write is treated as connection death, because the protocol is strict request/response and a client not draining its socket is broken.
 - **No metrics, health endpoint, structured logging, or admin tool.** Diagnostics are stderr lines; the registry is observable only through the SDK. The daemon's budget is a 1 ms loop; an observability surface is a design problem of its own.
-- **Real-time scheduling and CPU pinning assume an isolated core.** The unit pins to core 4 with SCHED_FIFO priority 50, correct only where the host boots with `isolcpus` covering core 4. Without kernel-level isolation the pin is a half-measure that reads as a guarantee, so check the boot parameters before deploying.
-- **Socket is listening before its mode is applied.** `UnixListener::bind` sockets, binds, and listens in one call; the chmod and chown follow. In the window the socket accepts connections at umask-derived permissions. The runtime directory's `0755` mode limits exposure to processes that can reach the path. Clients retry `EACCES` (`connect_waiting`); the daemon does not close the window.
+- **CPU pinning assumes an isolated core.** The unit pins the daemon to core 4 at the default scheduling policy, correct only where the host boots with `isolcpus` covering core 4 and places nothing else there. Without kernel-level isolation the pin is a half-measure that reads as a guarantee, so check the boot parameters before deploying.
+- **Socket is listening before its mode is applied.** `UnixListener::bind` sockets, binds, and listens in one call; the chmod and chown follow. In the window the socket accepts connections at umask-derived permissions. The shipped unit closes it with `UMask=0117` (the socket is born 0660); a daemon started any other way, including the test kit's in-process daemons (a process-wide umask is not an option there), still has it. Clients retry `EACCES` (`connect_waiting`).
 - **The daemon clock's TTL has no slack beyond a CFS period.** The clock is armed for 100 ms each tick, against the SDK's 200 ms keepalive floor. A daemon stall longer than 100 ms lapses the clock, and every `Abort`-policy client aborts with `DaemonClockLapsed`.
 - **Diagnostics are blocking stderr writes.** The keepalive's abort line and the daemon's log lines are plain writes to stderr. A stalled log sink can delay an abort or stall the daemon loop.
 
@@ -79,17 +79,11 @@ The gate is fmt, clippy, build, and test on `ubuntu-24.04`. Missing: an aarch64 
 
 **When:** before a second contributor or a CI-gated merge policy.
 
-### Harden the systemd unit
-
-The unit runs as root with no `User=`, `NoNewPrivileges`, `ProtectSystem`, `PrivateTmp`, `RestrictAddressFamilies`, or `CapabilityBoundingSet`. `RuntimeDirectory` without `RuntimeDirectoryPreserve=restart` deletes the directory on crash-only restarts. `Restart=always` with `RestartSec=100ms` under the default `StartLimitBurst=5/10s` leaves the unit dead after a fast crash loop.
-
-**When:** before deploying outside a controlled lab environment.
-
 ## Known defects (narrow, deferred for v0)
 
 - **Descriptor exhaustion spins the accept loop.** `try_accept` error leaves the listener in the pollset with POLLIN asserted; the daemon busy-loops. Requires exhausting the fd table.
 
-- **Stale-socket detection can unlink a live socket.** A connect failure from permissions or transient backlog leads to `remove_file` on a path another daemon may own.
+- **Startup probe blocks on a full socket backlog.** `probe_socket` uses a blocking `UnixStream::connect` with no timeout. If the daemon's accept queue is full (a stalled daemon with many queued clients), a new instance's startup probe hangs indefinitely. A non-blocking connect with a 1 to 2 second poll timeout would bound it. The EACCES/unlink half of this issue was fixed in the daemon-hardening sprint (probe now refuses on EACCES instead of unlinking).
 - **Decoders accept trailing bytes.** `decode_request`/`decode_response` do not check the cursor consumed the full payload.
 
 ### Verification gaps (no test identified)

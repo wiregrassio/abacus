@@ -1,76 +1,57 @@
 <purpose>
-
-# crates/abacus-daemon/
-
-Builds the `abacus` daemon executable and library that run Abacus's 1 ms coordination loop over a Unix-domain-socket interface.
-
+# abacus-daemon/
+Daemon package for the `abacus` executable and Rust coordination library. Hosts the Unix socket service, millisecond interlock loop, and process-level integration coverage.
 </purpose>
 
 <dependencies>
-
 ## Dependencies
-- `abacus-core`: monotonic time, interlock memory and fd operations, expiry checks, futex wakes, and shared errors.
-- `abacus-wire`: production request/response framing, protocol codec, and SCM_RIGHTS fd transfer.
-- `libc`: Unix polling, signals, sockets, process controls, and system errno interfaces.
-- Dev dependencies:
-  - `abacus-client`: SDK-level daemon integration testing.
-  - `abacus-tests`: shared daemon-process, raw-protocol, timing, and test-role infrastructure.
-
+Uses workspace crates `abacus-core` for interlock and timing primitives, `abacus-wire` for production protocol framing, and `libc` for Unix facilities. Integration tests additionally use `abacus-client` and `abacus-tests`.
 </dependencies>
 
 <consumed-by>
 
 ## Consumed By
-`abacus-tests` imports this crate as a dev-dependency for in-process daemon tests.
+Static import scan, directories importing `abacus-daemon`:
+- `<repo root>`
+
+(Real import edges, not inferred. A cross-service entry here is a reach into this directory's internals, a coupling to flag.)
 
 </consumed-by>
 
 <data-flow>
-
 ## Data Flow
-- CLI arguments enter the `abacus` binary and configure the socket path, socket permissions/group, and registry capacity.
-- The daemon creates a Unix socket server, registry, and daemon-owned clock interlock.
-- Clients send framed `abacus_wire` requests over Unix sockets; create and attach requests resolve to registry operations.
-- Successful requests produce wire responses and duplicated interlock file descriptors delivered with SCM_RIGHTS.
-- The daemon's `ppoll` loop processes socket activity and advances the registry at elapsed 1 ms boundaries.
-- Registry evaluation updates the clock, expires and reaps interlocks, completes wait tiers, and futex-wakes waiting clients.
-- SIGTERM or SIGINT stops the process; socket cleanup occurs when the server is dropped.
-
+- CLI configuration enters through the `abacus` binary.
+- Unix socket requests enter daemon implementation in `src/`.
+- Create and attach operations return wire responses and, when applicable, SCM_RIGHTS-transferred interlock descriptors.
+- Integration tests in `tests/` start and exercise real daemon processes.
 </data-flow>
 
 <known-hazards>
-
 ## Known Hazards
-- HIGH: Socket stale-path detection can remove a live daemon socket when a connection probe fails due to temporary reachability or permission conditions.
-- MEDIUM: Strict reply sending treats `EAGAIN` as a dead client rather than buffering a response, so slow-reading clients can lose request results.
-- MEDIUM: Registry evaluation linearly scans all live slots every millisecond; raising the registry limit directly risks exceeding the fixed scheduling budget.
-- MEDIUM: External stop-flag changes do not explicitly wake `ppoll`, so non-signal shutdown latency can last until the current poll timeout.
-- HIGH: Several process and hostile-client integration tests document currently red daemon behaviors; unresolved implementation defects make this suite fail rather than serve as a green regression baseline.
-- HIGH: Timing tests depend on host scheduling, startup latency, daemon cadence, and CPU-tick accounting, making them vulnerable to slow or heavily loaded test hosts.
-
+- HIGH: The daemon loop and registry evaluation depend on absolute millisecond boundaries. Scheduling changes can skip clock updates or delay shutdown.
+- HIGH: Interlock ID `0` is daemon-owned clock state and must not be allocated as an ordinary interlock.
+- HIGH: Registry capacity directly affects per-tick scheduling cost. Compliance with the 1 ms budget at maximum capacity is not verified.
+- HIGH: Malicious truncation of clock shared memory can SIGBUS mapped processes. Attack coverage must remain process-isolated.
+- MEDIUM: Slow-reading clients are closed on socket `EAGAIN`, not guaranteed strict response delivery.
 </known-hazards>
 
 <files>
-
 ## Files
 | File | Purpose |
-|---|---|
-| `Cargo.toml` | Defines the `abacus-daemon` package, its `abacus` binary target, and runtime/test dependencies. |
-
+|------|---------|
+| `Cargo.toml` | Defines the daemon package, `abacus` binary target, and production and test dependencies. |
+| `README.md` | Package contracts, units, test inventory, and cross-boundary verification status. |
 </files>
 
-<notes>
-
-## Notes
-The package deliberately separates daemon implementation from its process-level test suite: unit and module behavior live under `src/`, while `tests/` launches real daemon processes and crosses Unix socket, signal, fd-transfer, and shared-memory boundaries.
-
-The daemon-owned clock is a reserved interlock with ID `0`; consumers relying on registry state must preserve that reservation.
-
-</notes>
+<subdirectories>
+## Subdirectories
+| Directory | Purpose |
+|-----------|---------|
+| `src/` | Daemon library, event loop, registry, Unix socket transport, and CLI entry point. |
+| `tests/` | Real-process integration coverage for lifecycle, clients, timing, and hostile protocol inputs. |
+</subdirectories>
 
 <reference>
-
 ## Reference
-Full contracts, units, symbol table, test inventory, and cross-boundary verification: see `README.md`.
-
+See `README.md` for package contracts, timing units, and verification coverage.
 </reference>

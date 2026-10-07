@@ -1,86 +1,52 @@
 <purpose>
-
-# crates/abacus-client/src/
-
-Implements the Rust SDK: daemon connection, interlock creation/attachment, TTL maintenance, and typed blocking wait primitives.
-
+# src/
+Public Rust SDK for connecting to the Abacus daemon, mapping shared-memory interlocks, maintaining their TTLs, and exposing typed wait primitives.
 </purpose>
 
 <dependencies>
-
 ## Dependencies
-- Sibling workspace crates:
-  - `abacus_core`: shared-memory interlock handles and lifecycle operations, monotonic clock helpers, futex operations, sentinels, and transport/error types.
-  - `abacus_wire`: UDS request/response encoding, frame validation, daemon error codes, and passed-file-descriptor handling.
-- External/system packages:
-  - Rust standard library: Unix-domain sockets, owned file descriptors, threads, atomics, synchronization, timing.
-  - `libc`: socket peeking, errno values, and futex timeout classification.
-
+Imports `abacus-core` for shared-memory interlocks, clocks, futexes, and transport errors; `abacus-wire` for UDS request framing, responses, and passed file descriptors; `libc` and the Rust standard library for Unix sockets, scheduling, atomics, and threads. Internal modules route client-created handles through shared operations, keepalive, types, and wait implementations.
 </dependencies>
 
 <consumed-by>
 
 ## Consumed By
-- `abacus-tests` and end-user applications consume this SDK.
+Consumed by the parent package (`crates/abacus-client`).
 
 </consumed-by>
 
 <data-flow>
-
 ## Data Flow
-- `AbacusClient` connects to the daemon over a blocking Unix-domain socket, sends encoded create/attach requests, receives wire responses plus one shared-memory file descriptor, and maps that descriptor into an `InterlockHandle`.
-- Typed constructors wrap mapped handles as bare `Interlock`, `WaitCounter`, `WaitTimer`, `WaitCron`, `WaitBarrier`, or `ProcessClock` objects.
-- Handles read and mutate atomically shared `open_count`, `closed_count`, and `expiration_ns` words, using futex waits/wakes for local blocking synchronization.
-- A client-wide `Keepalive` background thread periodically arms registered interlocks with future expiration timestamps; `ProcessClock` registrations also copy the daemon clock into `open_count`.
-- Wait primitives observe daemon-written completion values and return `WaitResult`, timeout/reaped errors, or,in the configured fatal timer policy,abort the process.
-
+- `AbacusClient` sends typed create and attach requests over a Unix domain socket to the daemon.
+- Daemon responses return protocol data and shared-memory file descriptors, which the client maps into `InterlockHandle`s.
+- Typed handles read and mutate shared atomic words, then wait through futexes.
+- One shared `Keepalive` thread refreshes registered handle TTLs and updates the client ProcessClock.
+- Wait operations return `WaitResult` or `SdkError`, including daemon death, reaping, timeout, and transport failures.
 </data-flow>
 
 <known-hazards>
-
 ## Known Hazards
-- **HIGH:** `attach_interlock` maps any tier read-write, and attaching a ProcessClock is read-write: the daemon hands out the same descriptor for every tier, so read-only views are SDK convention. `attach_wait_counter` checks the daemon-reported tier before mapping and refuses anything but tier 1 (`InvalidRequest`).
-- **HIGH:** `WaitTimer` defaults to `TimeoutPolicy::Abort`; a missed fatal margin terminates the entire process rather than returning an error.
-- **HIGH:** `WaitRace` is SDK-side polling at 1 ms rather than daemon-side synchronization; it adds wake/scheduling overhead proportional to raced counters and treats any reaped member as failure of the entire race.
-- **MEDIUM:** Shared counter semantics rely on the `SENTINEL` value remaining reserved globally; direct or wrapping writes that violate this convention can make live interlocks appear reaped.
-- **MEDIUM:** `WaitCounter::wait_until` uses a CAS-max target, so concurrent users of the same handle cannot independently lower or isolate requested targets; one waiter may observe another waiter's delivery. A `WaitTimer` admits one waiter at a time and refuses a concurrent second wait (`InvalidRequest`).
-- **MEDIUM:** Keepalive liveness depends on its single background thread receiving CPU time before TTL expiration; long process stalls beyond the configured TTL cause daemon reaping.
-- **LOW:** `AbacusClient::is_connected` reads false once a failed send or receive has poisoned the connection, and otherwise only distinguishes socket EOF from no immediately observable closure; it does not establish that the daemon can serve a request.
-
+- HIGH: `TimeoutPolicy::Abort` is the default, a missed WaitTimer fatal margin or lost process liveness aborts the host process.
+- HIGH: Keepalive scheduling and CPU affinity inherit from the connecting thread. A non-real-time keepalive can starve behind real-time work and cause reaping.
+- MEDIUM: `AttachedInterlock::free` writes the termination sentinel despite attached expiration being read-only, terminating the shared interlock for all holders.
+- MEDIUM: `WaitRace` polls every millisecond and is an SDK-side stopgap pending daemon-side `WaitOr`.
 </known-hazards>
 
 <files>
-
 ## Files
 | File | Purpose |
-|---|---|
-| `client.rs` | Defines SDK errors, Unix-socket request/response transport, daemon connection setup, typed create/attach APIs, and descriptor mapping. |
-| `handle_ops.rs` | Provides shared atomic reads, sentinel-safe counter increments, lifecycle reads, TTL touching, and futex wait loops. |
-| `interlock.rs` | Implements creator, attached, read-only counter, and clock handle types. |
-| `lib.rs` | Declares modules and re-exports the SDK public API. |
-| `process_clock.rs` | Implements a keepalive-backed liveness and uptime beacon using daemon clock values. |
-| `tests.rs` | Tests public pure type behavior, constants, lifecycle classification, wire discriminants, and error display. |
-| `touch.rs` | Implements the shared keepalive registry, worker thread, and per-registration deregistration handle. |
-| `types.rs` | Defines SDK policies, wait/lifecycle result types, defaults, watched-word ABI values, and pure classification functions. |
-| `wait_barrier.rs` | Implements one-shot, manually rearmable all-conditions barrier waiting. |
-| `wait_counter.rs` | Implements target-based waits on a watched interlock word. |
-| `wait_cron.rs` | Implements recurring daemon-driven waits on a monotonic-time grid. |
-| `wait_race.rs` | Implements an SDK-only first-completion race over multiple `WaitCounter`s. |
-| `wait_timer.rs` | Implements clock-based waits with fatal delivery margins and configurable timeout policy. |
-
+|------|---------|
+| `client.rs` | Defines `AbacusClient`, SDK errors, UDS transport, daemon request handling, and typed handle creation and attachment. |
+| `handle_ops.rs` | Shared atomic reads, sentinel-aware increments, lifecycle reads, TTL touches, and futex wait loops. |
+| `interlock.rs` | Implements creator, attached, read-only counter, and daemon clock handle types. |
+| `lib.rs` | Declares SDK modules and re-exports the public API. |
+| `process_clock.rs` | Exposes the client ProcessClock liveness beacon and metadata. |
+| `tests.rs` | Cross-module unit tests for pure SDK types, constants, errors, and state derivation. |
+| `touch.rs` | Implements the shared keepalive thread, registrations, liveness monitoring, and thread scheduling control. |
+| `types.rs` | Defines SDK policies, result and state types, defaults, and pure state classification helpers. |
+| `wait_barrier.rs` | Implements daemon-evaluated multi-condition barriers. |
+| `wait_counter.rs` | Implements target-based waits on another interlock word. |
+| `wait_cron.rs` | Implements recurring daemon-driven grid-aligned timer waits. |
+| `wait_race.rs` | Implements SDK-side first-completer polling across WaitCounters. |
+| `wait_timer.rs` | Implements clock-based waits with fatal-margin timeout handling and one-waiter enforcement. |
 </files>
-
-<notes>
-
-## Notes
-- The daemon controls interlock allocation, naming, tier evaluation, and passed-memory descriptors; the client controls local handle lifetime, TTL refresh, and futex waiting.
-- Typed handles encode intended mutation permissions at the Rust API boundary, but attached shared memory remains a cross-process mutable resource.
-- The clock interlock is attached automatically during `AbacusClient::connect`; callers access it only through `client.clock()`.
-
-</notes>
-
-<reference>
-
-## Reference
-
-</reference>

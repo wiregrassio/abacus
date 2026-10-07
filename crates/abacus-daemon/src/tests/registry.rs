@@ -604,7 +604,7 @@ fn registry__evaluate_skips_clock() {
     );
     let (id, _, _) = reg.attach("clock").expect("clock gone");
     assert_eq!(id, 0);
-    reg.refresh_clock_expiration();
+    reg.refresh_clock_expiration(monotonic_now_nanos());
     assert!(
         words(&clock).2 > monotonic_now_nanos(),
         "refresh did not extend the clock"

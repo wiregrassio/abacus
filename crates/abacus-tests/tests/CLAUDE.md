@@ -1,97 +1,64 @@
 <purpose>
-
 # tests/
-
-Integration, regression, abuse, soak, and hardware-timing test suites that exercise the Abacus client/daemon contracts through in-thread and real-process daemons.
-
+Integration and resilience test suites for the Abacus client, daemon, shared-memory interlocks, wire protocol, liveness, timing, and abuse boundaries.
 </purpose>
 
 <dependencies>
-
 ## Dependencies
-- Sibling workspace crates: `abacus-client`, `abacus-core`, `abacus-daemon`, `abacus-wire`.
-- Parent test-support crate/module: `abacus_tests` helpers for daemon lifecycle, raw protocol clients, socket paths, synchronization, process roles, CPU/RSS/fd metrics, random generation, affinity, and statistics.
-- External/platform facilities: Rust standard library, Unix-domain sockets, `/proc`, `libc`, memfd/mmap/futex/SCM_RIGHTS behavior, process signals, CPU affinity, and resource limits.
-
+Imports sibling crates `abacus-client`, `abacus-core`, `abacus-daemon`, `abacus-tests`, and `abacus-wire`. Uses `libc` and Rust standard-library Unix process, socket, threading, and timing APIs.
 </dependencies>
 
 <consumed-by>
 
 ## Consumed By
-- Cargo/libtest discovers each `*.rs` file as an integration-test binary for the `abacus-tests` crate.
+Consumed by the parent package (`crates/abacus-tests`).
 
 </consumed-by>
 
 <data-flow>
-
 ## Data Flow
-- Test code starts an in-thread `ThreadDaemon`, a process-backed `ProcessDaemon`, a fake UDS daemon, or a stoppable daemon thread.
-- Tests create SDK clients, raw wire clients, shared-memory attachments, hostile socket traffic, child-process roles, CPU-load threads, and process signals.
-- Client and raw-wire operations produce shared-memory interlock handles, protocol responses, wait results, daemon process metrics, and child status/output.
-- Assertions compare those outputs against surface, lifecycle, timeout, permission, wire-ABI, resource-recovery, and timing contracts.
-- Abuse and timing suites report diagnostic measurements such as CPU ticks, latency percentiles, RSS, descriptor count, and replay seeds.
-
+- Test cases create thread-hosted or process-hosted daemons, then drive them through SDK clients, raw Unix sockets, shared memfds, child roles, signals, and CPU load.
+- Assertions observe interlock words, futex waits, daemon health, process exits, stderr diagnostics, resource counters, and timing statistics.
+- Abuse and timing suites emit failure diagnostics and benchmark summaries.
 </data-flow>
 
 <known-hazards>
-
 ## Known Hazards
-- **HIGH:** Most L3/L4 timing, soak, and abuse coverage is `#[ignore]`; regressions in hostile-input resilience, resource recovery, and real-hardware latency are not detected by the default test run.
-- **HIGH:** L3/L4 timing thresholds are calibrated to a Jetson Orin AGX with an isolated core; a different host or non-isolated configuration will fail the timing assertions even with correct daemon behavior.
-- **HIGH:** Hardware timing assertions depend on CPU isolation, affinity, scheduler behavior, tick accounting, and the Jetson-like deployment profile; they can fail on otherwise correct hosts with unrelated work scheduled on the daemon core.
-- **MEDIUM:** Process-role tests invoke the current libtest executable by test name; renamed role functions, altered libtest invocation semantics, or output-format changes can break orchestration independently of daemon behavior.
-- **MEDIUM:** Tests directly mutate and map shared memfds, including sentinel values and hostile writes; incorrect test isolation or a daemon that permits `ftruncate` can SIGBUS participating processes.
-- **MEDIUM:** Numerous behavioral assertions rely on millisecond-scale sleeps and polling for ordering, so heavily loaded CI can introduce timing-related flakiness.
-- **LOW:** Wire and protocol tests couple directly to numeric tags, tiers, error codes, frame layout, and fixed message-size limits; ABI changes require coordinated test updates.
-
+- HIGH: Several tests send SIGKILL or SIGSTOP, create CPU saturation, alter fd limits, or require scheduling privileges. Run ignored timing, abuse, soak, and priority suites only in suitable isolated environments.
+- MEDIUM: Role tests are ignored entry points invoked by other tests through the current test binary. Renaming a role requires updating its spawners.
+- MEDIUM: Hardware timing thresholds assume daemon CPU isolation. Host scheduling noise can produce legitimate failures.
 </known-hazards>
 
 <files>
-
 ## Files
 | File | Purpose |
-|---|---|
-| `abuse_connections.rs` | Ignored L4 process-daemon tests for idle connection piles, connect floods, SCM_RIGHTS floods, creation caps, fd exhaustion, and request-burst loop recovery. |
-| `abuse_memory.rs` | Ignored L4 process-daemon tests for registry collisions, memfd truncation, hostile mappings, writable-word corruption, and clock scribble resistance. |
-| `abuse_wire.rs` | Ignored L4 process-daemon tests that flood malformed, random, mutated, oversized, zero-length, and partial wire frames. |
-| `attached.rs` | L1 tests for attached interlock mutation/wait/free behavior and attached wait-counter visibility. |
-| `bounded_waits.rs` | Focused tests for bounded interlock, attached-interlock, and clock futex waits. |
-| `client.rs` | L1 tests for client connection setup, clock attachment, reserved-name handling, SDK-side rejection, and daemon error mapping. |
-| `connect_waiting.rs` | L1 tests that `connect_waiting` rides out an absent dependency or daemon, times out with `DependencyTimeout`, logs each distinct reason once even when reasons alternate, returns other errors at once, and returns a non-retryable connect errno (`ENOTDIR`) in under one retry interval. |
-| `interlock.rs` | L1 tests for interlock arithmetic, state, TTL, futex wakeups, sentinels, keepalive threads, freeing, drops, and create-over-existing-name replacement. |
-| `is_reaped.rs` | Tests `is_reaped()` across owning handle types, replacement, and TTL expiry. |
-| `liveness.rs` | L1 process-level tests of ProcessClock ownership and dependency cascade against a `ProcessDaemon`: SIGKILL reaps owned interlocks and aborts dependents, a three-level chain aborts every dependent, a missing dependency is refused until it exists, daemon death aborts the client, a recreated clock aborts the old process, a stale client cannot create or displace, a clean exit lapses owned interlocks; under `TimeoutPolicy::Error`, `liveness()` reports `DaemonClockLapsed` after daemon death and `ProcessClockReaped` after the clock is recreated, without aborting. |
-| `permissions.rs` | Runtime validation of the permission-model rows for creators, attachers, wait objects, and clock handles. |
-| `process_clock.rs` | L1 tests for the client's process-clock uptime, fixed start time, and wait-counter observation. |
-| `regressions.rs` | Consolidated in-process regression coverage for cron, barriers, races, timeout policy, invalid requests, sentinel safety, target lifetime, keepalive, and bounded waits. |
-| `sentinel_increments.rs` | Focused tests ensuring increments cannot resurrect or wrap through sentinel values. |
-| `soak_hour.rs` | Ignored long-running process-daemon soak checking wait liveness, cron semantics, RSS stability, and fd stability. |
-| `stop_flag.rs` | Tests the stoppable daemon-loop API, socket cleanup, connection-state transition, and wait-counter timeout after daemon shutdown. |
-| `timeout_policy.rs` | Tests timeout-policy behavior, timer TTL margins, zero-duration waits, daemon stalls, and daemon restart semantics. |
-| `timing_liveness.rs` | Ignored L3 timing of the A, B, C cascade over 20 runs with randomized start and kill delays: kill of A to C's clock and owned interlock reaped within `DEFAULT_TOUCH_TTL_MS` + 13 ms, C's `ProcessClockReaped` line within `DEFAULT_TOUCH_INTERVAL_MS` + 10 ms of the reap, kill to that line within TTL + interval + 13 ms; C's exit time is reported, not asserted. |
-| `timing_load.rs` | Ignored hardware timing/load benchmarks across oversubscribed, production-affinity, and stress-affinity profiles. |
-| `timing_loop.rs` | Ignored idle-hardware timing benchmarks for daemon CPU, timers, cron drift, wake latency, and large registries. |
-| `touch.rs` | L1 test that the default keepalive TTL survives a 100 ms owner-process stall. |
-| `wait_barrier.rs` | L1 tests for all-condition barriers, wake latency, reaping, already-reaped behavior, direct registry barrier evaluation, and SDK barrier delivery/rearming. |
-| `wait_counter.rs` | L1 tests for watched-word counters, target CAS-max semantics, delivery, timeout, reaping, TTL, and clock watching. |
-| `wait_cron.rs` | L1 tests for cron grid behavior, repeated waits, off-grid overrun reporting, and free behavior. |
-| `wait_race.rs` | L1 tests that SDK-only wait races identify the first completed counter and that a reaped counter is an error. |
-| `wait_timer.rs` | L1 tests for relative/absolute timer waits, past targets, multiple timers, monotonic sequencing, and reaping. |
-| `wire_crate.rs` | Wire-crate codec round-trip, truncation, fuzz-like mutation, random-input, and dependency-boundary tests. |
-
+|------|---------|
+| `abuse_connections.rs` | Ignored L4 daemon resilience tests for connection floods, partial recovery, SCM_RIGHTS, capacity limits, and fd exhaustion. |
+| `abuse_memory.rs` | Ignored L4 shared-memory abuse tests for collisions, memfd sealing, hostile mappings, and corrupted words. |
+| `abuse_wire.rs` | Ignored L4 hostile Unix-socket framing, mutation, oversized-prefix, and partial-frame tests. |
+| `attached.rs` | Attached interlock and attached wait-counter behavior tests. |
+| `bounded_waits.rs` | Bounded futex wait timeout, wake, and reaped-handle tests. |
+| `client.rs` | SDK connection, protocol error mapping, attachment, process-clock, and keepalive configuration tests. |
+| `connect_waiting.rs` | Retrying connection and dependency-wait behavior tests, including child role logging. |
+| `interlock.rs` | Owning interlock lifecycle, TTL, touch thread, waiting, termination, and replacement tests. |
+| `is_reaped.rs` | `is_reaped()` coverage across owning handle types and expiry paths. |
+| `keepalive_priority.rs` | Ignored privileged SCHED_FIFO keepalive priority soak tests and role entry point. |
+| `liveness.rs` | Process-clock dependency cascade, daemon death, replacement, and child abort tests. |
+| `permissions.rs` | Runtime validation of creator, attacher, counter, and clock permission-model cells. |
+| `process_clock.rs` | Process-clock uptime, fixed start time, and watcher tests. |
+| `regressions.rs` | In-process regression coverage for scheduling, protocol validation, waits, ownership, and keepalive behavior. |
+| `sentinel_increments.rs` | Sentinel-preserving increment and attacher-free race regression tests. |
+| `soak_hour.rs` | Ignored long-running daemon resource and wait-service soak test. |
+| `stop_flag.rs` | Stoppable daemon-loop, socket cleanup, connection state, and shutdown timeout tests. |
+| `timeout_policy.rs` | Timer TTL margin, timeout policy, daemon stall, and restart behavior tests. |
+| `timing_liveness.rs` | Ignored hardware timing measurements for multi-level liveness cascades. |
+| `timing_load.rs` | Ignored CPU-load timing benchmarks, isolation profiles, and keepalive thread-budget tests. |
+| `timing_loop.rs` | Ignored idle-hardware loop, timer, cron, barrier, counter, and registry-scale timing benchmarks. |
+| `touch.rs` | Default touch-thread TTL stall-survival test. |
+| `wait_barrier.rs` | WaitBarrier evaluation, rearm, latency, reap, and registry-stamping tests. |
+| `wait_counter.rs` | WaitCounter delivery, contention, timeout, TTL, reap, and clock-watch tests. |
+| `wait_cron.rs` | WaitCron grid, rearm, overrun, daemon-death, and termination tests. |
+| `wait_race.rs` | SDK-only multi-counter race winner and reap-error tests. |
+| `wait_timer.rs` | WaitTimer duration, absolute target, monotonicity, role, and reap tests. |
+| `wire_crate.rs` | Wire codec round-trip, truncation, mutation, random-input, and crate dependency-boundary tests. |
 </files>
-
-<notes>
-
-## Notes
-The directory deliberately separates normal L1 behavioral coverage from L3 hardware timing and L4 hostile-environment coverage. The latter are ignored because they are expensive and host-sensitive.
-
-File names describe the behavior under test. Their comments define the intended API/behavioral shape and make the test suite part of the implementation acceptance criteria.
-
-</notes>
-
-<reference>
-
-## Reference
-
-</reference>

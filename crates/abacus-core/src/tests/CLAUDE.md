@@ -1,67 +1,38 @@
 <purpose>
-
-# crates/abacus-core/src/tests/
-
+# tests/
+L0 unit-test modules for `abacus-core` clock, error vocabulary, and shared-memory interlock contracts.
 </purpose>
 
 <dependencies>
-
 ## Dependencies
-- Sibling crate modules: `crate::clock`, `crate::error`, and `crate::interlock`
-- Rust standard library: atomics, threads, channels, timing, file-descriptor ownership, formatting, environment access
-- External package: `libc` for errno constants and Linux syscalls/constants
-
+Imports sibling `clock`, `error`, and `interlock` modules, plus `libc` and Rust standard-library concurrency, timing, fd, and atomic APIs.
 </dependencies>
 
 <consumed-by>
-
 ## Consumed By
-- `cargo test -p abacus-core --lib` runs these tests.
-
+Consumer discovery pending downstream static import scan.
 </consumed-by>
 
 <data-flow>
-
 ## Data Flow
-- Test cases construct clocks, atomics, interlocks, file descriptors, error values, and concurrent waiter threads.
-- Tests invoke core APIs and selected direct Linux syscalls (`pipe`, `ftruncate`, `fcntl`) to observe behavior and OS-visible state.
-- Assertions validate return values, errno values, timing boundaries, shared-memory contents, futex wake behavior, memory layout, and error rendering.
-- `ABACUS_TEST_SEED` may enter through the environment to make the contention test's pseudo-random TTL sequence replayable.
-
+- Test inputs: core API calls, atomic shared-memory state, OS futex and memfd behavior, optional `ABACUS_TEST_SEED`.
+- Test outputs: assertions over return values, layouts, error displays, timing, wake behavior, and sealing.
+- Contention tests derive reproducible randomized TTL workloads from a seeded xorshift generator.
 </data-flow>
 
 <known-hazards>
-
 ## Known Hazards
-- HIGH: Futex operations intentionally compare and wake only the low 32 bits of `u64` counters; high-word-only changes are invisible to the kernel and can leave waiters sleeping until timeout.
-- HIGH: Futex address derivation assumes a little-endian target, where the first 32 bits of a `u64` are its low word; big-endian builds violate this assumption.
-- MEDIUM: Tests require Linux-specific facilities and semantics, including futexes, `memfd` seals, `F_GET_SEALS`, and Linux errno values.
-- MEDIUM: Timing-sensitive wake and timeout assertions can fail under extreme scheduler delay or heavily contended CI hosts despite correct implementation behavior.
-- LOW: The contention test uses modulo reduction in `Xorshift::below`, which introduces distribution bias; it is sufficient for stress coverage but not statistically uniform sampling.
-
+- HIGH: Futex tests require Linux futex semantics, operate on the low 32 bits of `u64`, and assume little-endian memory layout.
+- MEDIUM: Wake and timeout tests depend on scheduler timing, retry stimuli to reduce lost-wake races, and can be flaky under severe system load.
+- MEDIUM: Memfd sealing tests temporarily attempt size changes on a live mapping and must restore size before accessing it if sealing is absent.
 </known-hazards>
 
 <files>
-
 ## Files
 | File | Purpose |
-|---|---|
-| `clock.rs` | Tests monotonic-clock ordering, expiration boundaries, millisecond conversion, and Linux futex behavior. |
-| `error.rs` | Tests error enum display strings, conversions, equality, and `std::error::Error` implementation. |
-| `interlock.rs` | Tests interlock layout, lifecycle, concurrent arming, futex wakeup behavior, fd sharing, mapping failures, and memfd sealing. |
+|------|---------|
+| `clock.rs` | Tests monotonic clock, expiration arithmetic, futex behavior, endian assumption, and duration conversion. |
+| `error.rs` | Tests error enum display text, conversions, equality, and `std::error::Error` conformance. |
+| `interlock.rs` | Tests interlock layout, TTL arming, termination, futex wakeups, fd sharing, mapping failures, and memfd seals. |
 | `mod.rs` | Declares test modules and provides errno access plus seeded xorshift support for contention tests. |
-
 </files>
-
-<notes>
-
-## Notes
-The tests intentionally exercise implementation-visible Linux behavior rather than only public success paths, because interlock safety depends on kernel futex semantics, fixed memory layout, and sealed shared-memory backing.
-
-</notes>
-
-<reference>
-
-## Reference
-
-</reference>

@@ -1,67 +1,54 @@
 <purpose>
-
-# crates/abacus-wire/
-
+# abacus-wire/
+Shared Abacus v2 wire-protocol crate. Packages message encoding, bounded Unix-stream framing, and SCM_RIGHTS file descriptor transfer for protocol endpoints.
 </purpose>
 
 <dependencies>
-
 ## Dependencies
-- Sibling crate `abacus-core`: protocol condition and transport/error types.
-- External crate `libc`: Unix socket control-message APIs and errno constants.
-- Rust standard library Unix socket and file-descriptor ownership APIs.
-
+Imports workspace crate `abacus-core` and external package `libc`.
 </dependencies>
 
 <consumed-by>
 
 ## Consumed By
-Consumed by `abacus-client` and `abacus-daemon` (see their `Cargo.toml`).
+Static import scan, directories importing `abacus-wire`:
+- `crates/abacus-daemon`
+- `crates/abacus-tests`
+
+(Real import edges, not inferred. A cross-service entry here is a reach into this directory's internals, a coupling to flag.)
 
 </consumed-by>
 
 <data-flow>
-
 ## Data Flow
-- Callers construct protocol `Request` or `Response` values.
-- The `src` implementation serializes values into v2 payloads, prefixes each payload with a four-byte little-endian frame length, and transports frames over Unix streams.
-- File descriptors, when required, travel separately as `SCM_RIGHTS` ancillary data associated with initial frame bytes.
-- Receiving callers obtain decoded request/response values plus zero or more owned descriptors, and must validate descriptor cardinality for the response type.
-
+- Protocol requests and responses enter as public wire values.
+- `src/` encodes values into length-prefixed payloads, frames stream traffic, and transfers ancillary file descriptors.
+- Decoded values and separately owned received descriptors leave for protocol consumers.
 </data-flow>
 
 <known-hazards>
-
 ## Known Hazards
-- HIGH: Received descriptor cardinality is not enforced by the receive helper; consumers must compare received descriptors with the response's expected FD count or may accept missing or unexpected descriptors.
-- MEDIUM: Request and response decoding accepts trailing bytes after a valid message; consumers requiring canonical v2 payloads must reject nonexhaustive decoding.
-- MEDIUM: Raw numeric protocol values,including tier discriminants, wait-counter words, cron intervals, and barrier conditions,are not validated by the codec; daemon-side request validation is required.
-- MEDIUM: Incremental frame reading can fill its bounded buffer before detecting an oversized frame prefix; callers must invoke frame extraction after fills and close protocol-faulted connections.
-- LOW: FD-frame sending treats `EAGAIN` as an I/O failure rather than asynchronously retrying; callers must consider the peer unusable under that condition.
-
+MEDIUM: Decoders accept trailing payload bytes, canonical-message consumers must enforce payload exhaustion.
+MEDIUM: Received SCM_RIGHTS descriptors are separate from decoded responses, consumers must validate descriptor count against the response contract.
+HIGH: FD-passing depends on Unix-domain stream sockets and `libc` control-message semantics.
 </known-hazards>
 
 <files>
-
 ## Files
 | File | Purpose |
-|---|---|
-| `Cargo.toml` | Declares the `abacus-wire` crate and its dependencies on `abacus-core` and `libc`. |
-
+|------|---------|
+| `Cargo.toml` | Defines the `abacus-wire` package and its workspace dependencies. |
+| `README.md` | Documents wire-protocol contracts, transport boundaries, and verification gaps. |
 </files>
 
-<notes>
-
-## Notes
-The protocol is intentionally shared rather than owned by either the daemon or SDK, preventing either endpoint from becoming the other's wire-format dependency.
-
-Ordinary payload serialization and descriptor expectations are separate because Unix ancillary `SCM_RIGHTS` data is not part of a normal frame payload.
-
-</notes>
+<subdirectories>
+## Subdirectories
+| Directory | Purpose |
+|-----------|---------|
+| `src/` | Implements the v2 codec, framing, public API, and SCM_RIGHTS transport. |
+</subdirectories>
 
 <reference>
-
 ## Reference
-Full contracts, units, symbol table, test inventory, and cross-boundary verification: see `README.md`.
-
+See `README.md` for protocol contracts and transport details.
 </reference>

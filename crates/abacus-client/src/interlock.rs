@@ -144,16 +144,28 @@ impl Interlock {
 pub struct AttachedInterlock {
     handle: InterlockHandle,
     clock: InterlockHandle,
+    tier: u8,
 }
 
 impl AttachedInterlock {
-    pub(crate) fn new(handle: InterlockHandle, clock: InterlockHandle) -> Self {
-        Self { handle, clock }
+    pub(crate) fn new(handle: InterlockHandle, clock: InterlockHandle, tier: u8) -> Self {
+        Self {
+            handle,
+            clock,
+            tier,
+        }
     }
 
     /// The underlying shared-memory handle.
     pub fn handle(&self) -> &InterlockHandle {
         &self.handle
+    }
+
+    /// The tier the daemon reported at attach: 0 bare interlock, 1 WaitCounter,
+    /// 2 WaitTimer, 3 WaitCron, 4 WaitBarrier. Fixed for the handle's life; a name
+    /// recreated later is a new entry, which this handle sees only as termination.
+    pub fn tier(&self) -> u8 {
+        self.tier
     }
 
     /// open_count += h. Sentinel-aware; see `Interlock::open`.

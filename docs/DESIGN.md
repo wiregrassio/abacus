@@ -460,6 +460,15 @@ connect, so a host that selects `Error` does so after the keepalive is already r
 keepalive's shared state rather than as a registered entry, so it keeps no strong reference to
 the thread: the process clock stops, and lapses, when the client and every handle are gone.
 
+The keepalive thread's scheduling is the caller's (`set_keepalive_priority`), never the SDK's.
+It is applied with `pthread_setschedparam` to the running thread and to any thread started
+later, and a refusal is an error (`KeepalivePriorityFailed`), never a fallback. The thread
+inherits the connecting thread's CPU affinity and, under `KeepalivePriority::Normal`, its
+scheduling. This matters on real-time deployments: a SCHED_OTHER keepalive beside a
+SCHED_FIFO loop on its core starves, its ProcessClock lapses, and a healthy process dies. The
+ProcessClock TTL is per client (`set_process_clock_ttl_ms`), default 200 ms for the CFS reason
+above; a shorter one belongs only where the keepalive cannot be throttled.
+
 ## Death detection
 
 An owner that dies stops touching. Nothing else happens, and nothing else needs to.

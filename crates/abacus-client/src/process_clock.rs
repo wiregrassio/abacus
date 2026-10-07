@@ -18,6 +18,7 @@ pub struct ProcessClock {
     handle: InterlockHandle,
     name: String,
     id: u64,
+    dependencies: Vec<String>,
 }
 
 impl ProcessClock {
@@ -26,6 +27,7 @@ impl ProcessClock {
         clock: &InterlockHandle,
         name: String,
         id: u64,
+        dependencies: Vec<String>,
     ) -> Result<Self, SdkError> {
         let start_time = clock.words().open_count.load(Ordering::Acquire);
         if !stamp_word(&handle.words().closed_count, start_time) {
@@ -34,7 +36,12 @@ impl ProcessClock {
         if !stamp_word(&handle.words().open_count, start_time) {
             return Err(SdkError::InterlockReaped);
         }
-        Ok(Self { handle, name, id })
+        Ok(Self {
+            handle,
+            name,
+            id,
+            dependencies,
+        })
     }
 
     /// Uptime in milliseconds: open_count minus closed_count.
@@ -55,6 +62,13 @@ impl ProcessClock {
     /// The ProcessClock name passed to connect.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The dependency names passed to connect, in order. Names as given: the daemon
+    /// resolved each to whatever held that name at create time, and this clock dies with
+    /// those entries.
+    pub fn dependencies(&self) -> &[String] {
+        &self.dependencies
     }
 
     /// The registry id assigned at creation.
@@ -87,7 +101,7 @@ mod tests {
         let handle = interlock_create().unwrap();
         let clock = interlock_create().unwrap();
         handle.words().open_count.store(SENTINEL, Ordering::Release);
-        match ProcessClock::new(handle.clone(), &clock, "test".into(), 1) {
+        match ProcessClock::new(handle.clone(), &clock, "test".into(), 1, Vec::new()) {
             Err(err) => assert_eq!(err, SdkError::InterlockReaped),
             Ok(_) => panic!("ProcessClock::new must refuse a SENTINEL open_count"),
         }

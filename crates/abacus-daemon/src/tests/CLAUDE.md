@@ -1,72 +1,36 @@
 <purpose>
-
 # tests/
-
-L0 unit and integration-style tests for the daemon registry, Unix-domain transport, and v2 wire codec without running the daemon event loop.
-
+L0 unit tests for `abacus-daemon` registry and Unix-domain socket transport. They exercise public daemon components directly, without the daemon event loop.
 </purpose>
 
 <dependencies>
-
 ## Dependencies
-- Sibling daemon modules: `crate::registry`, `crate::transport`.
-- Workspace crates: `abacus_core`, `abacus_wire`.
-- External/system interfaces: `libc`, Unix sockets, SCM_RIGHTS, memfd-backed interlocks, `RLIMIT_NOFILE`.
-- Standard library: filesystem, Unix file descriptors, atomics, timing, and I/O.
-
+Imports sibling daemon modules `crate::registry` and `crate::transport`; workspace crates `abacus-core` and `abacus-wire`; external `libc`; Rust standard Unix socket, fd, synchronization, timing, and filesystem APIs.
 </dependencies>
 
 <consumed-by>
-
 ## Consumed By
-- Test harness via Rust's `#[test]` discovery; no production consumer is shown.
-
+- Test harness consumers are not visible in supplied material.
 </consumed-by>
 
 <data-flow>
-
 ## Data Flow
-- Registry tests construct `Registry` directly, create interlocks, mutate shared atomic words, and call `evaluate_all`.
-- Transport tests create a `Server` on a unique temporary Unix-socket path, connect raw `UnixStream` clients, and exchange framed messages and SCM_RIGHTS file descriptors.
-- Wire tests encode requests/responses into length-prefixed frames, decode payloads, and inject truncated, corrupt, oversized, and random byte streams.
-- Assertions inspect `Condition`, `ProtocolFault`, `TransportError`, interlock words, socket-path state, frame bytes, and timing measurements.
-
+- Registry tests construct `Registry` instances, create and mutate shared interlocks, then evaluate lifecycle, ownership, dependency, wait-tier, and capacity outcomes.
+- Transport tests connect raw Unix clients to `Server`, exchange encoded wire frames and SCM_RIGHTS descriptors, then assert protocol and connection error classification.
+- Helpers generate process-unique temporary socket paths and raise the process file-descriptor soft limit for high-cardinality tests.
 </data-flow>
 
 <known-hazards>
-
 ## Known Hazards
-- HIGH: The wire decoder is documented to accept an Error response truncated immediately after its code byte as a valid empty-message response; this violates the required strict-prefix truncation contract.
-- HIGH: A blocked nonblocking transport write currently reports `EAGAIN`, while the daemon reportedly retains that client instead of treating it as dead; stalled readers can remain live indefinitely.
-- HIGH: Watchers reap when their watched target is reaped or recreated; the anti-retargeting guarantee is enforced in `watched_value` via a three-word SENTINEL check.
-- MEDIUM: Registry name-length and interlock-count limits are enforced in `validate_name` and `Registry::create`.
-- MEDIUM: `raise_fd_limit` changes the process-wide soft `RLIMIT_NOFILE` and does not restore it, coupling later tests to execution order and host limits.
-- LOW: The registry performance test uses wall-clock microsecond thresholds and can be noisy on constrained or oversubscribed CI hosts.
-
+- MEDIUM: High-cardinality registry tests modify the process-wide `RLIMIT_NOFILE` soft limit and do not restore it.
+- MEDIUM: Performance ceilings and wall-clock timeout assertions can be flaky under heavily contended CI hosts.
 </known-hazards>
 
 <files>
-
 ## Files
 | File | Purpose |
-|---|---|
-| `mod.rs` | Declares registry and transport test modules and provides shared temporary-path, errno, file-limit, and deterministic RNG helpers. |
-| `registry.rs` | Tests registry creation, validation, lifecycle reaping, wait-tier evaluation, watcher ownership, limits, and evaluation performance. |
-| `transport.rs` | Tests Unix-domain server lifecycle, nonblocking connection behavior, framing, SCM_RIGHTS descriptor passing, and socket-path policies. |
-
+|------|---------|
+| `mod.rs` | Test module root and shared temporary-path, errno, and file-descriptor-limit helpers. |
+| `registry.rs` | Direct registry tests for creation validation, tier evaluation, lifecycle reaping, ownership, dependencies, limits, and performance. |
+| `transport.rs` | UDS server and connection tests for framing, SCM_RIGHTS passing, socket-path handling, nonblocking I/O, and failures. |
 </files>
-
-<notes>
-
-## Notes
-The tests deliberately bypass the daemon loop: registry behavior is evaluated through direct calls, while transport behavior is exercised through the public `Server` and `Connection` APIs.
-
-The random-input tests accept `ABACUS_TEST_SEED` to make a failure reproducible.
-
-</notes>
-
-<reference>
-
-## Reference
-
-</reference>

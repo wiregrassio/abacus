@@ -1,65 +1,30 @@
 <purpose>
-
-# .github/workflows/
-
-GitHub Actions CI gate: Rust formatting, linting, building, and testing.
-
+# workflows/
+GitHub Actions workflow definitions for the repository's contribution gate.
 </purpose>
 
 <dependencies>
-
 ## Dependencies
-- GitHub Actions runner image: `ubuntu-24.04`.
-- `actions/checkout@v4` to retrieve repository source.
-- `dtolnay/rust-toolchain@stable` to install the stable Rust toolchain plus `rustfmt` and Clippy.
-- Cargo workspace commands and the repository's Rust packages, including `abacus-daemon`.
-
+GitHub Actions: `actions/checkout@v4`, `dtolnay/rust-toolchain@stable`. Cargo workspace packages and toolchain components: rustfmt, Clippy.
 </dependencies>
 
 <consumed-by>
 
 ## Consumed By
-Consumed by GitHub Actions on push and PR events.
+Static import scan (`workflows`): no in-repo consumers found.
 
 </consumed-by>
 
 <data-flow>
-
 ## Data Flow
-- GitHub push and pull-request events enter GitHub Actions and trigger the `check` job.
-- The job checks out the repository and installs stable Rust tooling.
-- Cargo commands consume workspace manifests and source files, producing formatting/lint results, build artifacts, test results, and a release build of `abacus-daemon`.
-- Command exit status leaves the workflow as the CI pass/fail result reported on the commit or pull request.
-
+- Push and pull request events enter GitHub Actions.
+- The Ubuntu runner checks out the repository and installs the stable Rust toolchain.
+- Cargo format, lint, build, test, and release-daemon build results determine CI status.
 </data-flow>
 
-<known-hazards>
-
-## Known Hazards
-- MEDIUM: The workflow tracks the moving `stable` Rust toolchain rather than a pinned version; newly released compiler or Clippy behavior can fail previously passing revisions.
-- MEDIUM: CI runs only on Linux (`ubuntu-24.04`); platform-specific build and runtime failures on other supported systems are not detected.
-- LOW: The release build validates compilation of `abacus-daemon` but does not run release-mode tests.
-
-</known-hazards>
-
 <files>
-
 ## Files
 | File | Purpose |
-|---|---|
-| `ci.yml` | Runs the Linux CI contribution gate on pushes and pull requests. |
-
+|------|---------|
+| `ci.yml` | Runs formatting, warning-denied Clippy, workspace builds and tests, plus the release `abacus-daemon` build. |
 </files>
-
-<notes>
-
-## Notes
-The workflow intentionally treats warnings as failures through `cargo clippy ... -D warnings`, making lint cleanliness part of the merge gate.
-
-</notes>
-
-<reference>
-
-## Reference
-
-</reference>

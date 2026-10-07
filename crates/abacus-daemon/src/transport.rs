@@ -45,11 +45,14 @@ impl Server {
     pub fn create(path: &Path, options: &SocketOptions) -> Result<Self, TransportError> {
         if path.exists() {
             if is_socket_file(path)? {
-                if probe_connect_succeeds(path) {
-                    return Err(TransportError::SocketPathOccupied {
-                        path: path.to_string_lossy().into_owned(),
-                        live_daemon: true,
-                    });
+                match probe_socket(path) {
+                    Ok(true) | Err(_) => {
+                        return Err(TransportError::SocketPathOccupied {
+                            path: path.to_string_lossy().into_owned(),
+                            live_daemon: true,
+                        });
+                    }
+                    Ok(false) => {}
                 }
                 let _ = std::fs::remove_file(path);
             } else {
@@ -249,8 +252,23 @@ fn is_socket_file(path: &Path) -> Result<bool, TransportError> {
     Ok(meta.file_type().is_socket())
 }
 
-fn probe_connect_succeeds(path: &Path) -> bool {
-    UnixStream::connect(path).is_ok()
+/// Probe whether a live daemon is listening on `path`. Returns `Ok(true)` if a
+/// connection succeeds (live daemon), `Ok(false)` if the connect fails with
+/// ECONNREFUSED (stale socket, nobody listening), or `Err` for any other errno
+/// (EACCES: live daemon the current user cannot reach; anything else: unknown state,
+/// treat as live rather than unlinking a socket that may belong to a running daemon).
+fn probe_socket(path: &Path) -> std::result::Result<bool, i32> {
+    match UnixStream::connect(path) {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            let errno = e.raw_os_error().unwrap_or(0);
+            if errno == libc::ECONNREFUSED {
+                Ok(false)
+            } else {
+                Err(errno)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -298,6 +316,34 @@ mod tests {
         assert!(path.exists());
         let second = Server::create(&path, &SocketOptions::default());
         assert!(second.is_ok(), "stale socket file should be replaced");
+    }
+
+    #[test]
+    fn probe_eacces_is_not_treated_as_stale() {
+        let path = tmp_path("eacces");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Make the socket unreadable so connect gets EACCES.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = Server::create(
+            &path,
+            &SocketOptions {
+                mode: 0o660,
+                group: None,
+            },
+        );
+        // Restore permissions before asserting so cleanup succeeds.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(
+                result,
+                Err(TransportError::SocketPathOccupied {
+                    live_daemon: true,
+                    ..
+                })
+            ),
+            "EACCES should be treated as a live daemon, not stale: {result:?}"
+        );
     }
 
     #[test]

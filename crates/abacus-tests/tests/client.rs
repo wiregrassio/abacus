@@ -5,7 +5,10 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use abacus_client::{AbacusClient, SdkError};
+use abacus_client::{
+    AbacusClient, KeepalivePriority, SdkError, WatchedWord, DEFAULT_TOUCH_INTERVAL_MS,
+    DEFAULT_TOUCH_TTL_MS,
+};
 use abacus_core::interlock::{interlock_arm, interlock_create};
 use abacus_tests::{
     unique_name, unique_socket_path, wait_for, FakeDaemon, RawClient, RawResponse, ThreadDaemon,
@@ -350,4 +353,78 @@ fn client__daemon_error_codes_map_to_sdk_errors() {
         .join()
         .expect("fake daemon thread panicked")
         .expect("fake daemon script");
+}
+
+/// INTERFACE.md ProcessClock: dependencies() returns the names passed to connect.
+#[test]
+fn client__process_clock_reports_its_dependencies() {
+    let d = ThreadDaemon::start("pc-deps");
+    let a = unique_name("dep-a");
+    let b = unique_name("dep-b");
+    let _ca = d.client_with(&a, &[]).expect("connect a");
+    let _cb = d.client_with(&b, &[]).expect("connect b");
+    let c = d
+        .client_with(&unique_name("dep-c"), &[a.as_str(), b.as_str()])
+        .expect("connect c");
+    assert_eq!(
+        c.process_clock().dependencies(),
+        &[a.clone(), b.clone()][..]
+    );
+    assert!(d.client().process_clock().dependencies().is_empty());
+}
+
+/// INTERFACE.md AttachedInterlock: tier() is the tier the daemon reported at attach.
+#[test]
+fn client__attached_interlock_reports_its_tier() {
+    let d = ThreadDaemon::start("attach-tier");
+    let mut client = d.client();
+    let bare = unique_name("bare");
+    let counter = unique_name("counter");
+    let timer = unique_name("timer");
+    let cron = unique_name("cron");
+    let barrier = unique_name("barrier");
+    let _bare = client.create_interlock(&bare).expect("bare");
+    let _counter = client
+        .create_wait_counter(&counter, &bare, WatchedWord::OpenCount)
+        .expect("counter");
+    let _timer = client.create_wait_timer(&timer).expect("timer");
+    let _cron = client.create_wait_cron(&cron, 10).expect("cron");
+    let _barrier = client
+        .create_wait_barrier(&barrier, vec![(bare.clone(), WatchedWord::OpenCount, 1)])
+        .expect("barrier");
+    for (name, tier) in [
+        (&bare, 0u8),
+        (&counter, 1),
+        (&timer, 2),
+        (&cron, 3),
+        (&barrier, 4),
+    ] {
+        let attached = client
+            .attach_interlock(name)
+            .unwrap_or_else(|e| panic!("attach {name}: {e}"));
+        assert_eq!(attached.tier(), tier, "{name}");
+    }
+}
+
+/// INTERFACE.md SDK connection: the keepalive priority and ProcessClock TTL setters.
+#[test]
+fn client__keepalive_priority_and_process_clock_ttl_round_trip() {
+    let d = ThreadDaemon::start("kp-ttl");
+    let client = d.client();
+    assert_eq!(client.keepalive_priority(), KeepalivePriority::Normal);
+    client
+        .set_keepalive_priority(KeepalivePriority::Normal)
+        .expect("normal");
+    assert!(matches!(
+        client.set_keepalive_priority(KeepalivePriority::Fifo(0)),
+        Err(SdkError::InvalidRequest { .. })
+    ));
+    assert_eq!(client.process_clock_ttl_ms(), Some(DEFAULT_TOUCH_TTL_MS));
+    client.set_process_clock_ttl_ms(100).expect("ttl 100");
+    assert_eq!(client.process_clock_ttl_ms(), Some(100));
+    client.set_process_clock_ttl_ms(10).expect("ttl floor");
+    assert_eq!(
+        client.process_clock_ttl_ms(),
+        Some(2 * DEFAULT_TOUCH_INTERVAL_MS)
+    );
 }

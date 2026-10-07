@@ -2,12 +2,27 @@
 [Unit]
 Description=Abacus coordination daemon
 After=local-fs.target
+# Ordering only, never a requirement. At boot the socket directory exists before Docker mounts
+# it; at shutdown the containers stop before the daemon instead of aborting on a lapsed Abacus
+# clock.
+Before=docker.service
+# Never give up: every real-time process dies with the daemon, so a unit that stops restarting
+# keeps the whole line down. The default start limit would stop it after five fast crashes.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/abacus --socket-path=/run/abacus/abacus.sock
+User=abacus
+Group=abacus
 RuntimeDirectory=abacus
 RuntimeDirectoryMode=0755
+# Kept across restarts and stops, removed only at reboot. Containers bind-mount this directory;
+# deleting it would leave their mounts on a dead inode until each container restarts.
+RuntimeDirectoryPreserve=yes
+# The socket is born 0660, so it never accepts connections at looser permissions before the
+# daemon applies --socket-mode.
+UMask=0117
 # One fd and one mapping per interlock; the default cap is 4096 interlocks.
 LimitNOFILE=16384
 # Allow mlockall(MCL_CURRENT | MCL_FUTURE) to pin all pages and prevent cold-page faults.
@@ -17,12 +32,20 @@ RestartSec=100ms
 KillSignal=SIGTERM
 TimeoutStopSec=2
 
-# Deployment choices, not daemon choices. Core 4 is the first isolated core on the target
-# (isolcpus=4-11). The loop is a ppoll to the next millisecond boundary, so it yields every
-# cycle and SCHED_FIFO cannot starve the core it owns. Record the probe numbers
-# (docs/OPERATION.md) against an unpinned run before treating these as settled.
-CPUSchedulingPolicy=fifo
-CPUSchedulingPriority=50
+# Sandbox. The daemon needs no capability: it binds one Unix socket in its runtime directory,
+# creates memfds, and locks its memory under LimitMEMLOCK.
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+
+# Deployment choice, not a daemon choice. Core 4 is an isolated core on the target
+# (isolcpus=4-11) and the daemon is the only task placed on it, so it runs at the default
+# scheduling policy: there is nothing on the core for SCHED_FIFO to outrank but per-core kernel
+# threads. SCHED_FIFO here would also need real-time runtime in this unit's cpu cgroup on
+# kernels built with CONFIG_RT_GROUP_SCHED. Timing numbers and their environment:
+# docs/OPERATION.md.
 CPUAffinity=4
 
 [Install]

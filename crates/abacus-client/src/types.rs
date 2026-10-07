@@ -68,6 +68,21 @@ pub enum TimeoutPolicy {
     Error,
 }
 
+/// Scheduling the SDK applies to a client's keepalive thread. The caller chooses; the SDK
+/// never picks a real-time priority on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeepalivePriority {
+    /// The default. At start the thread keeps the scheduling it inherited from the thread
+    /// that started it (the one that called `connect`); set on a running thread, it moves
+    /// the thread to SCHED_OTHER.
+    #[default]
+    Normal,
+    /// SCHED_FIFO at this priority, 1 to 99. Needs CAP_SYS_NICE or an RLIMIT_RTPRIO at or
+    /// above it, and, where the kernel has RT group scheduling, real-time runtime in the
+    /// thread's cgroup.
+    Fifo(u8),
+}
+
 /// Outcome of a wait operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitState {

@@ -37,6 +37,16 @@ handle, one keepalive, one ProcessClock, and the default timeout policy applied 
 it creates. Connecting creates the client's ProcessClock: every client has exactly one,
 created at connect, not by a separate call.
 
+`KeepalivePriority` (types.rs::KeepalivePriority) is the scheduling the SDK applies to the
+client's keepalive thread; the caller chooses it, and the SDK never picks a real-time
+priority on its own. `KeepalivePriority::Normal`, the default: at start the thread keeps
+the scheduling it inherited from the thread that called `connect`; set on a running
+thread, it moves the thread to SCHED_OTHER. `KeepalivePriority::Fifo(p)`: SCHED_FIFO at
+priority `p`, 1 to 99, which needs CAP_SYS_NICE or an RLIMIT_RTPRIO at or above `p` and,
+where the kernel has RT group scheduling, real-time runtime in the thread's cgroup. The
+keepalive thread inherits the CPU affinity of the thread that called `connect`; the SDK
+never changes it, so pinning that thread before connecting chooses the keepalive's core.
+
 ```
 AbacusClient::connect(socket_path: &Path, clock_name: &str, dependencies: &[&str])
     -> Result<Self>
@@ -100,6 +110,47 @@ set_min_fatal_margin_ms(&mut self, margin_ms: u64)
 min_fatal_margin_ms(&self) -> u64
     Returns the floor (client.rs::AbacusClient::min_fatal_margin_ms).
     Default: MIN_FATAL_MARGIN_MS = 50 (types.rs::MIN_FATAL_MARGIN_MS).
+
+set_keepalive_priority(&self, priority: KeepalivePriority) -> Result<()>
+    Sets the keepalive thread's scheduling with pthread_setschedparam: applied at once to
+    the running thread and kept for any thread started later
+    (client.rs::AbacusClient::set_keepalive_priority, touch.rs::Keepalive::set_priority).
+    Call it before this process raises its own threads to real-time priority: a
+    SCHED_OTHER keepalive starves behind a SCHED_FIFO loop on its core and a healthy
+    process dies. The thread's CPU affinity is not changed.
+    Errors: SdkError::InvalidRequest for KeepalivePriority::Fifo(p) with p outside 1 to
+    99; SdkError::KeepalivePriorityFailed { errno } when the kernel refuses the change
+    (for example EPERM without CAP_SYS_NICE or RLIMIT_RTPRIO), leaving the previous
+    priority in force. There is no silent fallback. With no thread running the priority
+    is only stored, and the call that starts the thread reports any refusal
+    (touch.rs::spawn_thread).
+    Default: KeepalivePriority::Normal.
+
+keepalive_priority(&self) -> KeepalivePriority
+    The priority last set (client.rs::AbacusClient::keepalive_priority,
+    touch.rs::Keepalive::priority).
+    Default: KeepalivePriority::Normal.
+
+set_process_clock_ttl_ms(&self, ttl_ms: u64) -> Result<()>
+    Sets the TTL the keepalive writes on this client's ProcessClock, raised to at least
+    two touch intervals (80 ms at the default 40 ms interval), and arms the clock with it
+    at once: a longer TTL takes effect now, a shorter one from the first touch whose
+    now + ttl passes the current deadline (arming never moves a deadline back). Other
+    handles' TTLs are unchanged. A shorter TTL detects this process's death sooner and
+    tolerates shorter stalls of its keepalive: go below 200 ms only where the keepalive
+    cannot be throttled (an isolated core, a full CPU quota, a real-time keepalive)
+    (client.rs::AbacusClient::set_process_clock_ttl_ms,
+    touch.rs::Keepalive::set_process_ttl_ms).
+    Errors: SdkError::InterlockReaped when no process clock is bound (dropped after its
+    death under TimeoutPolicy::Error) or the arm finds it terminated; the TTL is then
+    unchanged.
+    Default: DEFAULT_TOUCH_TTL_MS = 200 (types.rs::DEFAULT_TOUCH_TTL_MS).
+
+process_clock_ttl_ms(&self) -> Option<u64>
+    The ProcessClock TTL the keepalive writes, in milliseconds; None once the keepalive
+    has dropped the clock after its death under TimeoutPolicy::Error
+    (client.rs::AbacusClient::process_clock_ttl_ms, touch.rs::Keepalive::process_ttl_ms).
+    Default: Some(200).
 
 transport_timeout(&self) -> Duration
     The socket read and write timeout in force (client.rs::AbacusClient::transport_timeout).
@@ -383,9 +434,15 @@ than resurrecting a terminated interlock (handle_ops.rs::increment).
 ### SDK: AttachedInterlock
 
 The attacher's handle (interlock.rs::AttachedInterlock). Mapped read-write via
-`interlock_map` (client.rs::AbacusClient::attach_interlock).
+`interlock_map` (client.rs::AbacusClient::attach_interlock). `tier()` is the tier the
+daemon reported at attach (client.rs::AbacusClient::attach_interlock,
+interlock.rs::AttachedInterlock::tier).
 
 ```
+tier(&self) -> u8
+    0 bare interlock, 1 WaitCounter, 2 WaitTimer, 3 WaitCron, 4 WaitBarrier. Fixed for
+    the handle's life; a name recreated later is a new entry, which this handle sees only
+    as termination.
 open(&self, h: u64) -> Result<(), SdkError>
 close(&self, h: u64) -> Result<(), SdkError>
 peek(&self) -> (u64, u64)
@@ -731,6 +788,7 @@ Absent: `open`, `close`, `touch`, `free`
 | Reap condition | `expiration_ns <= now` (`expiration_alive` is strict greater-than) | `clock::expiration_alive`, `registry::Registry::evaluate_all` |
 | Keepalive interval | `DEFAULT_TOUCH_INTERVAL_MS` = 40 ms | `types::DEFAULT_TOUCH_INTERVAL_MS`, `interlock::Interlock::new` |
 | Keepalive TTL | `max(interval * 5, MIN_TOUCH_TTL_MS)`, floor 200 ms | `types::default_touch_ttl_ms`, `types::MIN_TOUCH_TTL_MS` |
+| ProcessClock TTL | default `default_touch_ttl_ms(40)` = 200 ms; per client via `set_process_clock_ttl_ms`, raised to at least `2 * interval` | `touch::Keepalive::bind_process`, `touch::Keepalive::set_process_ttl_ms` |
 | Registration TTL floor | An interval of 0 is clamped to 1 ms first; the TTL is then raised to at least `2 * interval` | `touch::Keepalive::register_inner` |
 | One thread per client | A single keepalive thread serves every registered handle | `touch::Keepalive::register_inner`, `touch::run` |
 | Keepalive stop | Dropping or stopping a `TouchHandle` deregisters it; the interlock is then reaped after at most its remaining TTL | `touch::TouchHandle::drop`, `touch::Keepalive::deregister` |
@@ -771,6 +829,35 @@ register_with_clock(&self, handle: InterlockHandle, clock: InterlockHandle,
 
 thread_running(&self) -> bool
 registered(&self) -> usize
+
+set_priority(&self, priority: KeepalivePriority) -> Result<(), SdkError>
+    Sets the thread's scheduling with pthread_setschedparam: applied at once to a running
+    thread and kept for any thread started later (touch.rs::Keepalive::set_priority,
+    touch.rs::apply_priority). The thread's CPU affinity is not changed: it keeps the
+    affinity it inherited from the thread that started it.
+    Errors: SdkError::InvalidRequest for KeepalivePriority::Fifo(p) with p outside 1 to
+    99; SdkError::KeepalivePriorityFailed { errno } on a kernel refusal, leaving the
+    previous priority in force (no silent fallback). With no thread running the priority
+    is only stored; the call that starts the thread applies it and reports a refusal as
+    KeepalivePriorityFailed, with the thread left running at its inherited scheduling and
+    the stored priority returned to Normal (touch.rs::spawn_thread).
+
+priority(&self) -> KeepalivePriority
+    The scheduling last set with set_priority (touch.rs::Keepalive::priority).
+    Default: KeepalivePriority::Normal.
+
+set_process_ttl_ms(&self, ttl_ms: u64) -> Result<(), SdkError>
+    Sets the TTL written on the bound process clock, raised to at least two touch
+    intervals as register does, and arms the clock with it at once; a shorter TTL takes
+    effect from the first touch whose now + ttl passes the current deadline
+    (touch.rs::Keepalive::set_process_ttl_ms).
+    Errors: SdkError::InterlockReaped when no process clock is bound (never bound, or
+    dropped after its death under TimeoutPolicy::Error) or the arm finds it terminated;
+    the TTL is then unchanged.
+
+process_ttl_ms(&self) -> Option<u64>
+    The TTL written on the process clock in milliseconds; None when no process clock is
+    bound (touch.rs::Keepalive::process_ttl_ms).
 ```
 
 Each tick the thread walks every registered entry whose `next_due_ns` has passed, calls
@@ -798,7 +885,9 @@ TouchHandle::stop(&self)
 On drop: `TouchHandle::drop` calls `stop`, removing the entry
 (touch.rs::TouchHandle::drop). The thread holds only a `Weak` to the shared state; when
 every `Keepalive` clone and the last strong reference are gone, the thread sets
-`thread_running = false` and returns (touch.rs::run).
+`thread_running = false` and returns (touch.rs::run). Every exit of `run`, a panic
+included, clears `thread_running` (touch.rs::RunningGuard), so the next registration
+starts a new thread, which receives the stored priority.
 
 ## SDK-only compositions
 
@@ -872,6 +961,11 @@ start_time_ms(&self) -> u64
 
 name(&self) -> &str
     The ProcessClock name passed to connect (process_clock.rs::ProcessClock::name).
+
+dependencies(&self) -> &[String]
+    The dependency names passed to connect, in order. Names as given: the daemon
+    resolved each to whatever held that name at create time, and this clock dies with
+    those entries (process_clock.rs::ProcessClock::dependencies).
 
 id(&self) -> u64
     The registry id assigned at creation (process_clock.rs::ProcessClock::id).
@@ -1224,13 +1318,14 @@ client.rs::SdkError. Derives `Debug, Clone, PartialEq, Eq`, implements `Display`
 | `InterlockReaped` | Increment from or across SENTINEL (handle_ops.rs::increment); any wait loop observing a SENTINEL word or a lapsed `expiration_ns` (handle_ops.rs::wait_word, wait_counter.rs, wait_timer.rs, wait_cron.rs, wait_barrier.rs); `interlock_arm` on a SENTINEL expiration (interlock.rs::interlock_arm); daemon reply code `ERR_INTERLOCK_REAPED` (client.rs::daemon_error) |
 | `InterlockNotFound { name }` | Daemon reply code `ERR_INTERLOCK_NOT_FOUND`, with the reply message carried as `name` (client.rs::daemon_error) |
 | `AllocationFailed { message }` | Daemon reply code `ERR_ALLOCATION_FAILED` (client.rs::daemon_error); `Condition::AllocationFailed` rendered to a string (client.rs::From<Condition>) |
-| `InvalidRequest { message }` | `attach_interlock("clock")` (client.rs::AbacusClient::attach_interlock); `create_wait_cron` with `interval_ms == 0` or an `interval_ms` whose nanoseconds overflow (client.rs::AbacusClient::create_wait_cron, client.rs::checked_interval_ns); `WaitRace::wait` over zero counters (wait_race.rs::WaitRace::wait); `wait_ms_with_margin` with `margin_ms <= ms`, or a second concurrent wait on one WaitTimer (wait_timer.rs::WaitTimer::wait_ms_with_margin); daemon reply code `ERR_INVALID_REQUEST` (client.rs::daemon_error) |
+| `InvalidRequest { message }` | `attach_interlock("clock")` (client.rs::AbacusClient::attach_interlock); `create_wait_cron` with `interval_ms == 0` or an `interval_ms` whose nanoseconds overflow (client.rs::AbacusClient::create_wait_cron, client.rs::checked_interval_ns); `WaitRace::wait` over zero counters (wait_race.rs::WaitRace::wait); an out-of-range `KeepalivePriority::Fifo` (touch.rs::Keepalive::set_priority, client.rs::AbacusClient::set_keepalive_priority); `wait_ms_with_margin` with `margin_ms <= ms`, or a second concurrent wait on one WaitTimer (wait_timer.rs::WaitTimer::wait_ms_with_margin); daemon reply code `ERR_INVALID_REQUEST` (client.rs::daemon_error) |
 | `DeliveryTimeout` | `WaitTimer` margin expiry under `TimeoutPolicy::Error` (wait_timer.rs::WaitTimer::on_timeout) |
 | `Transport(TransportError)` | Connect, timeout set, frame send, frame receive, decode, and descriptor-count faults (client.rs::ClientConn); `extract_single_fd` when the reply carries a count other than one (client.rs::extract_single_fd) |
 | `MmapFailed { message }` | The mapping function returns `Condition`, rendered to a string (client.rs::map_handle) |
 | `UnexpectedResponse { message }` | A reply that is neither the expected `Created`/`Attached` nor `Error` (client.rs::AbacusClient::do_create, client.rs::do_attach); an unrecognized daemon error code, message `"unknown daemon error 0x{code:02x}: {message}"` (client.rs::daemon_error) |
 | `DependencyTimeout { waited, missing }` | `connect_waiting` exceeded `max_wait` without success; `missing` is the dependency name or socket path (client.rs::AbacusClient::connect_waiting) |
 | `KeepaliveSpawnFailed { message }` | The keepalive thread could not be started (for example `EAGAIN` at the thread limit); nothing was registered. From `Keepalive::register`, `register_with_clock`, `Interlock::start_touch_thread`, every `create_*` (through `Interlock::new`, `WaitCounter::new`, `WaitTimer::new`, `WaitCron::new`, `WaitBarrier::new`), and `connect`, which frees its new ProcessClock first (touch.rs::spawn_thread, client.rs::bind_or_free) |
+| `KeepalivePriorityFailed { errno }` | The kernel refused a keepalive scheduling change (`pthread_setschedparam`), for example `EPERM` without CAP_SYS_NICE or RLIMIT_RTPRIO. From `Keepalive::set_priority` and `AbacusClient::set_keepalive_priority`, leaving the previous priority in force; and from any call that starts the keepalive thread with a stored real-time priority, which leaves the thread at its inherited scheduling and the stored priority at `Normal` (touch.rs::spawn_thread) |
 | `ConnectionClosed` | Not an `SdkError` variant. It is `TransportError::ConnectionClosed` (error.rs::TransportError), reachable as `SdkError::Transport(TransportError::ConnectionClosed)` when a read hits EOF (framing.rs::read_exact, fdpass.rs::recv_prefix_with_fds) |
 
 ### From conversions

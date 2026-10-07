@@ -8,8 +8,8 @@ use std::sync::atomic::Ordering;
 use abacus_core::clock::{expiration_alive, futex_wake, monotonic_now_nanos, NANOS_PER_MS};
 use abacus_core::error::{Condition, Result};
 use abacus_core::interlock::{
-    interlock_arm, interlock_create, interlock_create_clock, interlock_dup_fd, interlock_reap,
-    Interlock, InterlockHandle, SENTINEL,
+    interlock_arm, interlock_create, interlock_create_clock, interlock_dup_fd,
+    interlock_read_expiration, interlock_reap, Interlock, InterlockHandle, SENTINEL,
 };
 
 /// The reserved name of the daemon-owned clock interlock, defined in abacus-core so the
@@ -456,7 +456,7 @@ impl Registry {
             .store(current_ms, Ordering::Release);
         // The clock is current before anything is evaluated against it: after a stall
         // longer than its TTL, evaluating first would reap every clock dependent.
-        self.refresh_clock_expiration();
+        self.refresh_clock_expiration(now_ns);
         self.evaluate_all(current_ms, now_ns);
         futex_wake(&self.clock.words().open_count);
     }
@@ -591,10 +591,18 @@ impl Registry {
         self.dead_slots.clear();
     }
 
-    /// Keep the clock alive. It is never reaped.
-    pub fn refresh_clock_expiration(&self) {
-        // The clock is every client's liveness root, so a daemon that cannot keep it alive
-        // must die, not limp.
+    /// Keep the clock alive. It is never reaped. If the clock has lapsed past its TTL
+    /// (the daemon stalled), log the stall duration before re-arming.
+    pub fn refresh_clock_expiration(&self, now_ns: u64) {
+        let exp = interlock_read_expiration(&self.clock);
+        if exp != SENTINEL && exp < now_ns {
+            let stall_ms = (now_ns - exp) / NANOS_PER_MS;
+            eprintln!(
+                "abacus: clock lapsed for {} ms (TTL {} ms); clients may have aborted",
+                stall_ms,
+                CLOCK_TTL_NANOS / NANOS_PER_MS
+            );
+        }
         if interlock_arm(&self.clock, CLOCK_TTL_NANOS).is_err() {
             eprintln!("abacus: the daemon clock is terminated; aborting");
             std::process::abort();
@@ -1151,6 +1159,26 @@ mod tests {
         assert!(
             per_pass < std::time::Duration::from_micros(500),
             "per pass {per_pass:?}"
+        );
+    }
+
+    fn test_registry(max: usize) -> Registry {
+        Registry::with_limit(max).unwrap()
+    }
+
+    #[test]
+    fn registry_clock_lapse_is_logged_at_rearm() {
+        let reg = test_registry(10);
+        // Advance past the clock's TTL so the expiration lapses.
+        let now_ns = monotonic_now_nanos() + CLOCK_TTL_NANOS + 50_000_000;
+        // The lapse log goes to stderr; we just verify it does not abort and the clock
+        // is re-armed afterward.
+        reg.refresh_clock_expiration(now_ns);
+        let exp = interlock_read_expiration(&reg.clock);
+        let after = monotonic_now_nanos();
+        assert!(
+            exp >= after,
+            "clock was not re-armed after a lapse: exp {exp}, after {after}"
         );
     }
 }

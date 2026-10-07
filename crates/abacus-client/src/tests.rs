@@ -195,6 +195,7 @@ fn types__sdk_error_every_variant_displays() {
             },
             "EAGAIN",
         ),
+        (SdkError::KeepalivePriorityFailed { errno: 1 }, "os error 1"),
     ];
     for (err, token) in cases {
         let s = err.to_string();

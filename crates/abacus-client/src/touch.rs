@@ -3,16 +3,21 @@
 //! process liveness (the Abacus clock check and the ProcessClock reap check).
 
 use std::io::Write;
+use std::os::unix::thread::JoinHandleExt;
+#[cfg(test)]
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
-use abacus_core::clock::{expiration_alive, monotonic_now_nanos, ms_to_nanos};
+use abacus_core::clock::{expiration_alive, monotonic_now_nanos, ms_to_nanos, NANOS_PER_MS};
 use abacus_core::interlock::{interlock_arm, interlock_read_expiration, InterlockHandle, SENTINEL};
 
 use crate::client::SdkError;
-use crate::types::{default_touch_ttl_ms, Liveness, TimeoutPolicy, DEFAULT_TOUCH_INTERVAL_MS};
+use crate::types::{
+    default_touch_ttl_ms, KeepalivePriority, Liveness, TimeoutPolicy, DEFAULT_TOUCH_INTERVAL_MS,
+};
 
 /// Longest the thread sleeps with nothing due, so it notices ownership changes.
 const IDLE_SLEEP: Duration = Duration::from_millis(100);
@@ -45,6 +50,13 @@ struct State {
     process: Option<Process>,
     policy: TimeoutPolicy,
     liveness: Liveness,
+    /// The scheduling the caller chose for the thread; applied at spawn and by
+    /// `set_priority`.
+    priority: KeepalivePriority,
+    /// The running thread, for `pthread_setschedparam`. Some only while
+    /// `thread_running`; every exit path of `run` clears both under this lock before
+    /// the thread returns, so a stored value always names a live thread.
+    thread: Option<libc::pthread_t>,
 }
 
 struct Inner {
@@ -53,6 +65,12 @@ struct Inner {
     /// Test hook: the next spawn fails as if the OS refused the thread.
     #[cfg(test)]
     fail_spawn: AtomicBool,
+    /// Test hook: the thread panics at the top of its next pass.
+    #[cfg(test)]
+    panic_next_pass: AtomicBool,
+    /// Test hook: while nonzero, every priority change fails with this errno.
+    #[cfg(test)]
+    fail_priority: AtomicI32,
 }
 
 /// The shared keepalive. Cloning shares the thread. The thread starts on the first
@@ -80,10 +98,16 @@ impl Keepalive {
                     process: None,
                     policy: TimeoutPolicy::Abort,
                     liveness: Liveness::Alive,
+                    priority: KeepalivePriority::Normal,
+                    thread: None,
                 }),
                 wake: Condvar::new(),
                 #[cfg(test)]
                 fail_spawn: AtomicBool::new(false),
+                #[cfg(test)]
+                panic_next_pass: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_priority: AtomicI32::new(0),
             }),
         }
     }
@@ -148,8 +172,7 @@ impl Keepalive {
 
         let mut st = lock(&self.inner.state);
         if !st.thread_running {
-            spawn_thread(&self.inner)?;
-            st.thread_running = true;
+            spawn_thread(&self.inner, &mut st)?;
         }
         st.process = Some(process);
         drop(st);
@@ -189,6 +212,62 @@ impl Keepalive {
         lock(&self.inner.state).entries.len()
     }
 
+    /// Set the keepalive thread's scheduling. Applied at once to a running thread and
+    /// kept for any thread started later. `KeepalivePriority::Fifo(p)` outside 1 to 99
+    /// is `InvalidRequest`. A kernel refusal is `KeepalivePriorityFailed { errno }` and
+    /// leaves the previous priority in force; there is no silent fallback. With no
+    /// thread running the priority is only stored, and the call that starts the thread
+    /// reports any refusal. The thread's CPU affinity is not changed: it keeps the
+    /// affinity it inherited from the thread that started it.
+    pub fn set_priority(&self, priority: KeepalivePriority) -> Result<(), SdkError> {
+        if let KeepalivePriority::Fifo(p) = priority {
+            if !(1..=99).contains(&p) {
+                return Err(SdkError::InvalidRequest {
+                    message: format!("SCHED_FIFO priority {p} is outside 1 to 99"),
+                });
+            }
+        }
+        let mut st = lock(&self.inner.state);
+        if let Some(thread) = st.thread {
+            apply_priority(&self.inner, thread, priority)
+                .map_err(|errno| SdkError::KeepalivePriorityFailed { errno })?;
+        }
+        st.priority = priority;
+        Ok(())
+    }
+
+    /// The scheduling last set with `set_priority`; default `KeepalivePriority::Normal`.
+    pub fn priority(&self) -> KeepalivePriority {
+        lock(&self.inner.state).priority
+    }
+
+    /// Set the TTL the keepalive writes on the process clock, in milliseconds, raised to
+    /// at least two touch intervals (80 ms at the default 40 ms interval), as `register`
+    /// does. The clock is armed with it at once: a longer TTL takes effect now, a shorter
+    /// one from the first touch whose `now + ttl` passes the current deadline (arming
+    /// never moves a deadline back). `Err(InterlockReaped)` when no process clock is
+    /// bound (never bound, or dropped after its death under `TimeoutPolicy::Error`) or
+    /// the arm finds it terminated; the TTL is then unchanged.
+    pub fn set_process_ttl_ms(&self, ttl_ms: u64) -> Result<(), SdkError> {
+        let mut st = lock(&self.inner.state);
+        let Some(process) = st.process.as_mut() else {
+            return Err(SdkError::InterlockReaped);
+        };
+        let ttl_ns = ms_to_nanos(ttl_ms).max(process.interval_ns.saturating_mul(2));
+        interlock_arm(&process.clock, ttl_ns).map_err(SdkError::from)?;
+        process.ttl_ns = ttl_ns;
+        Ok(())
+    }
+
+    /// The TTL the keepalive writes on the process clock, in milliseconds; `None` when
+    /// no process clock is bound.
+    pub fn process_ttl_ms(&self) -> Option<u64> {
+        lock(&self.inner.state)
+            .process
+            .as_ref()
+            .map(|p| p.ttl_ns / NANOS_PER_MS)
+    }
+
     fn register_inner(
         &self,
         handle: InterlockHandle,
@@ -212,8 +291,7 @@ impl Keepalive {
         let reaped = Arc::new(AtomicBool::new(false));
         let mut st = lock(&self.inner.state);
         if !st.thread_running {
-            spawn_thread(&self.inner)?;
-            st.thread_running = true;
+            spawn_thread(&self.inner, &mut st)?;
         }
         let id = st.next_id;
         st.next_id += 1;
@@ -261,7 +339,7 @@ fn stamp_last_seen(handle: &InterlockHandle, clock: &InterlockHandle) -> bool {
         .is_ok()
 }
 
-fn spawn_thread(inner: &Arc<Inner>) -> Result<(), SdkError> {
+fn spawn_thread(inner: &Arc<Inner>, st: &mut State) -> Result<(), SdkError> {
     #[cfg(test)]
     if inner.fail_spawn.load(Ordering::Acquire) {
         return Err(SdkError::KeepaliveSpawnFailed {
@@ -269,20 +347,84 @@ fn spawn_thread(inner: &Arc<Inner>) -> Result<(), SdkError> {
         });
     }
     let weak = Arc::downgrade(inner);
-    thread::Builder::new()
+    let handle = thread::Builder::new()
         .name("abacus-keepalive".into())
         .spawn(move || run(weak))
-        .map(|_| ())
         .map_err(|e| SdkError::KeepaliveSpawnFailed {
             message: e.to_string(),
-        })
+        })?;
+    let thread = handle.as_pthread_t();
+    // Detached: the thread ends on its own when its owners are gone. It cannot end
+    // before this returns, because it needs the state lock the caller holds.
+    drop(handle);
+    st.thread_running = true;
+    st.thread = Some(thread);
+    if st.priority != KeepalivePriority::Normal {
+        if let Err(errno) = apply_priority(inner, thread, st.priority) {
+            st.priority = KeepalivePriority::Normal;
+            return Err(SdkError::KeepalivePriorityFailed { errno });
+        }
+    }
+    Ok(())
+}
+
+/// Apply `priority` to `thread` with `pthread_setschedparam`; the error number on
+/// refusal. Callers hold the state lock and pass `State::thread`, which is Some
+/// only while the thread is alive.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn apply_priority(
+    inner: &Inner,
+    thread: libc::pthread_t,
+    priority: KeepalivePriority,
+) -> Result<(), i32> {
+    #[cfg(test)]
+    {
+        let errno = inner.fail_priority.load(Ordering::Acquire);
+        if errno != 0 {
+            return Err(errno);
+        }
+    }
+    let (policy, value) = match priority {
+        KeepalivePriority::Normal => (libc::SCHED_OTHER, 0),
+        KeepalivePriority::Fifo(p) => (libc::SCHED_FIFO, i32::from(p)),
+    };
+    // SAFETY: a zeroed sched_param is valid; only sched_priority is read on Linux.
+    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+    param.sched_priority = value;
+    // SAFETY: `thread` names a live thread (see above); `param` outlives the call.
+    let rc = unsafe { libc::pthread_setschedparam(thread, policy, &param) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(rc)
+    }
+}
+
+/// Clears `thread_running` and `thread` when `run` ends by any path, a panic
+/// included, so a later registration starts a new thread instead of trusting a dead
+/// one.
+struct RunningGuard(Weak<Inner>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.upgrade() {
+            let mut st = lock(&inner.state);
+            st.thread_running = false;
+            st.thread = None;
+        }
+    }
 }
 
 fn run(weak: Weak<Inner>) {
+    let _running = RunningGuard(weak.clone());
     loop {
         let Some(inner) = weak.upgrade() else {
             return;
         };
+        #[cfg(test)]
+        if inner.panic_next_pass.swap(false, Ordering::AcqRel) {
+            panic!("injected keepalive panic");
+        }
         let mut st = lock(&inner.state);
         let now = monotonic_now_nanos();
         let mut next_due = now + IDLE_SLEEP.as_nanos() as u64;
@@ -373,7 +515,11 @@ fn run(weak: Weak<Inner>) {
         drop(guard);
         if Arc::strong_count(&inner) == 1 {
             // Only the thread's own reference is left: every owner is gone.
-            lock(&inner.state).thread_running = false;
+            {
+                let mut st = lock(&inner.state);
+                st.thread_running = false;
+                st.thread = None;
+            }
             return;
         }
     }
@@ -410,6 +556,34 @@ mod tests {
     use abacus_core::interlock::{
         interlock_create, interlock_free, interlock_read_expiration, SENTINEL,
     };
+    use std::time::Instant;
+
+    #[test]
+    fn a_panicked_thread_clears_thread_running_and_the_next_registration_restarts_it() {
+        let k = Keepalive::new();
+        let h1 = interlock_create().unwrap();
+        let _t1 = k.register(h1, 5, 200).unwrap();
+        assert!(k.thread_running());
+        k.inner.panic_next_pass.store(true, Ordering::Release);
+        k.inner.wake.notify_all();
+        let start = Instant::now();
+        while k.thread_running() && start.elapsed() < Duration::from_secs(1) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !k.thread_running(),
+            "thread_running still true 1 s after the keepalive thread panicked"
+        );
+        let h2 = interlock_create().unwrap();
+        let _t2 = k.register(h2.clone(), 5, 200).unwrap();
+        assert!(k.thread_running());
+        let exp0 = interlock_read_expiration(&h2);
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            interlock_read_expiration(&h2) > exp0,
+            "no thread touched the registration made after the panic"
+        );
+    }
 
     #[test]
     fn register_arms_immediately_with_ttl() {
@@ -622,5 +796,125 @@ mod tests {
         ));
         assert!(!k.process_bound());
         assert!(!k.thread_running());
+    }
+
+    #[test]
+    fn set_priority_refuses_an_out_of_range_fifo_priority() {
+        let k = Keepalive::new();
+        for p in [0u8, 100] {
+            assert!(matches!(
+                k.set_priority(KeepalivePriority::Fifo(p)),
+                Err(SdkError::InvalidRequest { .. })
+            ));
+        }
+        assert_eq!(k.priority(), KeepalivePriority::Normal);
+    }
+
+    #[test]
+    fn set_priority_normal_applies_to_a_running_thread() {
+        let k = Keepalive::new();
+        let h = interlock_create().unwrap();
+        let _t = k.register(h, 40, 200).unwrap();
+        k.set_priority(KeepalivePriority::Normal).unwrap();
+        assert_eq!(k.priority(), KeepalivePriority::Normal);
+    }
+
+    #[test]
+    fn a_refused_priority_surfaces_its_errno_and_keeps_the_stored_priority() {
+        let k = Keepalive::new();
+        let h = interlock_create().unwrap();
+        let _t = k.register(h, 40, 200).unwrap();
+        k.inner.fail_priority.store(libc::EPERM, Ordering::Release);
+        assert_eq!(
+            k.set_priority(KeepalivePriority::Fifo(10)),
+            Err(SdkError::KeepalivePriorityFailed { errno: libc::EPERM })
+        );
+        assert_eq!(k.priority(), KeepalivePriority::Normal);
+    }
+
+    #[test]
+    fn a_priority_stored_before_the_thread_starts_is_applied_at_spawn() {
+        let k = Keepalive::new();
+        k.set_priority(KeepalivePriority::Fifo(10)).unwrap();
+        assert_eq!(k.priority(), KeepalivePriority::Fifo(10));
+        k.inner.fail_priority.store(libc::EPERM, Ordering::Release);
+        let h = interlock_create().unwrap();
+        assert_eq!(
+            k.register(h, 40, 200).err(),
+            Some(SdkError::KeepalivePriorityFailed { errno: libc::EPERM })
+        );
+        assert_eq!(k.registered(), 0);
+        assert_eq!(k.priority(), KeepalivePriority::Normal);
+        assert!(
+            k.thread_running(),
+            "the thread runs at its inherited scheduling"
+        );
+    }
+
+    #[test]
+    fn set_process_ttl_lowers_the_ttl_of_later_touches() {
+        let k = Keepalive::new();
+        k.set_policy(TimeoutPolicy::Error);
+        let pc = interlock_create().unwrap();
+        let abacus_clock = interlock_create().unwrap();
+        interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
+        abacus_clock
+            .words()
+            .open_count
+            .store(1000, Ordering::Release);
+        k.bind_process(pc.clone(), "test".into(), 1, abacus_clock)
+            .unwrap();
+        k.set_process_ttl_ms(100).unwrap();
+        assert_eq!(k.process_ttl_ms(), Some(100));
+        thread::sleep(Duration::from_millis(300));
+        let now = monotonic_now_nanos();
+        let exp = interlock_read_expiration(&pc);
+        assert!(exp > now, "process clock lapsed");
+        assert!(
+            exp <= now + ms_to_nanos(100),
+            "exp {exp} more than 100 ms past now {now}: the 200 ms TTL is still being written"
+        );
+    }
+
+    #[test]
+    fn set_process_ttl_floors_at_two_intervals() {
+        let k = Keepalive::new();
+        k.set_policy(TimeoutPolicy::Error);
+        let pc = interlock_create().unwrap();
+        let abacus_clock = interlock_create().unwrap();
+        interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
+        abacus_clock
+            .words()
+            .open_count
+            .store(1000, Ordering::Release);
+        k.bind_process(pc.clone(), "test".into(), 1, abacus_clock)
+            .unwrap();
+        k.set_process_ttl_ms(10).unwrap();
+        assert_eq!(k.process_ttl_ms(), Some(2 * DEFAULT_TOUCH_INTERVAL_MS));
+    }
+
+    #[test]
+    fn set_process_ttl_raises_the_expiration_at_once() {
+        let k = Keepalive::new();
+        k.set_policy(TimeoutPolicy::Error);
+        let pc = interlock_create().unwrap();
+        let abacus_clock = interlock_create().unwrap();
+        interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
+        abacus_clock
+            .words()
+            .open_count
+            .store(1000, Ordering::Release);
+        k.bind_process(pc.clone(), "test".into(), 1, abacus_clock)
+            .unwrap();
+        let before = monotonic_now_nanos();
+        k.set_process_ttl_ms(1000).unwrap();
+        assert!(interlock_read_expiration(&pc) >= before + ms_to_nanos(1000));
+    }
+
+    #[test]
+    fn set_process_ttl_without_a_bound_process_is_interlock_reaped() {
+        let k = Keepalive::new();
+        assert_eq!(k.set_process_ttl_ms(100), Err(SdkError::InterlockReaped));
+        assert_eq!(k.process_ttl_ms(), None);
     }
 }

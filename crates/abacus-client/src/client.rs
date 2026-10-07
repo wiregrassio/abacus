@@ -22,8 +22,8 @@ use crate::interlock::{AttachedInterlock, AttachedWaitCounter, ClockHandle, Inte
 use crate::process_clock::ProcessClock;
 use crate::touch::Keepalive;
 use crate::types::{
-    Liveness, TimeoutPolicy, WatchedWord, CONNECT_RETRY_INTERVAL, DEFAULT_TRANSPORT_TIMEOUT,
-    MIN_FATAL_MARGIN_MS,
+    KeepalivePriority, Liveness, TimeoutPolicy, WatchedWord, CONNECT_RETRY_INTERVAL,
+    DEFAULT_TRANSPORT_TIMEOUT, MIN_FATAL_MARGIN_MS,
 };
 use crate::wait_barrier::WaitBarrier;
 use crate::wait_counter::WaitCounter;
@@ -81,6 +81,15 @@ pub enum SdkError {
         /// The spawn error.
         message: String,
     },
+    /// The kernel refused a keepalive scheduling change (`pthread_setschedparam`), for
+    /// example EPERM without CAP_SYS_NICE or RLIMIT_RTPRIO. From `set_keepalive_priority`
+    /// the previous priority stays in force; from a call that starts the keepalive thread,
+    /// the thread runs at its inherited scheduling and the stored priority returns to
+    /// `Normal`.
+    KeepalivePriorityFailed {
+        /// The error number `pthread_setschedparam` returned.
+        errno: i32,
+    },
 }
 
 impl std::fmt::Display for SdkError {
@@ -103,6 +112,11 @@ impl std::fmt::Display for SdkError {
             Self::KeepaliveSpawnFailed { message } => {
                 write!(f, "keepalive thread spawn failed: {message}")
             }
+            Self::KeepalivePriorityFailed { errno } => write!(
+                f,
+                "keepalive priority failed: {}",
+                std::io::Error::from_raw_os_error(*errno)
+            ),
         }
     }
 }
@@ -284,8 +298,13 @@ impl AbacusClient {
             interlock_map,
         )?;
         let keepalive = Keepalive::new();
-        let process_clock =
-            ProcessClock::new(pc_handle.clone(), &clock_handle, clock_name.to_string(), id)?;
+        let process_clock = ProcessClock::new(
+            pc_handle.clone(),
+            &clock_handle,
+            clock_name.to_string(),
+            id,
+            dependencies.iter().map(|s| s.to_string()).collect(),
+        )?;
         bind_or_free(&keepalive, pc_handle, clock_name, id, clock_handle.clone())?;
         Ok(Self {
             conn,
@@ -377,6 +396,35 @@ impl AbacusClient {
         self.min_fatal_margin_ms
     }
 
+    /// Set the keepalive thread's scheduling (`Keepalive::set_priority`). Call it before
+    /// this process raises its own threads to real-time priority: a SCHED_OTHER keepalive
+    /// starves behind a SCHED_FIFO loop on its core and a healthy process dies. The
+    /// keepalive runs on the CPUs of the thread that called `connect`; pin that thread
+    /// before connecting to choose the keepalive's core.
+    pub fn set_keepalive_priority(&self, priority: KeepalivePriority) -> Result<()> {
+        self.keepalive.set_priority(priority)
+    }
+
+    /// The keepalive priority last set; default `KeepalivePriority::Normal`.
+    pub fn keepalive_priority(&self) -> KeepalivePriority {
+        self.keepalive.priority()
+    }
+
+    /// Set this client's ProcessClock TTL in milliseconds (`Keepalive::set_process_ttl_ms`).
+    /// Default `DEFAULT_TOUCH_TTL_MS` (200). A shorter TTL detects this process's death
+    /// sooner and tolerates shorter stalls of its keepalive: go below 200 ms only where
+    /// the keepalive cannot be throttled (an isolated core, a full CPU quota, a real-time
+    /// keepalive). Other handles' TTLs are unchanged.
+    pub fn set_process_clock_ttl_ms(&self, ttl_ms: u64) -> Result<()> {
+        self.keepalive.set_process_ttl_ms(ttl_ms)
+    }
+
+    /// The ProcessClock TTL the keepalive writes, in milliseconds; `None` once the
+    /// keepalive has dropped the clock after its death under `TimeoutPolicy::Error`.
+    pub fn process_clock_ttl_ms(&self) -> Option<u64> {
+        self.keepalive.process_ttl_ms()
+    }
+
     /// The transport timeout this connection uses.
     pub fn transport_timeout(&self) -> Duration {
         self.conn.timeout
@@ -416,8 +464,12 @@ impl AbacusClient {
                 message: "use client.clock() to access the system clock".to_string(),
             });
         }
-        let (_, handle) = do_attach(&mut self.conn, name, interlock_map)?;
-        Ok(AttachedInterlock::new(handle, self.clock.handle().clone()))
+        let (tier, handle) = do_attach(&mut self.conn, name, interlock_map)?;
+        Ok(AttachedInterlock::new(
+            handle,
+            self.clock.handle().clone(),
+            tier,
+        ))
     }
 
     /// Attach to a WaitCounter by name, read-only. Refuses any tier other than 1, without
@@ -784,6 +836,7 @@ mod tests {
             SdkError::KeepaliveSpawnFailed {
                 message: "m".into(),
             },
+            SdkError::KeepalivePriorityFailed { errno: 1 },
         ];
         for v in variants {
             assert!(!v.to_string().is_empty());
