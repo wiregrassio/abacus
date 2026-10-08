@@ -9,7 +9,8 @@ use abacus_core::clock::{expiration_alive, futex_wake, monotonic_now_nanos, NANO
 use abacus_core::error::{Condition, Result};
 use abacus_core::interlock::{
     interlock_arm, interlock_create, interlock_create_clock, interlock_dup_fd,
-    interlock_read_expiration, interlock_reap, Interlock, InterlockHandle, SENTINEL,
+    interlock_read_expiration, interlock_reap, Interlock, InterlockHandle, CLOCK_TTL_NANOS,
+    SENTINEL,
 };
 
 /// The reserved name of the daemon-owned clock interlock, defined in abacus-core so the
@@ -21,8 +22,13 @@ pub const CLOCK_ID: u64 = 0;
 pub const MAX_NAME_LEN: usize = 255;
 /// Default cap on live interlocks, excluding the clock. Each costs one fd and one mapping.
 pub const DEFAULT_MAX_INTERLOCKS: usize = 4096;
-
-const CLOCK_TTL_NANOS: u64 = 100_000_000;
+/// Per-entry cap on dependency targets (the explicit `dependencies` list, not the owner).
+pub const MAX_DEPENDENCIES: usize = 64;
+/// Per-entry cap on barrier conditions.
+pub const MAX_BARRIER_CONDITIONS: usize = 64;
+/// Default cap on total watch edges across all live entries. Each edge is one
+/// `target_alive` or `watched_value` call per tick. Adjustable with `--max-watch-edges`.
+pub const DEFAULT_MAX_WATCH_EDGES: usize = 32768;
 
 // -- Tier --
 
@@ -96,18 +102,35 @@ enum Target {
     Slot { slot: usize, id: u64 },
 }
 
+/// Tier-specific data carried on an entry. Each variant holds exactly the fields its tier
+/// needs, so invalid combinations (a cron with no interval, a counter with no target) are
+/// unrepresentable.
+enum EntryKind {
+    Interlock,
+    WaitCounter { target: Target, word: WatchedWord },
+    WaitTimer,
+    WaitCron { interval_ms: u64 },
+    WaitBarrier { conditions: Vec<(Target, WatchedWord, u64)> },
+}
+
+impl EntryKind {
+    fn tier(&self) -> Tier {
+        match self {
+            Self::Interlock => Tier::Interlock,
+            Self::WaitCounter { .. } => Tier::WaitCounter,
+            Self::WaitTimer => Tier::WaitTimer,
+            Self::WaitCron { .. } => Tier::WaitCron,
+            Self::WaitBarrier { .. } => Tier::WaitBarrier,
+        }
+    }
+}
+
 /// One live interlock.
 struct Entry {
     id: u64,
     name: String,
     handle: InterlockHandle,
-    tier: Tier,
-    /// WaitCounter: the watched target and word. WaitTimer and WaitCron watch the clock.
-    watch: Option<(Target, WatchedWord)>,
-    /// WaitCron: grid interval in milliseconds.
-    interval_ms: Option<u64>,
-    /// WaitBarrier: (target, word, threshold) per condition.
-    conditions: Option<Vec<(Target, WatchedWord, u64)>>,
+    kind: EntryKind,
     /// Owner (first) then dependencies: targets this entry dies with.
     depends_on: Vec<Target>,
 }
@@ -142,19 +165,28 @@ pub struct Registry {
     index: HashMap<String, usize>,
     live: usize,
     max_interlocks: usize,
+    watch_edges: usize,
+    max_watch_edges: usize,
     /// Reusable scratch buffer for slots reaped during evaluate_all.
     /// Capacity persists across cycles; only cleared (not deallocated) each pass.
     dead_slots: Vec<usize>,
 }
 
 impl Registry {
-    /// A registry holding only the clock, with the default interlock cap.
+    /// A registry holding only the clock, with default caps.
     pub fn new() -> Result<Self> {
-        Self::with_limit(DEFAULT_MAX_INTERLOCKS)
+        Self::with_limits(DEFAULT_MAX_INTERLOCKS, DEFAULT_MAX_WATCH_EDGES)
     }
 
-    /// A registry holding only the clock, capped at `max_interlocks` live entries.
+    /// A registry holding only the clock, capped at `max_interlocks` live entries
+    /// and the default watch-edge budget.
     pub fn with_limit(max_interlocks: usize) -> Result<Self> {
+        Self::with_limits(max_interlocks, DEFAULT_MAX_WATCH_EDGES)
+    }
+
+    /// A registry holding only the clock, capped at `max_interlocks` live entries
+    /// and `max_watch_edges` total watch edges.
+    pub fn with_limits(max_interlocks: usize, max_watch_edges: usize) -> Result<Self> {
         let clock = interlock_create_clock()?;
         interlock_arm(&clock, CLOCK_TTL_NANOS)?;
         // closed_count = daemon start ms (set once). open_count = current ms (each cycle).
@@ -172,6 +204,8 @@ impl Registry {
             index: HashMap::new(),
             live: 0,
             max_interlocks,
+            watch_edges: 0,
+            max_watch_edges,
             dead_slots: Vec::new(),
         })
     }
@@ -195,6 +229,16 @@ impl Registry {
     /// Exposed for tests that verify allocation reuse across evaluate_all cycles.
     pub fn dead_slots_capacity(&self) -> usize {
         self.dead_slots.capacity()
+    }
+
+    /// Total watch edges across all live entries.
+    pub fn watch_edge_count(&self) -> usize {
+        self.watch_edges
+    }
+
+    /// The watch-edge budget.
+    pub fn max_watch_edges(&self) -> usize {
+        self.max_watch_edges
     }
 
     /// The slot a live name currently occupies, or `None` if it is not registered.
@@ -228,14 +272,28 @@ impl Registry {
                 message: format!("interlock limit reached: {}", self.max_interlocks),
             });
         }
+        if spec.dependencies.len() > MAX_DEPENDENCIES {
+            return Err(Condition::InvalidRequest {
+                message: format!(
+                    "too many dependencies: {}, max {MAX_DEPENDENCIES}",
+                    spec.dependencies.len()
+                ),
+            });
+        }
+        if let Some(ref conds) = spec.barrier_conditions {
+            if conds.len() > MAX_BARRIER_CONDITIONS {
+                return Err(Condition::InvalidRequest {
+                    message: format!(
+                        "too many barrier conditions: {}, max {MAX_BARRIER_CONDITIONS}",
+                        conds.len()
+                    ),
+                });
+            }
+        }
 
-        let tier = spec.tier;
-        let mut watch = None;
-        let mut interval_ms = None;
-        let mut conditions = None;
         let now_ns = monotonic_now_nanos();
 
-        match tier {
+        let mut kind = match spec.tier {
             Tier::WaitCounter => {
                 let wn = spec.watched_name.ok_or_else(|| Condition::InvalidRequest {
                     message: "WaitCounter requires watched_name".to_string(),
@@ -252,11 +310,12 @@ impl Registry {
                 if !self.target_alive(target, now_ns) {
                     return Err(Condition::InterlockNotFound { name: wn });
                 }
-                watch = Some((target, WatchedWord::from_wire(ww)?));
+                EntryKind::WaitCounter {
+                    target,
+                    word: WatchedWord::from_wire(ww)?,
+                }
             }
-            Tier::WaitTimer => {
-                watch = Some((Target::Clock, WatchedWord::OpenCount));
-            }
+            Tier::WaitTimer => EntryKind::WaitTimer,
             Tier::WaitCron => {
                 let ival_ns = spec.interval_ns.ok_or_else(|| Condition::InvalidRequest {
                     message: "WaitCron requires interval_ns".to_string(),
@@ -272,8 +331,7 @@ impl Registry {
                         message: format!("WaitCron interval_ns ({ival_ns}) is less than 1ms"),
                     });
                 }
-                interval_ms = Some(ival_ms);
-                watch = Some((Target::Clock, WatchedWord::OpenCount));
+                EntryKind::WaitCron { interval_ms: ival_ms }
             }
             Tier::WaitBarrier => {
                 let conds = spec
@@ -299,10 +357,10 @@ impl Registry {
                     }
                     parsed.push((target, WatchedWord::from_wire(ww)?, threshold));
                 }
-                conditions = Some(parsed);
+                EntryKind::WaitBarrier { conditions: parsed }
             }
-            Tier::Interlock => {}
-        }
+            Tier::Interlock => EntryKind::Interlock,
+        };
 
         // Owner and dependency validation: before interlock_create() so a refused create
         // never displaces the existing entry.
@@ -351,6 +409,58 @@ impl Registry {
             depends_on.push(target);
         }
 
+        // Deduplicate: dying with the same target twice adds nothing.
+        {
+            let mut deduped: Vec<Target> = Vec::with_capacity(depends_on.len());
+            for t in &depends_on {
+                if !deduped.contains(t) {
+                    deduped.push(*t);
+                }
+            }
+            depends_on = deduped;
+        }
+
+        // Merge duplicate barrier conditions: same (target, word) keeps the highest
+        // threshold, since every condition must hold.
+        if let EntryKind::WaitBarrier { ref mut conditions } = kind {
+            let mut merged: Vec<(Target, WatchedWord, u64)> =
+                Vec::with_capacity(conditions.len());
+            for &(target, word, threshold) in conditions.iter() {
+                if let Some(existing) =
+                    merged.iter_mut().find(|(t, w, _)| *t == target && *w == word)
+                {
+                    existing.2 = existing.2.max(threshold);
+                } else {
+                    merged.push((target, word, threshold));
+                }
+            }
+            *conditions = merged;
+        }
+
+        // Watch-edge budget: the total per-tick work across the whole registry.
+        let new_edge_count = depends_on.len()
+            + match &kind {
+                EntryKind::WaitCounter { .. } => 1,
+                EntryKind::WaitBarrier { conditions } => conditions.len(),
+                _ => 0,
+            };
+        let old_edges = self
+            .index
+            .get(&spec.name)
+            .copied()
+            .and_then(|slot| self.slots[slot].as_ref().map(entry_edge_count))
+            .unwrap_or(0);
+        if self.watch_edges - old_edges + new_edge_count > self.max_watch_edges {
+            return Err(Condition::InvalidRequest {
+                message: format!(
+                    "watch edge budget exceeded: {} in use, {} needed, max {}",
+                    self.watch_edges - old_edges,
+                    new_edge_count,
+                    self.max_watch_edges,
+                ),
+            });
+        }
+
         // The descriptor is duplicated before any registry mutation, so a dup failure
         // leaves an existing entry of the same name (if any) untouched.
         let handle = interlock_create()?;
@@ -358,8 +468,8 @@ impl Registry {
 
         // Tier-specific initialization per CONTRACTS.md.
         let clock_now_ms = self.clock.words().open_count.load(Ordering::Acquire);
-        match tier {
-            Tier::WaitTimer => {
+        match &kind {
+            EntryKind::WaitTimer => {
                 handle
                     .words()
                     .open_count
@@ -369,14 +479,14 @@ impl Registry {
                     .closed_count
                     .store(clock_now_ms, Ordering::Release);
             }
-            Tier::WaitCron => {
+            EntryKind::WaitCron { interval_ms } => {
                 if clock_now_ms == SENTINEL {
                     return Err(Condition::InvalidRequest {
                         message: "clock word is SENTINEL".to_string(),
                     });
                 }
                 let next_line =
-                    next_grid_line(clock_now_ms, interval_ms.unwrap_or(1)).ok_or_else(|| {
+                    next_grid_line(clock_now_ms, *interval_ms).ok_or_else(|| {
                         Condition::InvalidRequest {
                             message: "WaitCron grid line overflow".to_string(),
                         }
@@ -390,11 +500,11 @@ impl Registry {
                     .closed_count
                     .store(clock_now_ms, Ordering::Release);
             }
-            Tier::WaitBarrier => {
+            EntryKind::WaitBarrier { .. } => {
                 // open_count = 1 makes the barrier Open so the daemon evaluates it.
                 handle.words().open_count.store(1, Ordering::Release);
             }
-            Tier::Interlock | Tier::WaitCounter => {}
+            EntryKind::Interlock | EntryKind::WaitCounter { .. } => {}
         }
 
         let id = self.next_id;
@@ -416,14 +526,12 @@ impl Registry {
             id,
             name: spec.name.clone(),
             handle: handle.clone(),
-            tier,
-            watch,
-            interval_ms,
-            conditions,
+            kind,
             depends_on,
         });
         self.index.insert(spec.name, slot);
         self.live += 1;
+        self.watch_edges += new_edge_count;
 
         Ok((id, handle, fd))
     }
@@ -439,7 +547,7 @@ impl Registry {
             .get(name)
             .and_then(|&slot| self.slots[slot].as_ref())
         {
-            Some(entry) => Ok((entry.id, entry.tier, entry.handle.clone())),
+            Some(entry) => Ok((entry.id, entry.kind.tier(), entry.handle.clone())),
             None => Err(Condition::InterlockNotFound {
                 name: name.to_string(),
             }),
@@ -503,21 +611,21 @@ impl Registry {
             let value = (open_count as i64).wrapping_sub(closed_count as i64);
             let open = value > 0;
 
-            match entry.tier {
-                Tier::Interlock => {}
-                Tier::WaitTimer => {
+            match &entry.kind {
+                EntryKind::Interlock => {}
+                EntryKind::WaitTimer => {
                     if open && clock_now_ms >= open_count {
                         words.closed_count.store(clock_now_ms, Ordering::Release);
                         futex_wake(&words.closed_count);
                     }
                 }
-                Tier::WaitCron => {
+                EntryKind::WaitCron { interval_ms } => {
                     if open && clock_now_ms >= open_count {
                         words.closed_count.store(clock_now_ms, Ordering::Release);
                         futex_wake(&words.closed_count);
                         // Re-arm to the next future grid line. Missed lines are skipped,
                         // never burst. Overflow means the grid is exhausted; reap.
-                        match next_grid_line(clock_now_ms, entry.interval_ms.unwrap_or(1)) {
+                        match next_grid_line(clock_now_ms, *interval_ms) {
                             Some(next_line) => {
                                 // A concurrent free's SENTINEL must never be undone by this
                                 // re-arm; on CAS failure the next pass reaps whatever was written.
@@ -535,11 +643,8 @@ impl Registry {
                         }
                     }
                 }
-                Tier::WaitCounter => {
-                    let Some((target, word)) = entry.watch else {
-                        continue;
-                    };
-                    match self.watched_value(target, word, now_ns) {
+                EntryKind::WaitCounter { target, word } => {
+                    match self.watched_value(*target, *word, now_ns) {
                         None => {
                             // Target reaped or recreated: the watcher dies with it.
                             interlock_reap(&entry.handle);
@@ -552,10 +657,7 @@ impl Registry {
                         Some(_) => {}
                     }
                 }
-                Tier::WaitBarrier => {
-                    let Some(conditions) = entry.conditions.as_ref() else {
-                        continue;
-                    };
+                EntryKind::WaitBarrier { conditions } => {
                     let mut all_met = true;
                     let mut target_gone = false;
                     for (target, word, threshold) in conditions {
@@ -683,6 +785,7 @@ impl Registry {
 
     fn remove_slot(&mut self, slot: usize) {
         if let Some(entry) = self.slots[slot].take() {
+            self.watch_edges -= entry_edge_count(&entry);
             interlock_reap(&entry.handle);
             if self.index.get(&entry.name) == Some(&slot) {
                 self.index.remove(&entry.name);
@@ -691,6 +794,15 @@ impl Registry {
             self.live -= 1;
         }
     }
+}
+
+fn entry_edge_count(entry: &Entry) -> usize {
+    entry.depends_on.len()
+        + match &entry.kind {
+            EntryKind::WaitCounter { .. } => 1,
+            EntryKind::WaitBarrier { conditions } => conditions.len(),
+            _ => 0,
+        }
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -1180,5 +1292,216 @@ mod tests {
             exp >= after,
             "clock was not re-armed after a lapse: exp {exp}, after {after}"
         );
+    }
+
+    // -- per-entry limit tests --
+
+    #[test]
+    fn too_many_dependencies_rejected() {
+        let mut r = registry();
+        let deps: Vec<String> = (0..MAX_DEPENDENCIES + 1).map(|i| format!("d{i}")).collect();
+        let err = r
+            .create(CreateSpec {
+                name: "x".into(),
+                dependencies: deps,
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, Condition::InvalidRequest { ref message } if message.contains("too many dependencies")));
+    }
+
+    #[test]
+    fn max_dependencies_accepted() {
+        let mut r = registry();
+        for i in 0..MAX_DEPENDENCIES {
+            create_bare(&mut r, &format!("d{i}"));
+        }
+        let deps: Vec<String> = (0..MAX_DEPENDENCIES).map(|i| format!("d{i}")).collect();
+        let result = r.create(CreateSpec {
+            name: "x".into(),
+            dependencies: deps,
+            ..Default::default()
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn too_many_barrier_conditions_rejected() {
+        let mut r = registry();
+        let conds: Vec<(String, u8, u64)> = (0..MAX_BARRIER_CONDITIONS + 1)
+            .map(|i| (format!("t{i}"), 0, 1))
+            .collect();
+        let err = r
+            .create(CreateSpec {
+                name: "b".into(),
+                tier: Tier::WaitBarrier,
+                barrier_conditions: Some(conds),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, Condition::InvalidRequest { ref message } if message.contains("too many barrier conditions")));
+    }
+
+    // -- deduplication tests --
+
+    #[test]
+    fn duplicate_dependencies_are_merged() {
+        let mut r = registry();
+        create_bare(&mut r, "t");
+        let result = r.create(CreateSpec {
+            name: "x".into(),
+            dependencies: vec!["t".into(), "t".into(), "t".into()],
+            ..Default::default()
+        });
+        assert!(result.is_ok());
+        // Three duplicate deps should be merged to one edge.
+        assert_eq!(r.watch_edge_count(), 1);
+    }
+
+    #[test]
+    fn duplicate_barrier_conditions_are_merged_with_max_threshold() {
+        let mut r = registry();
+        create_bare(&mut r, "a");
+        let (_, bar) = r
+            .create(CreateSpec {
+                name: "bar".into(),
+                tier: Tier::WaitBarrier,
+                barrier_conditions: Some(vec![
+                    ("a".into(), 1, 3),
+                    ("a".into(), 1, 7),
+                    ("a".into(), 0, 5),
+                ]),
+                ..Default::default()
+            })
+            .unwrap();
+        // Two unique (target, word) pairs after merge: (a, closed_count) and (a, open_count).
+        // Threshold for (a, closed_count) should be max(3, 7) = 7.
+        // Bar has 0 depends_on edges + 2 condition edges = 2 total for bar.
+        // "a" has 0 edges.
+        assert_eq!(r.watch_edge_count(), 2);
+        // Verify the merge kept the semantics: the bar fires only when a.closed_count >= 7
+        // AND a.open_count >= 5.
+        bar.words().open_count.store(1, Ordering::Release);
+        r.evaluate_all(now_ms(), monotonic_now_nanos());
+        assert_eq!(bar.words().closed_count.load(Ordering::Acquire), 0);
+    }
+
+    // -- watch-edge budget tests --
+
+    #[test]
+    fn watch_edge_budget_enforced() {
+        let mut r = Registry::with_limits(100, 5).unwrap();
+        create_bare(&mut r, "t1");
+        create_bare(&mut r, "t2");
+        create_bare(&mut r, "t3");
+        assert_eq!(r.watch_edge_count(), 0);
+        // Each dependency adds one edge. 5 deps = 5 edges = at the budget.
+        let result = r.create(CreateSpec {
+            name: "x".into(),
+            dependencies: vec![
+                "t1".into(),
+                "t2".into(),
+                "t3".into(),
+                "t1".into(),
+                "t2".into(),
+            ],
+            ..Default::default()
+        });
+        // After dedup, only 3 unique deps = 3 edges, within budget.
+        assert!(result.is_ok());
+        assert_eq!(r.watch_edge_count(), 3);
+        // Now try to add 3 more edges, exceeding the budget of 5.
+        let err = r
+            .create(CreateSpec {
+                name: "y".into(),
+                dependencies: vec!["t1".into(), "t2".into(), "t3".into()],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, Condition::InvalidRequest { ref message } if message.contains("watch edge budget")));
+    }
+
+    #[test]
+    fn watch_edge_budget_accounts_for_reap() {
+        let mut r = Registry::with_limits(100, 3).unwrap();
+        create_bare(&mut r, "t");
+        let (_, x) = r
+            .create(CreateSpec {
+                name: "x".into(),
+                dependencies: vec!["t".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let (_, y) = r
+            .create(CreateSpec {
+                name: "y".into(),
+                dependencies: vec!["t".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(r.watch_edge_count(), 2);
+        // Reap x: frees 1 edge.
+        abacus_core::interlock::interlock_free(&x);
+        r.evaluate_all(now_ms(), monotonic_now_nanos());
+        assert_eq!(r.watch_edge_count(), 1);
+        // Now we can add 2 more edges.
+        create_bare(&mut r, "t2");
+        let result = r.create(CreateSpec {
+            name: "z".into(),
+            dependencies: vec!["t".into(), "t2".into()],
+            ..Default::default()
+        });
+        assert!(result.is_ok());
+        assert_eq!(r.watch_edge_count(), 3);
+    }
+
+    #[test]
+    fn watch_edge_budget_accounts_for_recreate() {
+        let mut r = Registry::with_limits(100, 4).unwrap();
+        create_bare(&mut r, "t1");
+        create_bare(&mut r, "t2");
+        // x uses 2 edges.
+        r.create(CreateSpec {
+            name: "x".into(),
+            dependencies: vec!["t1".into(), "t2".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.watch_edge_count(), 2);
+        // Recreate x with only 1 edge: frees 2, adds 1 = net 1.
+        r.create(CreateSpec {
+            name: "x".into(),
+            dependencies: vec!["t1".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.watch_edge_count(), 1);
+        // We now have 3 edges of budget left.
+        r.create(CreateSpec {
+            name: "y".into(),
+            dependencies: vec!["t1".into(), "t2".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.watch_edge_count(), 3);
+    }
+
+    #[test]
+    fn watch_edge_budget_includes_tier_edges() {
+        let mut r = Registry::with_limits(100, 2).unwrap();
+        create_bare(&mut r, "src");
+        // WaitCounter adds 1 tier edge.
+        let result = create_counter(&mut r, "w", "src", 0);
+        assert!(result.is_ok());
+        assert_eq!(r.watch_edge_count(), 1);
+        // A second counter would need 1 more edge = 2 total, at the limit.
+        create_bare(&mut r, "src2");
+        let result = create_counter(&mut r, "w2", "src2", 0);
+        assert!(result.is_ok());
+        assert_eq!(r.watch_edge_count(), 2);
+        // A third would exceed.
+        create_bare(&mut r, "src3");
+        let err = create_counter(&mut r, "w3", "src3", 0).unwrap_err();
+        assert!(matches!(err, Condition::InvalidRequest { ref message } if message.contains("watch edge budget")));
     }
 }

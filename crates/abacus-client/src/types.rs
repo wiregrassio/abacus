@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use abacus_core::interlock::SENTINEL;
+use abacus_core::interlock::{CLOCK_TTL_NANOS, SENTINEL};
 
 /// Internal poll cadence for bare waits (100 ms). Each futex_wait iteration uses this as its
 /// timeout, after which the loop re-checks reaped state before sleeping again. Not a
@@ -30,11 +30,13 @@ pub const fn default_touch_ttl_ms(interval_ms: u64) -> u64 {
 /// Default keepalive TTL in milliseconds: `default_touch_ttl_ms(DEFAULT_TOUCH_INTERVAL_MS)`.
 pub const DEFAULT_TOUCH_TTL_MS: u64 = 200;
 
-/// Floor on a WaitTimer's fatal margin in milliseconds. `wait_ms(W)` gives the daemon
-/// `max(2 * W, MIN_FATAL_MARGIN_MS)` before declaring it dead. Derived from measurement:
-/// worst observed delivery under stress is ~17 ms (Jetson Orin AGX, isolated core, 44 load
-/// threads); 50 ms provides 3x headroom.
-pub const MIN_FATAL_MARGIN_MS: u64 = 50;
+/// Floor on a WaitTimer's delivery-lateness tolerance in milliseconds. `wait_ms(W)` gives
+/// the daemon `W + max(W, MIN_FATAL_MARGIN_MS)` before declaring it dead. The floor is at
+/// least as large as the daemon's clock TTL so the WaitTimer never gives up before the
+/// keepalive's clock-lapse check does.
+pub const MIN_FATAL_MARGIN_MS: u64 = 100;
+
+const _: () = assert!(MIN_FATAL_MARGIN_MS >= CLOCK_TTL_NANOS / 1_000_000);
 
 /// Default read and write timeout on the daemon connection.
 pub const DEFAULT_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -54,6 +56,10 @@ pub enum Liveness {
     ProcessClockReaped,
     /// The keepalive found the Abacus clock's expiration lapsed.
     DaemonClockLapsed,
+    /// The keepalive thread panicked. All registrations are marked reaped and no new
+    /// registrations are accepted. Under `TimeoutPolicy::Abort` the process aborted before
+    /// this value could be observed.
+    KeepaliveFailed,
 }
 
 /// What a WaitTimer does when the daemon misses its fatal margin.

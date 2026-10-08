@@ -46,15 +46,21 @@ impl Server {
         if path.exists() {
             if is_socket_file(path)? {
                 match probe_socket(path) {
-                    Ok(true) | Err(_) => {
+                    Ok(true) => {
                         return Err(TransportError::SocketPathOccupied {
                             path: path.to_string_lossy().into_owned(),
                             live_daemon: true,
                         });
                     }
+                    Err(errno) => {
+                        return Err(TransportError::Io {
+                            operation: IoOperation::Connect,
+                            errno,
+                        });
+                    }
                     Ok(false) => {}
                 }
-                let _ = std::fs::remove_file(path);
+                remove_stale_socket(path)?;
             } else {
                 return Err(TransportError::SocketPathOccupied {
                     path: path.to_string_lossy().into_owned(),
@@ -252,11 +258,22 @@ fn is_socket_file(path: &Path) -> Result<bool, TransportError> {
     Ok(meta.file_type().is_socket())
 }
 
+fn remove_stale_socket(path: &Path) -> Result<(), TransportError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        Err(e) => Err(TransportError::Io {
+            operation: IoOperation::Unlink,
+            errno: e.raw_os_error().unwrap_or(0),
+        }),
+    }
+}
+
 /// Probe whether a live daemon is listening on `path`. Returns `Ok(true)` if a
 /// connection succeeds (live daemon), `Ok(false)` if the connect fails with
-/// ECONNREFUSED (stale socket, nobody listening), or `Err` for any other errno
-/// (EACCES: live daemon the current user cannot reach; anything else: unknown state,
-/// treat as live rather than unlinking a socket that may belong to a running daemon).
+/// ECONNREFUSED (stale socket, nobody listening), or `Err(errno)` for any other
+/// failure. EACCES means permission denied, not that a daemon is listening; the
+/// caller reports it as an IO error rather than claiming a live daemon.
 fn probe_socket(path: &Path) -> std::result::Result<bool, i32> {
     match UnixStream::connect(path) {
         Ok(_) => Ok(true),
@@ -320,6 +337,12 @@ mod tests {
 
     #[test]
     fn probe_eacces_is_not_treated_as_stale() {
+        // Root ignores socket permissions, so connect succeeds even on mode 0o000.
+        // Skip this test when running as root (e.g. in a Docker container).
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping probe_eacces test: running as root (permissions are bypassed)");
+            return;
+        }
         let path = tmp_path("eacces");
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         // Make the socket unreadable so connect gets EACCES.
@@ -337,12 +360,12 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(TransportError::SocketPathOccupied {
-                    live_daemon: true,
-                    ..
+                Err(TransportError::Io {
+                    operation: IoOperation::Connect,
+                    errno: libc::EACCES,
                 })
             ),
-            "EACCES should be treated as a live daemon, not stale: {result:?}"
+            "EACCES should report the probe errno, not claim a live daemon: {result:?}"
         );
     }
 

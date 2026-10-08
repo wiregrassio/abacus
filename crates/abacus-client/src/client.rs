@@ -2,15 +2,16 @@
 //! calls that hand back typed handles.
 
 use std::collections::HashSet;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use abacus_core::error::{Condition, IoOperation, ProtocolFault, TransportError};
 use abacus_core::interlock::{
-    interlock_free, interlock_map, interlock_map_barrier, interlock_map_clock,
-    interlock_map_counter, interlock_map_cron, interlock_map_timer, InterlockHandle, CLOCK_NAME,
+    interlock_free, interlock_map, interlock_map_clock, interlock_map_readonly, InterlockHandle,
+    ReadOnlyInterlockHandle, CLOCK_NAME,
 };
 use abacus_wire::{
     decode_response, encode_request, expected_fd_count, read_exact, recv_prefix_with_fds,
@@ -75,6 +76,13 @@ pub enum SdkError {
         /// The dependency name or socket path that was still missing.
         missing: String,
     },
+    /// A futex wait syscall failed with a permanent errno (not EAGAIN, EINTR, or
+    /// ETIMEDOUT). Typical causes: EPERM from a seccomp filter, EFAULT from a bad mapping,
+    /// EINVAL from an unsupported futex operation, ENOSYS from a missing syscall.
+    FutexFailed {
+        /// The errno the syscall returned.
+        errno: i32,
+    },
     /// The SDK could not start its keepalive thread (for example EAGAIN at the thread
     /// limit). Nothing was registered.
     KeepaliveSpawnFailed {
@@ -90,6 +98,10 @@ pub enum SdkError {
         /// The error number `pthread_setschedparam` returned.
         errno: i32,
     },
+    /// The keepalive thread panicked and all registrations were marked reaped. No new
+    /// registrations are accepted: the process clock may already have been reaped by the
+    /// daemon during the gap.
+    KeepaliveFailed,
 }
 
 impl std::fmt::Display for SdkError {
@@ -109,6 +121,11 @@ impl std::fmt::Display for SdkError {
             Self::DependencyTimeout { waited, missing } => {
                 write!(f, "dependency timeout: waited {waited:?} for \"{missing}\"")
             }
+            Self::FutexFailed { errno } => write!(
+                f,
+                "futex wait failed permanently: {}",
+                std::io::Error::from_raw_os_error(*errno)
+            ),
             Self::KeepaliveSpawnFailed { message } => {
                 write!(f, "keepalive thread spawn failed: {message}")
             }
@@ -116,6 +133,10 @@ impl std::fmt::Display for SdkError {
                 f,
                 "keepalive priority failed: {}",
                 std::io::Error::from_raw_os_error(*errno)
+            ),
+            Self::KeepaliveFailed => write!(
+                f,
+                "keepalive thread panicked; all registrations reaped, no new registrations accepted"
             ),
         }
     }
@@ -147,7 +168,7 @@ pub type Result<T> = std::result::Result<T, SdkError>;
 
 // -- Client connection transport --
 
-/// Blocking UDS connection to the daemon with read and write timeouts.
+/// Blocking UDS connection to the daemon with connect, read, and write timeouts.
 struct ClientConn {
     stream: UnixStream,
     timeout: Duration,
@@ -156,23 +177,7 @@ struct ClientConn {
 
 impl ClientConn {
     fn connect(path: &Path, timeout: Duration) -> std::result::Result<Self, TransportError> {
-        let stream = UnixStream::connect(path).map_err(|e| TransportError::Io {
-            operation: IoOperation::Connect,
-            errno: e.raw_os_error().unwrap_or(0),
-        })?;
-        let some = Some(timeout);
-        stream
-            .set_read_timeout(some)
-            .map_err(|e| TransportError::Io {
-                operation: IoOperation::SetTimeout,
-                errno: e.raw_os_error().unwrap_or(0),
-            })?;
-        stream
-            .set_write_timeout(some)
-            .map_err(|e| TransportError::Io {
-                operation: IoOperation::SetTimeout,
-                errno: e.raw_os_error().unwrap_or(0),
-            })?;
+        let stream = connect_unix_with_timeout(path, timeout)?;
         Ok(Self {
             stream,
             timeout,
@@ -272,6 +277,14 @@ pub struct AbacusClient {
 impl AbacusClient {
     /// Connect to the daemon at `socket_path` with the default 1 s transport timeout.
     /// Creates a ProcessClock named `clock_name` with the given dependencies.
+    ///
+    /// `clock_name` identifies one live process. If another client already holds a
+    /// ProcessClock with this name, connecting reaps it: the holder aborts with
+    /// `ProcessClockReaped` (or reports it under `TimeoutPolicy::Error`), every entry
+    /// the holder owns is reaped, and every ProcessClock or entry that listed the name
+    /// as a dependency is reaped too. Dependencies are bound by registry id, so they do
+    /// not move to the new holder. Tested by
+    /// `liveness__recreated_clock_aborts_the_old_process`.
     pub fn connect(socket_path: &Path, clock_name: &str, dependencies: &[&str]) -> Result<Self> {
         Self::connect_with_timeout(
             socket_path,
@@ -284,6 +297,10 @@ impl AbacusClient {
     /// Connect with an explicit transport timeout. Creates a ProcessClock named `clock_name`
     /// with the given dependencies. A missing dependency surfaces as
     /// `SdkError::InterlockNotFound` and no client is returned.
+    ///
+    /// `clock_name` identifies one live process. Connecting with a name held by another
+    /// live client reaps that client's ProcessClock and everything it owns or that
+    /// depends on it (see [`connect`](Self::connect)).
     pub fn connect_with_timeout(
         socket_path: &Path,
         clock_name: &str,
@@ -291,7 +308,7 @@ impl AbacusClient {
         timeout: Duration,
     ) -> Result<Self> {
         let mut conn = ClientConn::connect(socket_path, timeout)?;
-        let clock_handle = do_attach(&mut conn, CLOCK_NAME, interlock_map_clock)?.1;
+        let clock_handle = do_attach_clock(&mut conn)?.1;
         let (id, pc_handle) = do_create(
             &mut conn,
             create_request(clock_name, 0, None, dependencies),
@@ -318,10 +335,12 @@ impl AbacusClient {
         })
     }
 
-    /// Connect to the daemon, retrying when the socket is absent or refused, or a dependency
-    /// is missing, up to `max_wait`. Retries a socket connect failure only when its errno is
-    /// `ENOENT`, `ECONNREFUSED`, or `EACCES`; every other connect errno, and every other error, returns
-    /// at once. Logs one line on stderr per distinct reason for the whole wait.
+    /// Connect to the daemon, retrying when the socket is absent, refused, timed out, or a
+    /// dependency is missing, up to `max_wait`. Each attempt's transport timeout is capped at
+    /// `min(DEFAULT_TRANSPORT_TIMEOUT, max_wait - elapsed)`. Retries a socket connect failure
+    /// only when its errno is `ENOENT`, `ECONNREFUSED`, `EACCES`, or `ETIMEDOUT`; every other
+    /// connect errno, and every other error, returns at once. Logs one line on stderr per
+    /// distinct reason for the whole wait.
     pub fn connect_waiting(
         socket_path: &Path,
         clock_name: &str,
@@ -333,7 +352,22 @@ impl AbacusClient {
         let mut last_missing = String::new();
 
         loop {
-            match Self::connect(socket_path, clock_name, dependencies) {
+            let elapsed = start.elapsed();
+            if elapsed >= max_wait {
+                return Err(SdkError::DependencyTimeout {
+                    waited: elapsed,
+                    missing: last_missing,
+                });
+            }
+            let remaining = max_wait - elapsed;
+            let attempt_timeout = remaining.min(DEFAULT_TRANSPORT_TIMEOUT);
+
+            match Self::connect_with_timeout(
+                socket_path,
+                clock_name,
+                dependencies,
+                attempt_timeout,
+            ) {
                 Ok(client) => return Ok(client),
                 Err(SdkError::Transport(TransportError::Io {
                     operation: IoOperation::Connect,
@@ -362,14 +396,8 @@ impl AbacusClient {
                 Err(other) => return Err(other),
             }
 
-            if start.elapsed() >= max_wait {
-                return Err(SdkError::DependencyTimeout {
-                    waited: start.elapsed(),
-                    missing: last_missing,
-                });
-            }
-
-            std::thread::sleep(CONNECT_RETRY_INTERVAL);
+            let remaining = max_wait.saturating_sub(start.elapsed());
+            std::thread::sleep(CONNECT_RETRY_INTERVAL.min(remaining));
         }
     }
 
@@ -472,8 +500,8 @@ impl AbacusClient {
         ))
     }
 
-    /// Attach to a WaitCounter by name, read-only. Refuses any tier other than 1, without
-    /// mapping the descriptor.
+    /// Attach to a WaitCounter by name, read-only. The mapping is `PROT_READ`; a stray write
+    /// faults. Refuses any tier other than 1, without mapping the descriptor.
     pub fn attach_wait_counter(&mut self, name: &str) -> Result<AttachedWaitCounter> {
         let (tier, fd) = do_attach_request(&mut self.conn, name)?;
         if tier != 1 {
@@ -481,7 +509,7 @@ impl AbacusClient {
                 message: format!("\"{name}\" is tier {tier}, not a WaitCounter"),
             });
         }
-        let handle = interlock_map_counter(fd).map_err(|e| SdkError::MmapFailed {
+        let handle = interlock_map_readonly(fd).map_err(|e| SdkError::MmapFailed {
             message: e.to_string(),
         })?;
         Ok(AttachedWaitCounter::new(handle))
@@ -505,8 +533,8 @@ impl AbacusClient {
             *wn = Some(watched_name.to_string());
             *ww = Some(watched_word.to_u8());
         }
-        let (_, handle) = self.do_create(req, interlock_map_counter)?;
-        WaitCounter::new(handle, &self.keepalive)
+        let (_, handle) = self.do_create(req, interlock_map)?;
+        WaitCounter::new(handle, self.clock.handle().clone(), &self.keepalive)
     }
 
     /// Create a WaitTimer (tier 2) watching the clock, with this client's timeout policy and
@@ -514,7 +542,7 @@ impl AbacusClient {
     pub fn create_wait_timer(&mut self, name: &str) -> Result<WaitTimer> {
         let owner = Some((self.clock_name.clone(), self.clock_id));
         let (_, handle) =
-            self.do_create(create_request(name, 2, owner, &[]), interlock_map_timer)?;
+            self.do_create(create_request(name, 2, owner, &[]), interlock_map)?;
         WaitTimer::new(
             handle,
             self.clock.handle().clone(),
@@ -542,7 +570,7 @@ impl AbacusClient {
         {
             *req_interval_ns = Some(interval_ns);
         }
-        let (_, handle) = self.do_create(req, interlock_map_cron)?;
+        let (_, handle) = self.do_create(req, interlock_map)?;
         WaitCron::new(
             handle,
             self.clock.handle().clone(),
@@ -567,7 +595,7 @@ impl AbacusClient {
         if let Request::CreateInterlock { conditions: c, .. } = &mut req {
             *c = Some(wire_conditions);
         }
-        let (_, handle) = self.do_create(req, interlock_map_barrier)?;
+        let (_, handle) = self.do_create(req, interlock_map)?;
         WaitBarrier::new(handle, self.clock.handle().clone(), &self.keepalive)
     }
 
@@ -624,7 +652,7 @@ fn bind_or_free(
     pc_handle: InterlockHandle,
     clock_name: &str,
     id: u64,
-    abacus_clock: InterlockHandle,
+    abacus_clock: ReadOnlyInterlockHandle,
 ) -> Result<()> {
     keepalive
         .bind_process(pc_handle.clone(), clock_name.to_string(), id, abacus_clock)
@@ -677,10 +705,103 @@ fn do_create(
     }
 }
 
-/// Connect errnos `connect_waiting` retries: no socket yet, nobody listening yet, or a
-/// socket whose mode and group the daemon has not applied yet.
+/// Create a Unix stream socket with `SO_SNDTIMEO` and `SO_RCVTIMEO` applied before
+/// connecting, so the blocking `connect(2)` is bounded by `timeout`. On Linux,
+/// `SO_SNDTIMEO` applies to a blocking connect on a Unix domain socket when the
+/// listener's queue is full; a timed-out connect returns `EAGAIN`, reported here as
+/// `ETIMEDOUT`.
+fn connect_unix_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> std::result::Result<UnixStream, TransportError> {
+    let path_bytes = path.as_os_str().as_bytes();
+
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(TransportError::Io {
+            operation: IoOperation::Connect,
+            errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        });
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    let tv = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+    set_sock_timeo(owned.as_raw_fd(), libc::SO_SNDTIMEO, &tv)?;
+    set_sock_timeo(owned.as_raw_fd(), libc::SO_RCVTIMEO, &tv)?;
+
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if path_bytes.len() >= addr.sun_path.len() {
+        return Err(TransportError::Io {
+            operation: IoOperation::Connect,
+            errno: libc::ENAMETOOLONG,
+        });
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            addr.sun_path.as_mut_ptr().cast::<u8>(),
+            path_bytes.len(),
+        );
+    }
+
+    let ret = unsafe {
+        libc::connect(
+            owned.as_raw_fd(),
+            (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        let errno = if errno == libc::EAGAIN {
+            libc::ETIMEDOUT
+        } else {
+            errno
+        };
+        return Err(TransportError::Io {
+            operation: IoOperation::Connect,
+            errno,
+        });
+    }
+
+    Ok(UnixStream::from(owned))
+}
+
+fn set_sock_timeo(
+    fd: libc::c_int,
+    opt: libc::c_int,
+    tv: &libc::timeval,
+) -> std::result::Result<(), TransportError> {
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            (tv as *const libc::timeval).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(TransportError::Io {
+            operation: IoOperation::SetTimeout,
+            errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        });
+    }
+    Ok(())
+}
+
+/// Connect errnos `connect_waiting` retries: no socket yet, nobody listening yet, a socket
+/// whose mode and group the daemon has not applied yet, or a timed-out connect (the daemon
+/// is alive but its listen queue is full).
 fn retryable_connect_errno(errno: i32) -> bool {
-    matches!(errno, libc::ENOENT | libc::ECONNREFUSED | libc::EACCES)
+    matches!(
+        errno,
+        libc::ENOENT | libc::ECONNREFUSED | libc::EACCES | libc::ETIMEDOUT
+    )
 }
 
 /// Send an AttachInterlock request and return the daemon's tier and the raw descriptor,
@@ -707,6 +828,14 @@ fn do_attach(
 ) -> Result<(u8, InterlockHandle)> {
     let (tier, fd) = do_attach_request(conn, name)?;
     let handle = map_fn(fd).map_err(|e| SdkError::MmapFailed {
+        message: e.to_string(),
+    })?;
+    Ok((tier, handle))
+}
+
+fn do_attach_clock(conn: &mut ClientConn) -> Result<(u8, ReadOnlyInterlockHandle)> {
+    let (tier, fd) = do_attach_request(conn, CLOCK_NAME)?;
+    let handle = interlock_map_clock(fd).map_err(|e| SdkError::MmapFailed {
         message: e.to_string(),
     })?;
     Ok((tier, handle))
@@ -855,10 +984,11 @@ mod tests {
     }
 
     #[test]
-    fn retryable_connect_errnos_are_absent_refused_and_not_yet_permitted() {
+    fn retryable_connect_errnos_are_absent_refused_permitted_and_timed_out() {
         assert!(retryable_connect_errno(libc::ENOENT));
         assert!(retryable_connect_errno(libc::ECONNREFUSED));
         assert!(retryable_connect_errno(libc::EACCES));
+        assert!(retryable_connect_errno(libc::ETIMEDOUT));
         assert!(!retryable_connect_errno(libc::ENOTDIR));
         assert!(!retryable_connect_errno(libc::EPERM));
     }
@@ -889,7 +1019,7 @@ mod tests {
             .words()
             .open_count
             .store(1000, Ordering::Release);
-        let r = bind_or_free(&k, pc.clone(), "pc", 1, abacus_clock);
+        let r = bind_or_free(&k, pc.clone(), "pc", 1, abacus_clock.into());
         assert!(
             matches!(r, Err(SdkError::KeepaliveSpawnFailed { .. })),
             "{r:?}"

@@ -4,8 +4,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use abacus_core::clock::{futex_wait, futex_wake, futex_word, monotonic_now_nanos, ms_to_nanos};
-use abacus_core::interlock::{interlock_arm, InterlockHandle, SENTINEL};
+use abacus_core::clock::{
+    classify_futex_result, futex_wait, futex_wake, futex_word, monotonic_now_nanos, ms_to_nanos,
+    FutexOutcome,
+};
+use abacus_core::interlock::{interlock_extend, InterlockHandle, ReadOnlyInterlockHandle, SENTINEL};
 
 use crate::client::SdkError;
 use crate::types::{interlock_state, InterlockState, DEFAULT_TIMEOUT_NANOS};
@@ -62,7 +65,7 @@ pub(crate) fn completed_at(handle: &InterlockHandle) -> u64 {
 
 /// Extend expiration to max(current, now + ms).
 pub(crate) fn touch(handle: &InterlockHandle, ms: u64) -> Result<(), SdkError> {
-    interlock_arm(handle, ms_to_nanos(ms)).map_err(SdkError::from)
+    interlock_extend(handle, ms_to_nanos(ms)).map_err(SdkError::from)
 }
 
 /// Add `h` to a counter and wake its waiters. A word at SENTINEL is never written; an addition that would reach or pass SENTINEL terminates the word. Either returns `InterlockReaped`.
@@ -88,6 +91,34 @@ pub(crate) fn increment(handle: &InterlockHandle, word: Word, h: u64) -> Result<
     }
 }
 
+/// Liveness gate: returns `Err(InterlockReaped)` if any word is SENTINEL, if expiration
+/// has lapsed, or (when a clock handle is provided) if the daemon clock has lapsed. Called
+/// at the top of every wait loop so termination is detected before a reached target can
+/// be reported as success.
+pub(crate) fn check_live(
+    handle: &InterlockHandle,
+    clock: Option<&ReadOnlyInterlockHandle>,
+    now: u64,
+) -> Result<(), SdkError> {
+    let words = handle.words();
+    if words.open_count.load(Ordering::Acquire) == SENTINEL
+        || words.closed_count.load(Ordering::Acquire) == SENTINEL
+    {
+        return Err(SdkError::InterlockReaped);
+    }
+    let exp = words.expiration_ns.load(Ordering::Acquire);
+    if exp == SENTINEL || exp < now {
+        return Err(SdkError::InterlockReaped);
+    }
+    if let Some(clk) = clock {
+        let clock_exp = clk.load_expiration();
+        if clock_exp == SENTINEL || clock_exp < now {
+            return Err(SdkError::InterlockReaped);
+        }
+    }
+    Ok(())
+}
+
 /// Block until `word` reaches `target`. `timeout` bounds the whole wait; `None` blocks
 /// indefinitely, re-checking reaped state every `DEFAULT_TIMEOUT_NANOS`.
 ///
@@ -96,6 +127,9 @@ pub(crate) fn increment(handle: &InterlockHandle, word: Word, h: u64) -> Result<
 /// returned. The interlock's own expiration is also checked (it catches the case where the
 /// creator stopped its keepalive).
 ///
+/// Liveness is checked before the target comparison: a terminated interlock whose word
+/// already reached the target reports `InterlockReaped`, not success.
+///
 /// `Ok(Some(value))` when reached, `Ok(None)` when the timeout elapsed first,
 /// `Err(InterlockReaped)` when the word reads SENTINEL or either expiration has lapsed.
 pub(crate) fn wait_word(
@@ -103,29 +137,19 @@ pub(crate) fn wait_word(
     word: Word,
     target: u64,
     timeout: Option<Duration>,
-    clock: &InterlockHandle,
+    clock: &ReadOnlyInterlockHandle,
 ) -> Result<Option<u64>, SdkError> {
     let w = word_of(handle, word);
     let deadline_ns = timeout.map(|t| monotonic_now_nanos().saturating_add(t.as_nanos() as u64));
     loop {
+        let now = monotonic_now_nanos();
+        check_live(handle, Some(clock), now)?;
         let current = w.load(Ordering::Acquire);
         if current == SENTINEL {
             return Err(SdkError::InterlockReaped);
         }
         if current >= target {
             return Ok(Some(current));
-        }
-        let now = monotonic_now_nanos();
-        let exp = handle.words().expiration_ns.load(Ordering::Acquire);
-        if exp == SENTINEL || exp < now {
-            return Err(SdkError::InterlockReaped);
-        }
-        // Check the daemon-owned clock's expiration. The client keepalive cannot re-arm
-        // the clock (it is read-only), so after daemon death this fires within one clock TTL.
-        let clock_exp = clock.words().expiration_ns.load(Ordering::Acquire);
-        // A terminated daemon clock (SENTINEL) is dead, not alive.
-        if clock_exp == SENTINEL || clock_exp < now {
-            return Err(SdkError::InterlockReaped);
         }
         let mut wait_ns = DEFAULT_TIMEOUT_NANOS;
         if let Some(deadline) = deadline_ns {
@@ -136,6 +160,52 @@ pub(crate) fn wait_word(
         }
         // Low 32 bits only (kernel constraint). An increment that is an exact multiple of
         // 2^32 landing in the load-to-syscall window costs one poll cadence, nothing more.
-        let _ = futex_wait(w, futex_word(current), wait_ns);
+        if let FutexOutcome::Fatal(errno) =
+            classify_futex_result(futex_wait(w, futex_word(current), wait_ns))
+        {
+            return Err(SdkError::FutexFailed { errno });
+        }
+    }
+}
+
+/// `wait_word` for the clock handle, which is both the wait target and the liveness
+/// reference. Only reads and futex-waits; safe on a `PROT_READ` mapping.
+pub(crate) fn wait_word_clock(
+    clock: &ReadOnlyInterlockHandle,
+    word: Word,
+    target: u64,
+    timeout: Option<Duration>,
+) -> Result<Option<u64>, SdkError> {
+    let deadline_ns = timeout.map(|t| monotonic_now_nanos().saturating_add(t.as_nanos() as u64));
+    loop {
+        let now = monotonic_now_nanos();
+        let exp = clock.load_expiration();
+        if exp == SENTINEL || exp < now {
+            return Err(SdkError::InterlockReaped);
+        }
+        let current = match word {
+            Word::Open => clock.load_open(),
+            Word::Closed => clock.load_closed(),
+        };
+        if current == SENTINEL {
+            return Err(SdkError::InterlockReaped);
+        }
+        if current >= target {
+            return Ok(Some(current));
+        }
+        let mut wait_ns = DEFAULT_TIMEOUT_NANOS;
+        if let Some(deadline) = deadline_ns {
+            if now >= deadline {
+                return Ok(None);
+            }
+            wait_ns = wait_ns.min(deadline - now);
+        }
+        let futex_result = match word {
+            Word::Open => clock.futex_wait_open(futex_word(current), wait_ns),
+            Word::Closed => clock.futex_wait_closed(futex_word(current), wait_ns),
+        };
+        if let FutexOutcome::Fatal(errno) = classify_futex_result(futex_result) {
+            return Err(SdkError::FutexFailed { errno });
+        }
     }
 }

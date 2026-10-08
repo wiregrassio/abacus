@@ -105,6 +105,47 @@ fn wait_cron__reports_overrun_when_off_grid() {
     );
 }
 
+/// A fire that lands while the caller is busy must not be lost. Sleep for 1.5 intervals
+/// between waits: the second wait must return immediately with the fire that landed during
+/// the sleep, and must report Overrun because a grid line was skipped.
+#[test]
+fn wait_cron__missed_fire_returns_immediately_with_overrun() {
+    let d = ThreadDaemon::start("cron-missed");
+    let mut client = d.client();
+    let cron = client.create_wait_cron("c", 10).expect("create cron");
+    let r1 = cron.wait().expect("first fire");
+    assert_eq!(r1.state, WaitState::Normal, "first fire should be Normal");
+
+    // Simulate a slow caller: sleep long enough for at least one fire to land and be missed.
+    std::thread::sleep(Duration::from_millis(25));
+
+    let before = Instant::now();
+    let r2 = cron.wait().expect("second fire after sleep");
+    let wait_elapsed = before.elapsed();
+
+    // The second wait must return near-instantly (the fire is already there).
+    assert!(
+        wait_elapsed < Duration::from_millis(5),
+        "wait() blocked for {wait_elapsed:?} despite a fire already pending; peek={:?}",
+        cron.peek()
+    );
+    // At least one grid line was skipped between the two returns.
+    assert_eq!(
+        r2.state,
+        WaitState::Overrun,
+        "missed fire at {} (previous at {}) should be Overrun; peek={:?}",
+        r2.completed_at,
+        r1.completed_at,
+        cron.peek()
+    );
+    assert!(
+        r2.completed_at > r1.completed_at,
+        "second fire {} should be after first fire {}",
+        r2.completed_at,
+        r1.completed_at
+    );
+}
+
 /// After SIGKILL of the daemon, a WaitCron::wait() that has no local deadline must
 /// return Err(InterlockReaped) within a bounded time (the clock TTL) instead of hanging
 /// forever. Before the fix, the client keepalive re-arms the interlock's own expiration,

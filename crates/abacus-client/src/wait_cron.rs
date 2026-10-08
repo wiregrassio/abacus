@@ -1,13 +1,17 @@
 //! WaitCron: a recurring grid-aligned timer. The daemon re-arms it after every fire, so the
 //! client loops `wait()` with no UDS round-trip.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use abacus_core::clock::{futex_wait, futex_word, monotonic_now_nanos};
-use abacus_core::interlock::{interlock_free, interlock_is_terminated, InterlockHandle, SENTINEL};
+use abacus_core::clock::{
+    classify_futex_result, futex_wait, futex_word, monotonic_now_nanos, FutexOutcome,
+};
+use abacus_core::interlock::{
+    interlock_free, interlock_is_terminated, InterlockHandle, ReadOnlyInterlockHandle, SENTINEL,
+};
 
 use crate::client::SdkError;
-use crate::handle_ops;
+use crate::handle_ops::{self, check_live};
 use crate::touch::{Keepalive, TouchHandle};
 use crate::types::{
     default_touch_ttl_ms, WaitResult, WaitState, DEFAULT_TIMEOUT_NANOS, DEFAULT_TOUCH_INTERVAL_MS,
@@ -16,18 +20,21 @@ use crate::types::{
 /// A WaitCron on the `interval_ms` grid aligned to the monotonic epoch.
 pub struct WaitCron {
     handle: InterlockHandle,
-    clock: InterlockHandle,
+    clock: ReadOnlyInterlockHandle,
     touch: Option<TouchHandle>,
     interval_ms: u64,
+    /// The closed_count from the last fire this caller observed (or the creation-time value).
+    last_seen: AtomicU64,
 }
 
 impl WaitCron {
     pub(crate) fn new(
         handle: InterlockHandle,
-        clock: InterlockHandle,
+        clock: ReadOnlyInterlockHandle,
         keepalive: &Keepalive,
         interval_ms: u64,
     ) -> Result<Self, SdkError> {
+        let initial_closed = handle.words().closed_count.load(Ordering::Acquire);
         let touch = Some(keepalive.register(
             handle.clone(),
             DEFAULT_TOUCH_INTERVAL_MS,
@@ -38,6 +45,7 @@ impl WaitCron {
             clock,
             touch,
             interval_ms,
+            last_seen: AtomicU64::new(initial_closed),
         })
     }
 
@@ -46,48 +54,47 @@ impl WaitCron {
         self.interval_ms
     }
 
-    /// Block until the next grid line fires.
+    /// Block until the next fire, or return immediately if a fire landed since the last `wait()`.
     ///
-    /// `completed_at` is the clock when the daemon fired. `Normal` when that is on the grid,
-    /// `Overrun` when the daemon fired late (off grid). After a stall the daemon fires once
-    /// and re-arms to the next future line; missed lines are never replayed.
+    /// `completed_at` is the clock when the daemon fired. `Normal` when the fire is on the grid
+    /// and no grid lines were skipped since the previous return. `Overrun` when the daemon fired
+    /// late (off grid) or when the caller was slow and at least one grid line was missed.
     pub fn wait(&self) -> Result<WaitResult, SdkError> {
         let words = self.handle.words();
         let closed_word = &words.closed_count;
-        let initial_closed = closed_word.load(Ordering::Acquire);
-        if initial_closed == SENTINEL {
+        let seen = self.last_seen.load(Ordering::Acquire);
+        if seen == SENTINEL {
             return Err(SdkError::InterlockReaped);
         }
 
         loop {
+            let now = monotonic_now_nanos();
+            check_live(&self.handle, Some(&self.clock), now)?;
             let closed = closed_word.load(Ordering::Acquire);
             if closed == SENTINEL {
                 return Err(SdkError::InterlockReaped);
             }
-            if closed > initial_closed {
-                let state = if closed % self.interval_ms == 0 {
-                    WaitState::Normal
-                } else {
+            if closed > seen {
+                self.last_seen.fetch_max(closed, Ordering::AcqRel);
+                let state = if closed % self.interval_ms != 0 {
                     WaitState::Overrun
+                } else if closed > seen + self.interval_ms {
+                    WaitState::Overrun
+                } else {
+                    WaitState::Normal
                 };
                 return Ok(WaitResult {
                     completed_at: closed,
                     state,
                 });
             }
-            let now = monotonic_now_nanos();
-            let exp = words.expiration_ns.load(Ordering::Acquire);
-            if exp == SENTINEL || exp < now {
-                return Err(SdkError::InterlockReaped);
+            if let FutexOutcome::Fatal(errno) = classify_futex_result(futex_wait(
+                closed_word,
+                futex_word(closed),
+                DEFAULT_TIMEOUT_NANOS,
+            )) {
+                return Err(SdkError::FutexFailed { errno });
             }
-            // Check the daemon-owned clock's expiration. The client keepalive cannot re-arm
-            // the clock (it is read-only), so after daemon death this fires within one clock TTL.
-            let clock_exp = self.clock.words().expiration_ns.load(Ordering::Acquire);
-            // A terminated daemon clock (SENTINEL) is dead, not alive.
-            if clock_exp == SENTINEL || clock_exp < now {
-                return Err(SdkError::InterlockReaped);
-            }
-            let _ = futex_wait(closed_word, futex_word(closed), DEFAULT_TIMEOUT_NANOS);
         }
     }
 

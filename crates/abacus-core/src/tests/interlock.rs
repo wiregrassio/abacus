@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use crate::clock::{futex_wait, futex_word, monotonic_now_nanos};
 use crate::error::{AllocationStep, Condition};
 use crate::interlock::{
-    interlock_arm, interlock_create, interlock_dup_fd, interlock_free, interlock_is_terminated,
-    interlock_map, interlock_read_expiration, interlock_reap, Interlock, InterlockHandle,
-    CREATION_TTL_NANOS, INTERLOCK_SIZE, SENTINEL,
+    interlock_arm, interlock_create, interlock_dup_fd, interlock_extend, interlock_free,
+    interlock_is_terminated, interlock_map, interlock_map_clock, interlock_read_expiration,
+    interlock_reap, Interlock, InterlockHandle, CREATION_TTL_NANOS, INTERLOCK_SIZE, SENTINEL,
 };
 
 use super::{last_errno, Xorshift};
@@ -327,7 +327,7 @@ fn interlock__dup_fd_maps_the_same_page() {
     assert_eq!(exp_via_dup, interlock_read_expiration(&h));
 }
 
-/// Negative for interlock_map: an fd that cannot be mmapped is AllocationFailed at Mmap.
+/// Negative for interlock_map: a pipe fd fails validation (no seals) before reaching mmap.
 #[test]
 fn interlock__open_rejects_unmappable_fd() {
     let mut fds = [0i32; 2];
@@ -339,10 +339,10 @@ fn interlock__open_rejects_unmappable_fd() {
     let _read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     match interlock_map(write_end) {
         Err(Condition::AllocationFailed {
-            step: AllocationStep::Mmap,
+            step: AllocationStep::Validate,
             errno,
         }) => {
-            assert!(errno != 0, "Mmap failure carried errno 0");
+            assert!(errno != 0, "Validate failure on pipe carried errno 0");
         }
         other => panic!("open of a pipe fd returned {other:?}"),
     }
@@ -402,4 +402,179 @@ fn interlock__memfd_is_sealed_against_shrink_and_grow() {
         seals >= 0 && (seals & want) == want,
         "F_GET_SEALS = {seals:#x}; expected shrink|grow|seal = {want:#x}"
     );
+}
+
+// -- Received-fd validation tests --
+
+/// Helper: create a memfd with MFD_ALLOW_SEALING, optionally truncate and seal it.
+fn test_memfd(size: Option<libc::off_t>, seals: Option<libc::c_int>) -> OwnedFd {
+    let raw = unsafe {
+        libc::memfd_create(
+            c"test-interlock".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    assert!(raw >= 0, "memfd_create failed: errno {}", last_errno());
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    if let Some(sz) = size {
+        let ret = unsafe { libc::ftruncate(fd.as_raw_fd(), sz) };
+        assert_eq!(ret, 0, "ftruncate failed: errno {}", last_errno());
+    }
+    if let Some(s) = seals {
+        let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, s) };
+        assert_eq!(ret, 0, "F_ADD_SEALS failed: errno {}", last_errno());
+    }
+    fd
+}
+
+/// A 0-byte memfd (sealed) is rejected at Validate: size mismatch.
+#[test]
+fn interlock__map_rejects_zero_byte_memfd() {
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    let fd = test_memfd(None, Some(seals));
+    match interlock_map(fd) {
+        Err(Condition::AllocationFailed {
+            step: AllocationStep::Validate,
+            ..
+        }) => {}
+        other => panic!("expected Validate failure for 0-byte memfd, got {other:?}"),
+    }
+}
+
+/// A correctly sized but unsealed memfd is rejected at Validate: missing seals.
+#[test]
+fn interlock__map_rejects_unsealed_memfd() {
+    let fd = test_memfd(Some(INTERLOCK_SIZE as libc::off_t), None);
+    match interlock_map(fd) {
+        Err(Condition::AllocationFailed {
+            step: AllocationStep::Validate,
+            ..
+        }) => {}
+        other => panic!("expected Validate failure for unsealed memfd, got {other:?}"),
+    }
+}
+
+/// A sealed memfd of the wrong size is rejected at Validate.
+#[test]
+fn interlock__map_rejects_wrong_size_sealed_memfd() {
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    let fd = test_memfd(Some(4096), Some(seals));
+    match interlock_map(fd) {
+        Err(Condition::AllocationFailed {
+            step: AllocationStep::Validate,
+            ..
+        }) => {}
+        other => panic!("expected Validate failure for wrong-size memfd, got {other:?}"),
+    }
+}
+
+/// A sealed memfd smaller than 24 bytes is rejected at Validate: size mismatch.
+#[test]
+fn interlock__map_rejects_undersized_sealed_memfd() {
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    let fd = test_memfd(Some(16), Some(seals));
+    match interlock_map(fd) {
+        Err(Condition::AllocationFailed {
+            step: AllocationStep::Validate,
+            ..
+        }) => {}
+        other => panic!("expected Validate failure for 16-byte memfd, got {other:?}"),
+    }
+}
+
+/// A regular file fd is rejected at Validate: F_GET_SEALS fails on non-memfd files.
+#[test]
+fn interlock__map_rejects_regular_file() {
+    let path = c"/dev/null";
+    let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+    assert!(raw >= 0, "open /dev/null failed: errno {}", last_errno());
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    match interlock_map(fd) {
+        Err(Condition::AllocationFailed {
+            step: AllocationStep::Validate,
+            ..
+        }) => {}
+        other => panic!("expected Validate failure for regular file fd, got {other:?}"),
+    }
+}
+
+/// A regular interlock fd (without F_SEAL_FUTURE_WRITE) is rejected by interlock_map_clock.
+#[test]
+fn interlock__map_clock_rejects_non_clock_fd() {
+    let h = interlock_create().expect("create");
+    let dup = interlock_dup_fd(&h).expect("dup");
+    match interlock_map_clock(dup) {
+        Err(Condition::AllocationFailed {
+            step: AllocationStep::Validate,
+            ..
+        }) => {}
+        other => panic!(
+            "expected Validate failure for non-clock fd passed to map_clock, got {other:?}"
+        ),
+    }
+}
+
+/// interlock_extend on a lapsed deadline returns InterlockReaped and writes SENTINEL.
+#[test]
+fn interlock__extend_on_lapsed_deadline_terminates_and_returns_reaped() {
+    let h = interlock_create().expect("create");
+    h.words()
+        .expiration_ns
+        .store(1, Ordering::Release);
+    let r = interlock_extend(&h, 500 * MS);
+    assert_eq!(
+        r,
+        Err(Condition::InterlockReaped),
+        "extend on a lapsed deadline returned {r:?}"
+    );
+    assert_eq!(
+        interlock_read_expiration(&h),
+        SENTINEL,
+        "extend did not write SENTINEL on a lapsed interlock"
+    );
+    assert!(
+        interlock_is_terminated(&h),
+        "interlock not terminated after extend on lapsed deadline"
+    );
+}
+
+/// interlock_extend on SENTINEL returns InterlockReaped without modifying the word.
+#[test]
+fn interlock__extend_on_sentinel_returns_reaped() {
+    let h = interlock_create().expect("create");
+    h.words()
+        .expiration_ns
+        .store(SENTINEL, Ordering::Release);
+    let r = interlock_extend(&h, 100 * MS);
+    assert_eq!(
+        r,
+        Err(Condition::InterlockReaped),
+        "extend on SENTINEL returned {r:?}"
+    );
+    assert_eq!(interlock_read_expiration(&h), SENTINEL);
+}
+
+/// interlock_extend on a live deadline extends it, same as interlock_arm.
+#[test]
+fn interlock__extend_on_live_deadline_extends() {
+    let h = interlock_create().expect("create");
+    let before = monotonic_now_nanos();
+    interlock_extend(&h, 500 * MS).expect("extend");
+    let exp = interlock_read_expiration(&h);
+    assert!(
+        exp >= before + 500 * MS,
+        "extend did not advance: exp={exp} expected >= {}",
+        before + 500 * MS
+    );
+}
+
+/// interlock_extend never decrements.
+#[test]
+fn interlock__extend_never_decrements() {
+    let h = interlock_create().expect("create");
+    interlock_extend(&h, 500 * MS).expect("extend 500");
+    let e1 = interlock_read_expiration(&h);
+    interlock_extend(&h, 10 * MS).expect("extend 10");
+    let e2 = interlock_read_expiration(&h);
+    assert_eq!(e2, e1, "extend 10 ms moved expiration from {e1} to {e2}");
 }

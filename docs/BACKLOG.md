@@ -49,11 +49,12 @@ Non-isolated operation is best-effort and explicitly out of contract.
 
 **When:** when `WaitRace` polling shows up in a profile.
 
-### WaitCounter waits cannot see a dead daemon under Error policy
+### ~~WaitCounter waits cannot see a dead daemon under Error policy~~ (resolved)
 
-Under `TimeoutPolicy::Abort` (default) the keepalive aborts the process within the clock's TTL (100 ms) plus one keepalive interval (40 ms), so a dead daemon is detected. Under `TimeoutPolicy::Error`, `WaitCounter` is the one wait tier built without the clock handle. `wait_until` checks its own words for the sentinel, but a dead daemon neither reaps nor delivers, so every wait returns `Timeout` forever. Fix: `WaitCounter` carries the clock, as `WaitTimer` does, and `wait_until` checks it on every loop. Until then an Error-policy consumer polls: Convoy's rider waits in 100 ms slices and, on each timeout, runs a zero-time `wait_close_for` on the watched interlock to reach the clock check.
-
-**When:** before a second `TimeoutPolicy::Error` consumer relies on a WaitCounter alone for liveness.
+Resolved: `WaitCounter` now carries the daemon clock handle, and `wait_until` checks it on
+every loop iteration (including the zero-timeout path) via `check_live`. `WaitRace::wait`
+checks each member's clock on every pass via `is_clock_dead`. Both return
+`InterlockReaped` when the clock's expiration is `SENTINEL` or earlier than now.
 
 ### Boolean compositions
 
@@ -80,8 +81,6 @@ The gate is fmt, clippy, build, and test on `ubuntu-24.04`. Missing: an aarch64 
 **When:** before a second contributor or a CI-gated merge policy.
 
 ## Known defects (narrow, deferred for v0)
-
-- **Descriptor exhaustion spins the accept loop.** `try_accept` error leaves the listener in the pollset with POLLIN asserted; the daemon busy-loops. Requires exhausting the fd table.
 
 - **Startup probe blocks on a full socket backlog.** `probe_socket` uses a blocking `UnixStream::connect` with no timeout. If the daemon's accept queue is full (a stalled daemon with many queued clients), a new instance's startup probe hangs indefinitely. A non-blocking connect with a 1 to 2 second poll timeout would bound it. The EACCES/unlink half of this issue was fixed in the daemon-hardening sprint (probe now refuses on EACCES instead of unlinking).
 - **Decoders accept trailing bytes.** `decode_request`/`decode_response` do not check the cursor consumed the full payload.

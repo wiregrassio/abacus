@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use abacus_daemon::daemon::{daemon_run_with, DaemonConfig};
-use abacus_daemon::registry::DEFAULT_MAX_INTERLOCKS;
+use abacus_daemon::daemon::{daemon_run_with, DaemonConfig, DEFAULT_MAX_CLIENTS};
+use abacus_daemon::registry::{DEFAULT_MAX_INTERLOCKS, DEFAULT_MAX_WATCH_EDGES};
 
 const DEFAULT_SOCKET_PATH: &str = "/run/abacus/abacus.sock";
 
@@ -66,12 +66,15 @@ fn install_stop_handlers() -> Result<(), i32> {
 fn usage() -> String {
     format!(
         "usage: abacus [--socket-path PATH] [--socket-mode OCTAL] [--socket-group NAME]\n\
-         \x20             [--max-interlocks N] [--help] [--version]\n\
+         \x20             [--max-interlocks N] [--max-watch-edges N] [--max-clients N]\n\
+         \x20             [--help] [--version]\n\
          \n\
          \x20 --socket-path PATH     UDS path to listen on (default {DEFAULT_SOCKET_PATH})\n\
          \x20 --socket-mode OCTAL    permission bits for the socket file (default 0660)\n\
          \x20 --socket-group NAME    group to chown the socket file to (default: unchanged)\n\
          \x20 --max-interlocks N     registry cap, excluding the clock (default {DEFAULT_MAX_INTERLOCKS})\n\
+         \x20 --max-watch-edges N    total watch-edge budget across all entries (default {DEFAULT_MAX_WATCH_EDGES})\n\
+         \x20 --max-clients N        connection cap (default {DEFAULT_MAX_CLIENTS})\n\
          \n\
          Flags take either `--flag value` or `--flag=value`."
     )
@@ -95,7 +98,8 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Option<DaemonConfig
                 println!("abacus {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
-            "--socket-path" | "--socket-mode" | "--socket-group" | "--max-interlocks" => {
+            "--socket-path" | "--socket-mode" | "--socket-group" | "--max-interlocks"
+            | "--max-watch-edges" | "--max-clients" => {
                 let value = match inline_value {
                     Some(v) => v,
                     None => iter
@@ -114,6 +118,16 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Option<DaemonConfig
                     "--max-interlocks" => {
                         config.max_interlocks = value.parse::<usize>().map_err(|_| {
                             format!("--max-interlocks expects an integer, got {value}")
+                        })?;
+                    }
+                    "--max-watch-edges" => {
+                        config.max_watch_edges = value.parse::<usize>().map_err(|_| {
+                            format!("--max-watch-edges expects an integer, got {value}")
+                        })?;
+                    }
+                    "--max-clients" => {
+                        config.max_clients = value.parse::<usize>().map_err(|_| {
+                            format!("--max-clients expects an integer, got {value}")
                         })?;
                     }
                     _ => unreachable!(),
@@ -140,6 +154,8 @@ mod tests {
         assert_eq!(c.socket_mode, 0o660);
         assert_eq!(c.socket_group, None);
         assert_eq!(c.max_interlocks, DEFAULT_MAX_INTERLOCKS);
+        assert_eq!(c.max_watch_edges, DEFAULT_MAX_WATCH_EDGES);
+        assert_eq!(c.max_clients, DEFAULT_MAX_CLIENTS);
     }
 
     #[test]
@@ -166,6 +182,24 @@ mod tests {
     fn help_and_version_short_circuit() {
         assert!(parse(&["--help"]).unwrap().is_none());
         assert!(parse(&["--version"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn max_clients_flag() {
+        let a = parse(&["--max-clients=128"]).unwrap().unwrap();
+        let b = parse(&["--max-clients", "128"]).unwrap().unwrap();
+        assert_eq!(a.max_clients, 128);
+        assert_eq!(b.max_clients, 128);
+        assert!(parse(&["--max-clients", "abc"]).is_err());
+    }
+
+    #[test]
+    fn max_watch_edges_flag() {
+        let a = parse(&["--max-watch-edges=1024"]).unwrap().unwrap();
+        let b = parse(&["--max-watch-edges", "1024"]).unwrap().unwrap();
+        assert_eq!(a.max_watch_edges, 1024);
+        assert_eq!(b.max_watch_edges, 1024);
+        assert!(parse(&["--max-watch-edges", "abc"]).is_err());
     }
 
     #[test]

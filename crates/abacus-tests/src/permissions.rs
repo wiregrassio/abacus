@@ -110,3 +110,25 @@ pub fn wait_timer__has_no_close() {}
 /// fn f(c: &mut abacus_client::AbacusClient) { let _ = c.attach_wait_timer("t"); }
 /// ```
 pub fn client__has_no_attach_wait_timer() {}
+
+/// Write discipline: `Interlock::handle()` is `pub(crate)`. External code cannot bypass the
+/// typed API to reach the writable `InterlockHandle`.
+///
+/// ```compile_fail,E0624
+/// fn f(i: &abacus_client::Interlock) { let _ = i.handle(); }
+/// ```
+pub fn interlock__handle_is_crate_private() {}
+
+/// Write discipline: `AttachedInterlock::handle()` is `pub(crate)`.
+///
+/// ```compile_fail,E0624
+/// fn f(a: &abacus_client::AttachedInterlock) { let _ = a.handle(); }
+/// ```
+pub fn attached__handle_is_crate_private() {}
+
+/// Write discipline: `AttachedWaitCounter::handle()` is `pub(crate)`.
+///
+/// ```compile_fail,E0624
+/// fn f(c: &abacus_client::AttachedWaitCounter) { let _ = c.handle(); }
+/// ```
+pub fn attached_wait_counter__handle_is_crate_private() {}

@@ -257,9 +257,9 @@ fn abuse__request_burst_does_not_stall_the_loop() {
         }
     }
     let burst = t0.elapsed();
-    let seen = clock.words().open_count.load(Ordering::Acquire);
+    let seen = clock.load_open();
     let gap = wait_for(Duration::from_secs(30), Duration::from_micros(200), || {
-        clock.words().open_count.load(Ordering::Acquire) > seen
+        clock.load_open() > seen
     });
     let gap = match gap {
         Ok(g) => g,

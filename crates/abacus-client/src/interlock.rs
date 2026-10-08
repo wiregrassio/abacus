@@ -2,7 +2,10 @@
 
 use std::time::Duration;
 
-use abacus_core::interlock::{interlock_free, interlock_is_terminated, InterlockHandle, SENTINEL};
+use abacus_core::interlock::{
+    interlock_free, interlock_is_terminated, InterlockHandle, ReadOnlyInterlockHandle,
+    SENTINEL,
+};
 
 use crate::client::SdkError;
 use crate::handle_ops::{self, Word};
@@ -12,7 +15,7 @@ use crate::types::{default_touch_ttl_ms, InterlockState, DEFAULT_TOUCH_INTERVAL_
 /// An interlock created by this client. Read and write on both counters and expiration.
 pub struct Interlock {
     handle: InterlockHandle,
-    clock: InterlockHandle,
+    clock: ReadOnlyInterlockHandle,
     keepalive: Keepalive,
     touch: Option<TouchHandle>,
 }
@@ -20,7 +23,7 @@ pub struct Interlock {
 impl Interlock {
     pub(crate) fn new(
         handle: InterlockHandle,
-        clock: InterlockHandle,
+        clock: ReadOnlyInterlockHandle,
         keepalive: Keepalive,
     ) -> Result<Self, SdkError> {
         let touch = Some(keepalive.register(
@@ -36,8 +39,9 @@ impl Interlock {
         })
     }
 
-    /// The underlying shared-memory handle.
-    pub fn handle(&self) -> &InterlockHandle {
+    /// The underlying shared-memory handle. Crate-internal: callers use typed methods
+    /// instead, which enforce write discipline.
+    pub(crate) fn handle(&self) -> &InterlockHandle {
         &self.handle
     }
 
@@ -143,12 +147,12 @@ impl Interlock {
 /// An interlock attached by name. Read and write on both counters; expiration read-only.
 pub struct AttachedInterlock {
     handle: InterlockHandle,
-    clock: InterlockHandle,
+    clock: ReadOnlyInterlockHandle,
     tier: u8,
 }
 
 impl AttachedInterlock {
-    pub(crate) fn new(handle: InterlockHandle, clock: InterlockHandle, tier: u8) -> Self {
+    pub(crate) fn new(handle: InterlockHandle, clock: ReadOnlyInterlockHandle, tier: u8) -> Self {
         Self {
             handle,
             clock,
@@ -156,8 +160,9 @@ impl AttachedInterlock {
         }
     }
 
-    /// The underlying shared-memory handle.
-    pub fn handle(&self) -> &InterlockHandle {
+    /// The underlying shared-memory handle. Crate-internal: callers use typed methods
+    /// instead, which enforce write discipline.
+    pub(crate) fn handle(&self) -> &InterlockHandle {
         &self.handle
     }
 
@@ -244,44 +249,47 @@ impl AttachedInterlock {
 }
 
 /// A read-only view of a WaitCounter, obtained via attach. No open, close, touch, wait, or
-/// free: the creator owns every mutation.
+/// free: the creator owns every mutation. The mapping is `PROT_READ`; a stray write faults.
 ///
 /// ```compile_fail
 /// # use abacus_client::AttachedWaitCounter;
 /// fn f(c: &AttachedWaitCounter) { c.open(1); }
 /// ```
 pub struct AttachedWaitCounter {
-    handle: InterlockHandle,
+    handle: ReadOnlyInterlockHandle,
 }
 
 impl AttachedWaitCounter {
-    pub(crate) fn new(handle: InterlockHandle) -> Self {
+    pub(crate) fn new(handle: ReadOnlyInterlockHandle) -> Self {
         Self { handle }
     }
 
-    /// The underlying shared-memory handle.
-    pub fn handle(&self) -> &InterlockHandle {
+    /// The underlying read-only shared-memory handle.
+    pub(crate) fn handle(&self) -> &ReadOnlyInterlockHandle {
         &self.handle
     }
 
     /// Read both counters: (open_count, closed_count).
     pub fn peek(&self) -> (u64, u64) {
-        handle_ops::peek(&self.handle)
+        let closed = self.handle.load_closed();
+        let open = self.handle.load_open();
+        (open, closed)
     }
 
     /// open_count minus closed_count, signed.
     pub fn value(&self) -> i64 {
-        handle_ops::value(&self.handle)
+        let (open, closed) = self.peek();
+        (open as i64).wrapping_sub(closed as i64)
     }
 
     /// The daemon's response: closed_count.
     pub fn completed_at(&self) -> u64 {
-        handle_ops::completed_at(&self.handle)
+        self.handle.load_closed()
     }
 
     /// True once any word reads SENTINEL.
     pub fn is_reaped(&self) -> bool {
-        interlock_is_terminated(&self.handle)
+        self.handle.is_terminated()
     }
 }
 
@@ -290,35 +298,35 @@ impl AttachedWaitCounter {
 /// open_count = current monotonic ms (every daemon cycle), closed_count = daemon start ms
 /// (set once), value = uptime ms.
 pub struct ClockHandle {
-    handle: InterlockHandle,
+    handle: ReadOnlyInterlockHandle,
 }
 
 impl ClockHandle {
-    pub(crate) fn new(handle: InterlockHandle) -> Self {
+    pub(crate) fn new(handle: ReadOnlyInterlockHandle) -> Self {
         Self { handle }
     }
 
     /// Read both words: (now_ms, start_time_ms).
     pub fn peek(&self) -> (u64, u64) {
-        handle_ops::peek(&self.handle)
+        let closed = self.handle.load_closed();
+        let open = self.handle.load_open();
+        (open, closed)
     }
 
     /// Uptime in milliseconds.
     pub fn value(&self) -> i64 {
-        handle_ops::value(&self.handle)
+        let (open, closed) = self.peek();
+        (open as i64).wrapping_sub(closed as i64)
     }
 
     /// Current monotonic time in milliseconds (open_count).
     pub fn now_ms(&self) -> u64 {
-        self.handle
-            .words()
-            .open_count
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.handle.load_open()
     }
 
     /// Daemon start time in monotonic milliseconds (closed_count).
     pub fn start_time_ms(&self) -> u64 {
-        handle_ops::completed_at(&self.handle)
+        self.handle.load_closed()
     }
 
     /// Uptime in milliseconds.
@@ -329,39 +337,27 @@ impl ClockHandle {
     /// Block until the clock reaches `target` ms. Returns `InterlockReaped` within one clock
     /// TTL (100 ms) of the daemon stopping.
     pub fn wait_open(&self, target: u64) -> Result<u64, SdkError> {
-        handle_ops::wait_word(&self.handle, Word::Open, target, None, &self.handle)
+        handle_ops::wait_word_clock(&self.handle, Word::Open, target, None)
             .map(|v| v.unwrap_or(target))
     }
 
     /// Block until closed_count >= target.
     pub fn wait_close(&self, target: u64) -> Result<u64, SdkError> {
-        handle_ops::wait_word(&self.handle, Word::Closed, target, None, &self.handle)
+        handle_ops::wait_word_clock(&self.handle, Word::Closed, target, None)
             .map(|v| v.unwrap_or(target))
     }
 
     /// Bounded `wait_open`. `Ok(None)` on timeout.
     pub fn wait_open_for(&self, target: u64, timeout: Duration) -> Result<Option<u64>, SdkError> {
-        handle_ops::wait_word(
-            &self.handle,
-            Word::Open,
-            target,
-            Some(timeout),
-            &self.handle,
-        )
+        handle_ops::wait_word_clock(&self.handle, Word::Open, target, Some(timeout))
     }
 
     /// Bounded `wait_close`. `Ok(None)` on timeout.
     pub fn wait_close_for(&self, target: u64, timeout: Duration) -> Result<Option<u64>, SdkError> {
-        handle_ops::wait_word(
-            &self.handle,
-            Word::Closed,
-            target,
-            Some(timeout),
-            &self.handle,
-        )
+        handle_ops::wait_word_clock(&self.handle, Word::Closed, target, Some(timeout))
     }
 
-    pub(crate) fn handle(&self) -> &InterlockHandle {
+    pub(crate) fn handle(&self) -> &ReadOnlyInterlockHandle {
         &self.handle
     }
 }

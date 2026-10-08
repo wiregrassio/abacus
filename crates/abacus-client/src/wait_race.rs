@@ -1,16 +1,19 @@
 //! WaitRace: SDK-only first-of-N over WaitCounters. Polls every 1 ms, the daemon's delivery
-//! cadence. The daemon-side replacement is WaitOr in wire v2.
+//! cadence.
 
 use std::time::Duration;
 
+use abacus_core::clock::{monotonic_now_nanos, ms_to_nanos};
+
 use crate::client::SdkError;
-use crate::types::{classify_wake, WaitResult, WaitState};
+use crate::types::{classify_wake, WaitResult};
 use crate::wait_counter::WaitCounter;
 
 /// Watches N WaitCounters and returns the first to fire.
 ///
-/// Set each counter's target first (`wait_until` from its own thread, or by writing
-/// open_count), then call `wait`. Polling costs one wake per millisecond per race.
+/// Each counter's target must already be set (via `wait_until` with a zero timeout, or by
+/// writing `open_count` directly) before calling `wait`. A counter that is already delivered
+/// on entry (closed_count >= open_count) wins immediately.
 pub struct WaitRace {
     counters: Vec<WaitCounter>,
 }
@@ -21,31 +24,35 @@ impl WaitRace {
         Self { counters }
     }
 
-    /// Poll until one counter's closed_count advances past its snapshot at entry. Returns
-    /// its index and result. `Err(InterlockReaped)` as soon as any counter is terminated.
-    pub fn wait(&self) -> Result<(usize, WaitResult), SdkError> {
+    /// Poll until one counter is delivered (`closed_count >= open_count`) or `timeout_ms`
+    /// elapses. Returns `Ok(Some((index, result)))` for the first delivered counter,
+    /// `Ok(None)` on timeout, or `Err(InterlockReaped)` if any counter is terminated or
+    /// the daemon clock lapses. `timeout_ms == 0` polls once and returns.
+    pub fn wait(&self, timeout_ms: u64) -> Result<Option<(usize, WaitResult)>, SdkError> {
         if self.counters.is_empty() {
             return Err(SdkError::InvalidRequest {
                 message: "WaitRace over zero counters".to_string(),
             });
         }
-        let initial: Vec<u64> = self.counters.iter().map(|c| c.peek().1).collect();
+        let deadline_ns = monotonic_now_nanos().saturating_add(ms_to_nanos(timeout_ms));
         loop {
             for (i, counter) in self.counters.iter().enumerate() {
-                if counter.is_reaped() {
+                if counter.is_reaped() || counter.is_clock_dead() {
                     return Err(SdkError::InterlockReaped);
                 }
                 let (open, closed) = counter.peek();
-                if closed > initial[i] {
-                    let state = classify_wake(open, closed).unwrap_or(WaitState::Timeout);
-                    return Ok((
+                if let Some(state) = classify_wake(open, closed) {
+                    return Ok(Some((
                         i,
                         WaitResult {
                             completed_at: closed,
                             state,
                         },
-                    ));
+                    )));
                 }
+            }
+            if monotonic_now_nanos() >= deadline_ns {
+                return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(1));
         }

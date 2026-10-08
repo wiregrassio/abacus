@@ -5,13 +5,16 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use abacus_core::clock::{futex_wait, futex_word, monotonic_now_nanos, ms_to_nanos};
+use abacus_core::clock::{
+    classify_futex_result, futex_wait, futex_word, monotonic_now_nanos, ms_to_nanos, FutexOutcome,
+};
 use abacus_core::interlock::{
-    interlock_arm, interlock_free, interlock_is_terminated, InterlockHandle, SENTINEL,
+    interlock_extend, interlock_free, interlock_is_terminated, InterlockHandle,
+    ReadOnlyInterlockHandle, SENTINEL,
 };
 
 use crate::client::SdkError;
-use crate::handle_ops;
+use crate::handle_ops::{self, check_live};
 use crate::touch::{Keepalive, TouchHandle};
 use crate::types::{
     classify_wake, default_touch_ttl_ms, TimeoutPolicy, WaitResult, WaitState,
@@ -19,14 +22,15 @@ use crate::types::{
 };
 
 /// A WaitTimer. `wait_ms(W)` targets clock + W and gives the daemon
-/// `max(2 * W, min_fatal_margin_ms)` to deliver.
+/// `W + max(W, min_fatal_margin_ms)` to deliver, so the delivery-lateness tolerance is
+/// always at least `min_fatal_margin_ms`.
 ///
 /// One waiter at a time: a wait started while another is in progress on the same timer
 /// returns `InvalidRequest`. `peek`, `is_reaped`, and `completed_at` may be called from any
 /// thread during a wait.
 pub struct WaitTimer {
     handle: InterlockHandle,
-    clock: InterlockHandle,
+    clock: ReadOnlyInterlockHandle,
     touch: Option<TouchHandle>,
     policy: TimeoutPolicy,
     min_margin_ms: u64,
@@ -37,7 +41,7 @@ pub struct WaitTimer {
 impl WaitTimer {
     pub(crate) fn new(
         handle: InterlockHandle,
-        clock: InterlockHandle,
+        clock: ReadOnlyInterlockHandle,
         keepalive: &Keepalive,
         policy: TimeoutPolicy,
         min_margin_ms: u64,
@@ -62,9 +66,9 @@ impl WaitTimer {
         self.policy
     }
 
-    /// The margin `wait_ms(ms)` uses: `max(2 * ms, min_fatal_margin_ms)`.
+    /// The margin `wait_ms(ms)` uses: `ms + max(ms, min_fatal_margin_ms)`.
     pub fn margin_for(&self, ms: u64) -> u64 {
-        ms.saturating_mul(2).max(self.min_margin_ms)
+        ms.saturating_add(ms.max(self.min_margin_ms))
     }
 
     /// Wait `ms` milliseconds from the current clock. Margin is `margin_for(ms)`.
@@ -84,7 +88,7 @@ impl WaitTimer {
     /// is terminated before delivery. `Err(InvalidRequest)` if another wait is in progress on
     /// this timer.
     pub fn wait_ms_with_margin(&self, ms: u64, margin_ms: u64) -> Result<WaitResult, SdkError> {
-        let clock_now = self.clock.words().open_count.load(Ordering::Acquire);
+        let clock_now = self.clock.load_open();
         self.wait_from(clock_now, ms, margin_ms)
     }
 
@@ -95,9 +99,7 @@ impl WaitTimer {
         }
 
         if ms == 0 {
-            if interlock_is_terminated(&self.handle) {
-                return Err(SdkError::InterlockReaped);
-            }
+            check_live(&self.handle, Some(&self.clock), monotonic_now_nanos())?;
             return Ok(WaitResult {
                 completed_at: clock_now,
                 state: WaitState::Normal,
@@ -130,11 +132,13 @@ impl WaitTimer {
 
         // TTL and deadline are the same number: the interlock outlives the wait.
         let margin_ns = ms_to_nanos(margin_ms);
-        interlock_arm(&self.handle, margin_ns).map_err(SdkError::from)?;
+        interlock_extend(&self.handle, margin_ns).map_err(SdkError::from)?;
         let deadline_ns = monotonic_now_nanos().saturating_add(margin_ns);
 
         let closed_word = &words.closed_count;
         loop {
+            let now_ns = monotonic_now_nanos();
+            check_live(&self.handle, Some(&self.clock), now_ns)?;
             let closed = closed_word.load(Ordering::Acquire);
             let open = words.open_count.load(Ordering::Acquire);
             if closed == SENTINEL || open == SENTINEL {
@@ -146,18 +150,16 @@ impl WaitTimer {
                     state,
                 });
             }
-            let exp = words.expiration_ns.load(Ordering::Acquire);
-            if exp == SENTINEL {
-                return Err(SdkError::InterlockReaped);
-            }
-            let now_ns = monotonic_now_nanos();
             if now_ns >= deadline_ns {
-                if exp < now_ns {
-                    return Err(SdkError::InterlockReaped);
-                }
                 return self.on_timeout(ms, margin_ms, target, open, closed);
             }
-            let _ = futex_wait(closed_word, futex_word(closed), deadline_ns - now_ns);
+            if let FutexOutcome::Fatal(errno) = classify_futex_result(futex_wait(
+                closed_word,
+                futex_word(closed),
+                deadline_ns - now_ns,
+            )) {
+                return Err(SdkError::FutexFailed { errno });
+            }
         }
     }
 
@@ -185,7 +187,7 @@ impl WaitTimer {
     /// Wait until an absolute clock time: `wait_ms(timestamp_ms - clock_now)` from a single
     /// clock read, returning at once if the time is past.
     pub fn wait_until(&self, timestamp_ms: u64) -> Result<WaitResult, SdkError> {
-        let clock_now = self.clock.words().open_count.load(Ordering::Acquire);
+        let clock_now = self.clock.load_open();
         let ms = timestamp_ms.saturating_sub(clock_now);
         self.wait_from(clock_now, ms, self.margin_for(ms))
     }
@@ -242,14 +244,14 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    /// A timer over a fake clock frozen at 1000 ms. No daemon: nothing is ever delivered, so
-    /// every non-zero wait under `TimeoutPolicy::Error` ends in `DeliveryTimeout`.
+    /// A timer over a fake clock frozen at 1000 ms. No daemon and no clock expiration set,
+    /// so every non-zero wait detects the lapsed clock and ends in `InterlockReaped`.
     fn local_timer(policy: TimeoutPolicy) -> (WaitTimer, InterlockHandle, Keepalive) {
         let k = Keepalive::new();
         let h = interlock_create().unwrap();
         let clock = interlock_create().unwrap();
         clock.words().open_count.store(1000, Ordering::Release);
-        let t = WaitTimer::new(h.clone(), clock, &k, policy, 50).unwrap();
+        let t = WaitTimer::new(h.clone(), clock.into(), &k, policy, 100).unwrap();
         (t, h, k)
     }
 
@@ -269,8 +271,8 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(matches!(t.wait_ms(5), Err(SdkError::InvalidRequest { .. })));
-        assert_eq!(first.join().unwrap(), Err(SdkError::DeliveryTimeout));
-        assert_eq!(t.wait_ms_with_margin(5, 20), Err(SdkError::DeliveryTimeout));
+        assert_eq!(first.join().unwrap(), Err(SdkError::InterlockReaped));
+        assert_eq!(t.wait_ms_with_margin(5, 20), Err(SdkError::InterlockReaped));
     }
 
     #[test]
@@ -278,10 +280,10 @@ mod tests {
         let (t, h, _k) = local_timer(TimeoutPolicy::Error);
         assert_eq!(
             t.wait_ms_with_margin(100, 150),
-            Err(SdkError::DeliveryTimeout)
+            Err(SdkError::InterlockReaped)
         );
         assert_eq!(h.words().open_count.load(Ordering::Acquire), 1100);
-        assert_eq!(t.wait_ms_with_margin(5, 20), Err(SdkError::DeliveryTimeout));
+        assert_eq!(t.wait_ms_with_margin(5, 20), Err(SdkError::InterlockReaped));
         assert_eq!(
             h.words().open_count.load(Ordering::Acquire),
             1005,
@@ -292,7 +294,7 @@ mod tests {
     #[test]
     fn wait_until_targets_the_timestamp() {
         let (t, h, _k) = local_timer(TimeoutPolicy::Error);
-        assert_eq!(t.wait_until(1010), Err(SdkError::DeliveryTimeout));
+        assert_eq!(t.wait_until(1010), Err(SdkError::InterlockReaped));
         assert_eq!(h.words().open_count.load(Ordering::Acquire), 1010);
     }
 }

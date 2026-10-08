@@ -3,11 +3,15 @@
 
 use std::sync::atomic::Ordering;
 
-use abacus_core::clock::{futex_wait, futex_word, monotonic_now_nanos};
-use abacus_core::interlock::{interlock_free, interlock_is_terminated, InterlockHandle, SENTINEL};
+use abacus_core::clock::{
+    classify_futex_result, futex_wait, futex_word, monotonic_now_nanos, FutexOutcome,
+};
+use abacus_core::interlock::{
+    interlock_free, interlock_is_terminated, InterlockHandle, ReadOnlyInterlockHandle, SENTINEL,
+};
 
 use crate::client::SdkError;
-use crate::handle_ops::{self, Word};
+use crate::handle_ops::{self, check_live, Word};
 use crate::touch::{Keepalive, TouchHandle};
 use crate::types::{
     default_touch_ttl_ms, WaitResult, WaitState, DEFAULT_TIMEOUT_NANOS, DEFAULT_TOUCH_INTERVAL_MS,
@@ -17,14 +21,14 @@ use crate::types::{
 /// closed_count == open_count.
 pub struct WaitBarrier {
     handle: InterlockHandle,
-    clock: InterlockHandle,
+    clock: ReadOnlyInterlockHandle,
     touch: Option<TouchHandle>,
 }
 
 impl WaitBarrier {
     pub(crate) fn new(
         handle: InterlockHandle,
-        clock: InterlockHandle,
+        clock: ReadOnlyInterlockHandle,
         keepalive: &Keepalive,
     ) -> Result<Self, SdkError> {
         let touch = Some(keepalive.register(
@@ -47,13 +51,15 @@ impl WaitBarrier {
         let words = self.handle.words();
         let closed_word = &words.closed_count;
         loop {
+            let now = monotonic_now_nanos();
+            check_live(&self.handle, Some(&self.clock), now)?;
             let closed = closed_word.load(Ordering::Acquire);
             let open = words.open_count.load(Ordering::Acquire);
             if closed == SENTINEL || open == SENTINEL {
                 return Err(SdkError::InterlockReaped);
             }
             if closed >= open {
-                let clock_now = self.clock.words().open_count.load(Ordering::Acquire);
+                let clock_now = self.clock.load_open();
                 if clock_now == SENTINEL {
                     return Err(SdkError::InterlockReaped);
                 }
@@ -62,19 +68,13 @@ impl WaitBarrier {
                     state: WaitState::Normal,
                 });
             }
-            let now = monotonic_now_nanos();
-            let exp = words.expiration_ns.load(Ordering::Acquire);
-            if exp == SENTINEL || exp < now {
-                return Err(SdkError::InterlockReaped);
+            if let FutexOutcome::Fatal(errno) = classify_futex_result(futex_wait(
+                closed_word,
+                futex_word(closed),
+                DEFAULT_TIMEOUT_NANOS,
+            )) {
+                return Err(SdkError::FutexFailed { errno });
             }
-            // Check the daemon-owned clock's expiration. The client keepalive cannot re-arm
-            // the clock (it is read-only), so after daemon death this fires within one clock TTL.
-            let clock_exp = self.clock.words().expiration_ns.load(Ordering::Acquire);
-            // A terminated daemon clock (SENTINEL) is dead, not alive.
-            if clock_exp == SENTINEL || clock_exp < now {
-                return Err(SdkError::InterlockReaped);
-            }
-            let _ = futex_wait(closed_word, futex_word(closed), DEFAULT_TIMEOUT_NANOS);
         }
     }
 

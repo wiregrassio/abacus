@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use abacus_client::{AbacusClient, TimeoutPolicy};
 use abacus_core::error::{ProtocolFault, TransportError};
-use abacus_core::interlock::{interlock_map, interlock_map_clock, InterlockHandle};
+use abacus_core::interlock::{
+    interlock_map, interlock_map_clock, InterlockHandle, ReadOnlyInterlockHandle,
+};
 use abacus_daemon::daemon::{daemon_run_with, DaemonConfig};
 use abacus_wire::{
     decode_response, encode_request, read_exact, recv_prefix_with_fds, Request, Response,
@@ -564,6 +566,9 @@ impl Drop for ProcessDaemon {
         }
         let _ = std::fs::remove_file(&self.path);
         let _ = std::fs::remove_file(&self.stderr_path);
+        let mut hb = self.path.as_os_str().to_os_string();
+        hb.push(".heartbeat");
+        let _ = std::fs::remove_file(PathBuf::from(hb));
     }
 }
 
@@ -1485,7 +1490,7 @@ pub fn map_fd(fd: OwnedFd) -> InterlockHandle {
 }
 
 /// Map a received clock fd read-only. The clock is sealed against writable mappings.
-pub fn map_fd_readonly(fd: OwnedFd) -> InterlockHandle {
+pub fn map_fd_readonly(fd: OwnedFd) -> ReadOnlyInterlockHandle {
     interlock_map_clock(fd)
         .unwrap_or_else(|e| panic!("mmap (read-only) of received fd failed: {e}"))
 }
@@ -1500,6 +1505,15 @@ pub fn interlock_words(handle: &InterlockHandle) -> (u64, u64, u64) {
     )
 }
 
+/// Read all three words from a read-only handle: (open_count, closed_count, expiration_ns).
+pub fn interlock_words_readonly(handle: &ReadOnlyInterlockHandle) -> (u64, u64, u64) {
+    (
+        handle.load_open(),
+        handle.load_closed(),
+        handle.load_expiration(),
+    )
+}
+
 /// Attach to `name` through a fresh raw connection and return a read-write mapped handle.
 /// This is how a test reads all three words of an SDK-owned interlock (the SDK exposes
 /// only two). For the clock, use [`attach_words_readonly`].
@@ -1508,8 +1522,16 @@ pub fn attach_words(socket: &Path, name: &str) -> InterlockHandle {
 }
 
 /// Attach to the clock (or any read-only interlock) and return a read-only mapped handle.
-pub fn attach_words_readonly(socket: &Path, name: &str) -> InterlockHandle {
-    attach_words_with(socket, name, map_fd_readonly)
+pub fn attach_words_readonly(socket: &Path, name: &str) -> ReadOnlyInterlockHandle {
+    let mut raw = RawClient::connect(socket)
+        .unwrap_or_else(|e| panic!("raw connect to {} failed: {e}", socket.display()));
+    match raw.attach(name) {
+        Ok((RawResponse::Attached { .. }, mut fds)) if fds.len() == 1 => {
+            map_fd_readonly(fds.remove(0))
+        }
+        Ok((resp, fds)) => panic!("attach {name}: unexpected {resp:?} with {} fds", fds.len()),
+        Err(e) => panic!("attach {name} failed: {e}"),
+    }
 }
 
 fn attach_words_with(

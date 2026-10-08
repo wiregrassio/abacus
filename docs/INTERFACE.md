@@ -21,12 +21,13 @@ send length-prefixed frames, and receive one response per request.
 | Connection lifetime | Persistent. Many requests per connection, served in arrival order. | `daemon::service_client` loop over `Connection::next_request` |
 | Pipelining | Allowed. All frames already buffered are decoded and answered in one service pass. | `framing::FrameReader::next_frame`, `daemon::service_client` |
 | Accept mode | Listener and accepted connections are nonblocking. | `transport::Server::create`, `daemon::daemon_run_with` |
-| Client transport timeout | Default 1 s read and write timeout; `EAGAIN` is remapped to `ETIMEDOUT`. | `client::ClientConn::connect`, `client::ClientConn::map_timeout`, `types::DEFAULT_TRANSPORT_TIMEOUT` |
+| Connection cap | At most `--max-clients` (default 256) live connections. At the cap or under descriptor pressure, the listener stops polling until a client disconnects. At most 64 connections accepted per cycle. | `daemon::daemon_run_with`, `daemon::DaemonConfig::max_clients`, `daemon::MAX_ACCEPT_PER_CYCLE` |
+| Client transport timeout | Default 1 s connect, read, and write timeout; `SO_SNDTIMEO` and `SO_RCVTIMEO` are set before the blocking connect, so the connect itself is bounded. `EAGAIN` is remapped to `ETIMEDOUT` in both the connect path and `map_timeout`. | `client::connect_unix_with_timeout`, `client::ClientConn::connect`, `client::ClientConn::map_timeout`, `types::DEFAULT_TRANSPORT_TIMEOUT` |
 | Descriptor cardinality | Client rejects a response carrying more or fewer descriptors than `expected_fd_count`. | `client::ClientConn::recv_response`, `client::extract_single_fd` |
 | Protocol fault | Daemon logs one line, sends `Error { ERR_INVALID_REQUEST }`, then drops the connection. | `daemon::service_client` |
 | Peer EOF | Remaining buffered requests are answered, then the connection is dropped. | `daemon::service_client` (`closing` path) |
 | Unwritable response | Write errors in the connection-error set (`EPIPE`, `ECONNRESET`, `EAGAIN`, `ENOTCONN`) drop the client without a log line. | `daemon::is_connection_error`, `daemon::service_client` |
-| Socket file on start | A live socket at the path is refused; a stale socket file is replaced; a non-socket file is refused. | `transport::Server::create`, `transport::probe_connect_succeeds`, `transport::is_socket_file` |
+| Socket file on start | A live socket at the path is refused (`SocketPathOccupied`); a probe error refuses with the errno (`Io { Connect, errno }`); a stale socket file is replaced; a non-socket file is refused. | `transport::Server::create`, `transport::probe_socket`, `transport::is_socket_file` |
 | Socket file on stop | Removed when the `Server` is dropped. | `transport::Server::drop` |
 | Socket permissions | Mode applied after bind (default `0o660`); optional group chown. | `transport::Server::apply_socket_options`, `daemon::DaemonConfig::new` |
 
@@ -53,6 +54,12 @@ AbacusClient::connect(socket_path: &Path, clock_name: &str, dependencies: &[&str
     Connects, attaches the daemon clock, creates a tier 0 interlock named clock_name with
     the given dependencies and no owner, and binds the keepalive to it. Delegates to
     connect_with_timeout (client.rs::AbacusClient::connect).
+    clock_name identifies one live process. If another client already holds a ProcessClock
+    with this name, connecting reaps it: the holder aborts with ProcessClockReaped (or
+    reports it under TimeoutPolicy::Error), every entry the holder owns is reaped, and
+    every ProcessClock or entry that listed the name as a dependency is reaped too.
+    Dependencies are bound by registry id, so they do not move to the new holder. Enforced
+    by liveness__recreated_clock_aborts_the_old_process.
     Errors: SdkError::Transport(TransportError::Io { operation: IoOperation::Connect, .. })
     when the socket cannot be opened (client.rs::ClientConn::connect);
     SdkError::InterlockNotFound { name } when a dependency does not exist;
@@ -63,10 +70,14 @@ AbacusClient::connect(socket_path: &Path, clock_name: &str, dependencies: &[&str
 
 AbacusClient::connect_with_timeout(socket_path: &Path, clock_name: &str,
     dependencies: &[&str], timeout: Duration) -> Result<Self>
-    Connects, sets the same value as both socket read and write timeout, then attaches
+    Connects with SO_SNDTIMEO and SO_RCVTIMEO set before the blocking connect (so the
+    connect itself is bounded by timeout), then attaches
     "clock" through interlock_map_clock (read-only mapping), creates the ProcessClock,
     and binds the keepalive to it
     (client.rs::AbacusClient::connect_with_timeout).
+    clock_name identifies one live process. Connecting with a name held by another live
+    client reaps that client's ProcessClock and everything it owns or that depends on it
+    (see connect above).
     Errors: Transport Io with IoOperation::Connect or IoOperation::SetTimeout;
     Transport Io with errno rewritten from EAGAIN to ETIMEDOUT on any timed-out read or
     write (client.rs::ClientConn::map_timeout); Transport Protocol on frame or descriptor
@@ -78,16 +89,20 @@ AbacusClient::connect_with_timeout(socket_path: &Path, clock_name: &str,
     keepalive cannot bind the new ProcessClock for either reason, connect frees it first,
     so the daemon reaps it on its next pass (client.rs::bind_or_free).
     Default: TimeoutPolicy::Abort (types.rs::TimeoutPolicy default) and
-    min_fatal_margin_ms = MIN_FATAL_MARGIN_MS = 50 (types.rs::MIN_FATAL_MARGIN_MS).
+    min_fatal_margin_ms = MIN_FATAL_MARGIN_MS = 100 (types.rs::MIN_FATAL_MARGIN_MS).
 
 AbacusClient::connect_waiting(socket_path: &Path, clock_name: &str,
     dependencies: &[&str], max_wait: Duration) -> Result<Self>
-    Loops connect (default transport timeout). Retries on exactly two failures: a socket
-    connect that fails with ENOENT, ECONNREFUSED, or EACCES
+    Loops connect_with_timeout, each attempt capped at
+    min(DEFAULT_TRANSPORT_TIMEOUT, max_wait - elapsed). Each attempt carries the same
+    clock_name takeover semantics as connect_with_timeout: if another live client holds a
+    ProcessClock with this name, the first successful attempt reaps it.
+    Retries on exactly two failures: a
+    socket connect that fails with ENOENT, ECONNREFUSED, EACCES, or ETIMEDOUT
     (Transport(Io { operation: Connect, errno }), client.rs::retryable_connect_errno) and a
     missing dependency (InterlockNotFound). Any other connect errno, and every other error,
-    returns at once. Retry interval: CONNECT_RETRY_INTERVAL = 100 ms
-    (types.rs::CONNECT_RETRY_INTERVAL).
+    returns at once. Retry interval: CONNECT_RETRY_INTERVAL = 100 ms, also capped at the
+    remaining time (types.rs::CONNECT_RETRY_INTERVAL).
     Logging, on stderr, one line per distinct reason for the whole wait, never per retry:
     - "abacus: waiting up to <max_wait> for dependency \"<name>\""
     - "abacus: waiting up to <max_wait> for the Abacus daemon at <path>"
@@ -109,7 +124,7 @@ set_min_fatal_margin_ms(&mut self, margin_ms: u64)
 
 min_fatal_margin_ms(&self) -> u64
     Returns the floor (client.rs::AbacusClient::min_fatal_margin_ms).
-    Default: MIN_FATAL_MARGIN_MS = 50 (types.rs::MIN_FATAL_MARGIN_MS).
+    Default: MIN_FATAL_MARGIN_MS = 100 (types.rs::MIN_FATAL_MARGIN_MS).
 
 set_keepalive_priority(&self, priority: KeepalivePriority) -> Result<()>
     Sets the keepalive thread's scheduling with pthread_setschedparam: applied at once to
@@ -170,8 +185,9 @@ liveness(&self) -> Liveness
     Process liveness as last observed by the keepalive thread
     (client.rs::AbacusClient::liveness, touch.rs::Keepalive::liveness).
     Liveness::Alive until the keepalive finds the ProcessClock reaped
-    (Liveness::ProcessClockReaped) or the Abacus clock's expiration lapsed
-    (Liveness::DaemonClockLapsed) (types.rs::Liveness). Under TimeoutPolicy::Abort the
+    (Liveness::ProcessClockReaped), the Abacus clock's expiration lapsed
+    (Liveness::DaemonClockLapsed), or the keepalive thread panicked
+    (Liveness::KeepaliveFailed) (types.rs::Liveness). Under TimeoutPolicy::Abort the
     keepalive aborts the process first, so a caller only ever reads Alive; under
     TimeoutPolicy::Error the keepalive records the cause here and keeps running.
 
@@ -182,9 +198,12 @@ is_connected(&self) -> bool
     (client.rs::AbacusClient::is_connected).
 ```
 
-Transport timeout semantics: the value applies to each socket read and each socket write.
-A timed-out operation surfaces as `TransportError::Io { errno: ETIMEDOUT }` because
-`ClientConn::map_timeout` rewrites EAGAIN. A response payload longer than
+Transport timeout semantics: the value applies to the blocking connect, each socket read,
+and each socket write. The connect timeout is `SO_SNDTIMEO`, which on Linux bounds a
+blocking connect on a Unix domain socket when the listener's queue is full; a timed-out
+connect surfaces as `TransportError::Io { operation: Connect, errno: ETIMEDOUT }` (EAGAIN
+remapped by `connect_unix_with_timeout`). A timed-out read or write surfaces the same way
+because `ClientConn::map_timeout` rewrites EAGAIN. A response payload longer than
 `MAX_MESSAGE_SIZE` (4096, codec.rs::MAX_MESSAGE_SIZE) is rejected as
 `ProtocolFault::FrameTooLarge`, and a descriptor count that differs from
 `expected_fd_count` is rejected as `ProtocolFault::UnexpectedFd` or
@@ -223,7 +242,7 @@ function of `tier`.
 | Error | Cause | Enforced in |
 |---|---|---|
 | `Error { ERR_INVALID_REQUEST }` | tier not in 0..=4 | `daemon::handle_request` |
-| `Condition::InvalidRequest` | empty name, name over 255 bytes, name `clock`, live-count limit reached, missing tier field, `interval_ns` 0 or sub-millisecond, empty conditions list, `watched_word` not 0 or 1, owner or dependency names own name, `watched_name` or a condition name is own name | `registry::validate_name`, `registry::Registry::create`, `registry::WatchedWord::from_wire` |
+| `Condition::InvalidRequest` | empty name, name over 255 bytes, name `clock`, live-count limit reached, too many dependencies (over 64), too many barrier conditions (over 64), watch edge budget exceeded, missing tier field, `interval_ns` 0 or sub-millisecond, empty conditions list, `watched_word` not 0 or 1, owner or dependency names own name, `watched_name` or a condition name is own name | `registry::validate_name`, `registry::Registry::create`, `registry::WatchedWord::from_wire` |
 | `Condition::InterlockReaped` | owner name not found, owner id does not match, or owner not alive (gone, replaced, or lapsed) | `registry::Registry::create` |
 | `Condition::InterlockNotFound` | `watched_name`, any condition name, or any dependency name does not resolve or is not alive | `registry::Registry::resolve`, `registry::Registry::create`, `registry::Registry::target_alive` |
 
@@ -236,7 +255,7 @@ daemon calls to get the descriptor in the same call. Every validation, `interloc
 and the descriptor `dup` happen before any registry mutation, and the id is taken last, so a
 refused or failed create changes nothing: an existing entry of the same name survives and no
 id is consumed.
-| `Condition::AllocationFailed` | memfd create, ftruncate, seal, mmap, or dup failed | `interlock::interlock_create`, `interlock::interlock_dup_fd` |
+| `Condition::AllocationFailed` | memfd create, ftruncate, seal, validate, mmap, or dup failed | `interlock::interlock_create`, `interlock::validate_received_fd`, `interlock::interlock_dup_fd` |
 
 Creating over an existing live name is permitted: the old entry is reaped and removed, the
 new one takes the name with a strictly larger id (`registry::Registry::create` remove-slot
@@ -269,8 +288,8 @@ attach_interlock(&mut self, name: &str) -> Result<AttachedInterlock>
     ERR_INTERLOCK_NOT_FOUND; the other daemon error mappings.
 
 attach_wait_counter(&mut self, name: &str) -> Result<AttachedWaitCounter>
-    Attaches by name, checks the tier the daemon reports, and only then maps through
-    interlock_map_counter. Refuses any tier other than 1, before mapping, with
+    Attaches by name, checks the tier the daemon reports, and only then maps read-only
+    through interlock_map_readonly. Refuses any tier other than 1, before mapping, with
     SdkError::InvalidRequest { message: "\"<name>\" is tier <t>, not a WaitCounter" }
     (client.rs::AbacusClient::attach_wait_counter, client.rs::do_attach_request).
     Errors: same as attach_interlock without the reserved-name rejection, plus
@@ -327,7 +346,7 @@ Enforced in `interlock::interlock_create`, `interlock::CREATION_TTL_NANOS`,
 `registry::Registry::create` (per-tier match), `registry::next_grid_line`,
 `registry::Registry::with_limit`, `interlock::interlock_create_clock`.
 
-Client-side handles arm on construction: keepalive registration calls `interlock_arm` with
+Client-side handles arm on construction: keepalive registration calls `interlock_extend` with
 the touch TTL before returning (`touch::Keepalive::register_inner`). A `ProcessClock` also
 stamps both counters with the current clock millisecond, and refuses with `InterlockReaped`
 if either already reads `SENTINEL` (`process_clock::ProcessClock::new`).
@@ -340,7 +359,7 @@ if either already reads `SENTINEL` (`process_clock::ProcessClock::new`).
 |---|---|---|---|
 | open_count | Monotonic count of opens | Creator and attachers (`Interlock::open`, `AttachedInterlock::open`) | All handles, daemon |
 | closed_count | Monotonic count of closes | Creator and attachers (`Interlock::close`, `AttachedInterlock::close`) | All handles, daemon |
-| expiration_ns | Monotonic-clock deadline | Creator via `touch` or keepalive (`handle_ops::touch`, `interlock::interlock_arm`); daemon on reap | Daemon (`registry::Registry::evaluate_all`), SDK waiters |
+| expiration_ns | Monotonic-clock deadline | Creator via `touch` or keepalive (`handle_ops::touch`, `interlock::interlock_extend`); daemon on reap | Daemon (`registry::Registry::evaluate_all`), SDK waiters |
 
 ### SDK: Interlock (creator handle)
 
@@ -380,7 +399,8 @@ wait_open(&self, target: u64) -> Result<u64, SdkError>
     (handle_ops.rs::wait_word with timeout None).
     Errors: SdkError::InterlockReaped when the word is SENTINEL, when expiration_ns is
     SENTINEL, or when expiration_ns is in the past; likewise when the daemon clock's
-    expiration_ns is SENTINEL or in the past (the daemon is dead).
+    expiration_ns is SENTINEL or in the past (the daemon is dead);
+    SdkError::FutexFailed { errno } when the futex syscall fails permanently.
 
 wait_close(&self, target: u64) -> Result<u64, SdkError>
     Same on closed_count.
@@ -398,8 +418,9 @@ wait_close_for(&self, target: u64, timeout: Duration) -> Result<Option<u64>, Sdk
 
 touch(&self, ms: u64) -> Result<(), SdkError>
     Monotonic-forward CAS of expiration_ns to max(current, now + ms)
-    (handle_ops.rs::touch, interlock.rs::interlock_arm). A shorter TTL is a no-op.
-    Errors: SdkError::InterlockReaped when expiration_ns is SENTINEL.
+    (handle_ops.rs::touch, interlock.rs::interlock_extend). A shorter TTL is a no-op.
+    A lapsed deadline is terminated (SENTINEL written, waiters woken).
+    Errors: SdkError::InterlockReaped when expiration_ns is SENTINEL or lapsed.
 
 is_reaped(&self) -> bool
     True when any of the three words is SENTINEL, or when the registered touch handle
@@ -430,6 +451,11 @@ Sentinel-aware increments: `open` and `close` return `Result` precisely because 
 increment never writes a word already at SENTINEL, and an addition that would carry a live
 word onto or past SENTINEL stores SENTINEL instead; both report `InterlockReaped` rather
 than resurrecting a terminated interlock (handle_ops.rs::increment).
+
+Wait precedence: termination takes priority over delivery. Every wait loop checks
+liveness (any word at SENTINEL, expiration lapsed, daemon clock lapsed) before comparing
+the target. A wait on an already-reached target returns `InterlockReaped` when the
+interlock is terminated, not `Ok`. The shared gate is `handle_ops::check_live`.
 
 ### SDK: AttachedInterlock
 
@@ -475,7 +501,7 @@ crates/abacus-tests/src/permissions.rs (`attached__cannot_touch`,
 |---|---|---|---|
 | open_count | Target value on the watched word | Creator, CAS-max (`WaitCounter::wait_until`) | Daemon comparison |
 | closed_count | Watched value at delivery | Daemon only (`registry::Registry::evaluate_all`) | Creator, attached view (`AttachedWaitCounter::completed_at`) |
-| expiration_ns | Deadline, armed to `2 * timeout_ms` | Creator (`WaitCounter::wait_until` via `interlock_arm`), keepalive | Daemon |
+| expiration_ns | Deadline, armed to `2 * timeout_ms` | Creator (`WaitCounter::wait_until` via `interlock_extend`), keepalive | Daemon |
 
 ### SDK: WaitCounter (creator handle)
 
@@ -488,7 +514,7 @@ construction using `DEFAULT_TOUCH_INTERVAL_MS` and `default_touch_ttl_ms(40)` = 
 wait_until(&self, target: u64, timeout_ms: u64) -> Result<WaitResult, SdkError>
     CAS-max loop raises open_count to target, never lowering it: the loop breaks when
     target <= current (wait_counter.rs::WaitCounter::wait_until). Then arms the TTL with
-    interlock_arm(handle, timeout_nanos * 2) and futex-waits on closed_count against one
+    interlock_extend(handle, timeout_nanos * 2) and futex-waits on closed_count against one
     absolute deadline, now + timeout_ms: a wake short of delivery (spurious, EINTR, or a
     closed_count change below the target) sleeps only for what remains, never a fresh
     timeout. Returns WaitResult { completed_at: closed_count, state } where state comes
@@ -497,10 +523,13 @@ wait_until(&self, target: u64, timeout_ms: u64) -> Result<WaitResult, SdkError>
     WaitResult { completed_at, state: WaitState::Timeout }: a timeout is a WaitState, not
     an error. timeout_ms == 0 checks once and returns Timeout if nothing was delivered.
     Errors: SdkError::InterlockReaped when open_count, closed_count, or expiration_ns is
-    SENTINEL; SdkError::InterlockReaped from interlock_arm when expiration is already
-    SENTINEL.
-    TTL: 2x the timeout, applied monotonically forward by interlock_arm
-    (interlock.rs::interlock_arm).
+    SENTINEL, when the counter's own expiration has lapsed, or when the daemon clock's
+    expiration is SENTINEL or earlier than now (check_live with the clock, same test as
+    wait_word); SdkError::InterlockReaped from interlock_extend when expiration is already
+    SENTINEL or lapsed; SdkError::FutexFailed { errno } when the futex syscall fails
+    permanently.
+    TTL: 2x the timeout, applied monotonically forward by interlock_extend
+    (interlock.rs::interlock_extend).
 
 completed_at(&self) -> u64
     closed_count (handle_ops.rs::completed_at).
@@ -526,7 +555,7 @@ Absent: `close` (crates/abacus-tests/src/permissions.rs marker
 
 ### SDK: AttachedWaitCounter
 
-Read-only view of a tier 1 interlock, mapped through `interlock_map_counter`
+Read-only view of a tier 1 interlock, mapped `PROT_READ` through `interlock_map_readonly`
 (client.rs::AbacusClient::attach_wait_counter, interlock.rs::AttachedWaitCounter).
 
 ```
@@ -558,7 +587,7 @@ value the daemon stamped on delivery, and termination.
 |---|---|---|---|
 | open_count | Target clock millisecond | Creator, set exactly by the timer's single waiter (`WaitTimer::wait_ms_with_margin`) | Daemon comparison against `clock.open_count` |
 | closed_count | Clock millisecond at delivery | Daemon only | Creator (`WaitTimer::completed_at`) |
-| expiration_ns | Fatal margin deadline | Creator (`interlock_arm` with `margin_ms`), keepalive | Daemon, creator |
+| expiration_ns | Fatal margin deadline | Creator (`interlock_extend` with `margin_ms`), keepalive | Daemon, creator |
 
 ### SDK: WaitTimer
 
@@ -577,9 +606,9 @@ timeout_policy(&self) -> TimeoutPolicy
     Default: TimeoutPolicy::Abort (types.rs::TimeoutPolicy).
 
 margin_for(&self, ms: u64) -> u64
-    max(2 * ms, min_margin_ms), the doubling saturating at u64::MAX
+    ms + max(ms, min_margin_ms), saturating at u64::MAX
     (wait_timer.rs::WaitTimer::margin_for).
-    Default floor: MIN_FATAL_MARGIN_MS = 50 (types.rs::MIN_FATAL_MARGIN_MS), overridable
+    Default floor: MIN_FATAL_MARGIN_MS = 100 (types.rs::MIN_FATAL_MARGIN_MS), overridable
     per client with set_min_fatal_margin_ms.
 
 wait_ms(&self, ms: u64) -> Result<WaitResult, SdkError>
@@ -597,7 +626,9 @@ wait_ms_with_margin(&self, ms: u64, margin_ms: u64) -> Result<WaitResult, SdkErr
     ms == 0 and the handle is already terminated; SdkError::InvalidRequest { message:
     "margin_ms (N) must exceed wait (M)" } when margin_ms <= ms; SdkError::InvalidRequest
     when another wait is in progress on this timer;
-    SdkError::InterlockReaped from interlock_arm on a SENTINEL expiration.
+    SdkError::InterlockReaped from interlock_extend on a SENTINEL or lapsed expiration;
+    SdkError::FutexFailed { errno } when the futex syscall fails permanently (returned
+    before the deadline path, so a syscall failure is never misreported as DeliveryTimeout).
     On the margin expiring: TimeoutPolicy::Error returns Err(SdkError::DeliveryTimeout);
     TimeoutPolicy::Abort prints an "abacus: DeliveryTimeout" diagnostic to stderr and calls
     std::process::abort (wait_timer.rs::WaitTimer::on_timeout).
@@ -645,12 +676,15 @@ interval_ms(&self) -> u64
     The interval captured at construction (wait_cron.rs::WaitCron::interval_ms).
 
 wait(&self) -> Result<WaitResult, SdkError>
-    Records the current closed_count, then futex-waits until closed_count exceeds it:
-    the next grid fire (wait_cron.rs::WaitCron::wait). state is WaitState::Normal when
-    completed_at % interval_ms == 0, WaitState::Overrun otherwise.
+    Compares closed_count against the last fire this caller observed, returning immediately
+    if a fire already landed, or futex-waiting for the next one
+    (wait_cron.rs::WaitCron::wait). state is WaitState::Normal when the fire is on the
+    grid and no grid lines were skipped since the previous return; WaitState::Overrun when
+    the daemon fired late (off grid) or the caller missed at least one grid line.
     Errors: SdkError::InterlockReaped when closed_count is SENTINEL on entry or during
     the loop, when expiration_ns is SENTINEL, or when expiration_ns is in the past; likewise
-    when the daemon clock's expiration_ns is SENTINEL or in the past.
+    when the daemon clock's expiration_ns is SENTINEL or in the past;
+    SdkError::FutexFailed { errno } when the futex syscall fails permanently.
     Default: each futex sleep is capped at DEFAULT_TIMEOUT_NANOS = 100_000_000
     (types.rs::DEFAULT_TIMEOUT_NANOS).
 
@@ -694,7 +728,8 @@ wait(&self) -> Result<WaitResult, SdkError>
     from the barrier's own words.
     Errors: SdkError::InterlockReaped when closed_count or open_count is SENTINEL, when
     the clock word is SENTINEL, when expiration_ns is SENTINEL, when expiration_ns is
-    in the past, or when the daemon clock's expiration_ns is SENTINEL or in the past.
+    in the past, or when the daemon clock's expiration_ns is SENTINEL or in the past;
+    SdkError::FutexFailed { errno } when the futex syscall fails permanently.
     Default: each futex sleep is capped at DEFAULT_TIMEOUT_NANOS = 100_000_000.
 
 rearm(&self) -> Result<(), SdkError>
@@ -779,10 +814,11 @@ Absent: `open`, `close`, `touch`, `free`
 
 | Rule | Contract | Enforced in |
 |---|---|---|
-| Expiration is absolute | `expiration_ns` is a `CLOCK_MONOTONIC` nanosecond deadline | `clock::monotonic_now_nanos`, `interlock::interlock_arm` |
-| Arming is monotonic forward | `interlock_arm` CAS-maxes `max(current, now + ttl)`; a shorter TTL is a no-op | `interlock::interlock_arm` |
-| Arming a terminated interlock fails | `expiration_ns == SENTINEL` returns `Condition::InterlockReaped` and leaves the sentinel intact | `interlock::interlock_arm` |
-| Arming never terminates | The deadline `now + ttl` saturates and is capped at `SENTINEL - 1`, so a huge TTL never writes `SENTINEL` | `interlock::interlock_arm` |
+| Expiration is absolute | `expiration_ns` is a `CLOCK_MONOTONIC` nanosecond deadline | `clock::monotonic_now_nanos`, `interlock::interlock_arm`, `interlock::interlock_extend` |
+| Arming is monotonic forward | Both `interlock_arm` and `interlock_extend` CAS-max `max(current, now + ttl)`; a shorter TTL is a no-op | `interlock::interlock_arm`, `interlock::interlock_extend` |
+| Arming a terminated interlock fails | `expiration_ns == SENTINEL` returns `Condition::InterlockReaped` and leaves the sentinel intact | `interlock::interlock_arm`, `interlock::interlock_extend` |
+| Client-side arm refuses lapsed deadlines | `interlock_extend` writes `SENTINEL` and wakes waiters when `current < now`, returning `InterlockReaped`; `interlock_arm` does not (the daemon uses it to recover its clock after a stall) | `interlock::interlock_extend` |
+| Arming never terminates | The deadline `now + ttl` saturates and is capped at `SENTINEL - 1`, so a huge TTL never writes `SENTINEL` | `interlock::interlock_arm`, `interlock::interlock_extend` |
 | Creation TTL | 100 ms (`CREATION_TTL_NANOS`) | `interlock::interlock_create` |
 | Clock TTL | 100 ms, refreshed every tick | `registry::CLOCK_TTL_NANOS`, `registry::Registry::refresh_clock_expiration` |
 | Reap condition | `expiration_ns <= now` (`expiration_alive` is strict greater-than) | `clock::expiration_alive`, `registry::Registry::evaluate_all` |
@@ -793,7 +829,7 @@ Absent: `open`, `close`, `touch`, `free`
 | One thread per client | A single keepalive thread serves every registered handle | `touch::Keepalive::register_inner`, `touch::run` |
 | Keepalive stop | Dropping or stopping a `TouchHandle` deregisters it; the interlock is then reaped after at most its remaining TTL | `touch::TouchHandle::drop`, `touch::Keepalive::deregister` |
 | Reaped detection | A failed arm sets the entry's reaped flag and removes it from the keepalive set | `touch::run`, `touch::TouchHandle::is_reaped` |
-| Timer margin | `margin = max(2 * wait_ms, min_fatal_margin_ms)`, default floor `MIN_FATAL_MARGIN_MS` = 50 ms | `wait_timer::WaitTimer::margin_for`, `types::MIN_FATAL_MARGIN_MS` |
+| Timer margin | `margin = wait_ms + max(wait_ms, min_fatal_margin_ms)`, default floor `MIN_FATAL_MARGIN_MS` = 100 ms | `wait_timer::WaitTimer::margin_for`, `types::MIN_FATAL_MARGIN_MS` |
 | Explicit margin | `wait_ms_with_margin` requires `margin_ms > ms`, else `SdkError::InvalidRequest` | `wait_timer::WaitTimer::wait_ms_with_margin` |
 | Counter TTL | `wait_until(target, timeout_ms)` arms `2 * timeout_ms` | `wait_counter::WaitCounter::wait_until` |
 | Daemon clock lapse | A wait that finds the daemon clock's `expiration_ns` at `SENTINEL` or in the past treats the daemon as dead and returns `InterlockReaped` | `handle_ops::wait_word`, `wait_cron::WaitCron::wait`, `wait_barrier::WaitBarrier::wait` |
@@ -861,7 +897,7 @@ process_ttl_ms(&self) -> Option<u64>
 ```
 
 Each tick the thread walks every registered entry whose `next_due_ns` has passed, calls
-`interlock_arm(handle, ttl_ns)`, copies the clock word if the entry has one, and sets
+`interlock_extend(handle, ttl_ns)`, copies the clock word if the entry has one, and sets
 `next_due_ns = now + interval_ns`. An entry whose arm fails has its reaped flag set and
 is removed from the list. The thread then sleeps on a condvar until the earliest
 `next_due_ns`, bounded above by `IDLE_SLEEP` = 100 ms (touch.rs::IDLE_SLEEP,
@@ -885,9 +921,17 @@ TouchHandle::stop(&self)
 On drop: `TouchHandle::drop` calls `stop`, removing the entry
 (touch.rs::TouchHandle::drop). The thread holds only a `Weak` to the shared state; when
 every `Keepalive` clone and the last strong reference are gone, the thread sets
-`thread_running = false` and returns (touch.rs::run). Every exit of `run`, a panic
-included, clears `thread_running` (touch.rs::RunningGuard), so the next registration
-starts a new thread, which receives the stored priority.
+`thread_running = false` and returns (touch.rs::run).
+
+A keepalive thread panic is a liveness death that fails closed
+(touch.rs::RunningGuard::drop). Under `TimeoutPolicy::Abort` (the default): one
+diagnostic line to stderr, then `std::process::abort()`. Under `TimeoutPolicy::Error`:
+every registered entry is marked reaped, the process clock is dropped,
+`liveness()` reports `Liveness::KeepaliveFailed`, and all future `register`,
+`register_with_clock`, and `bind_process` calls return
+`SdkError::KeepaliveFailed`. A restart cannot restore the guarantee: the process
+clock may have been reaped by the daemon during the gap, along with everything it
+owned.
 
 ## SDK-only compositions
 
@@ -899,16 +943,17 @@ First-of-N over a set of `WaitCounter` values, implemented entirely in the SDK
 ```
 WaitRace::new(counters: Vec<WaitCounter>) -> Self
 
-wait(&self) -> Result<(usize, WaitResult), SdkError>
-    Snapshots each counter's closed_count once, then polls all counters in order,
-    sleeping 1 ms between passes (wait_race.rs::WaitRace::wait). Returns the index of
-    the first counter whose closed_count exceeds its snapshot, with
-    WaitResult { completed_at: closed, state } where state comes from classify_wake and
-    falls back to WaitState::Timeout if classification yields None.
+wait(&self, timeout_ms: u64) -> Result<Option<(usize, WaitResult)>, SdkError>
+    Polls all counters in order, sleeping 1 ms between passes
+    (wait_race.rs::WaitRace::wait). Returns Ok(Some((index, result))) for the first
+    counter whose classify_wake returns Some(state) (closed_count >= open_count), with
+    WaitResult { completed_at: closed, state }. A counter that has not been delivered
+    (open_count > closed_count) is skipped. A delivery that landed before wait was
+    called wins on the first pass. Returns Ok(None) after timeout_ms milliseconds if
+    no counter fires. timeout_ms == 0 polls once and returns.
     Errors: SdkError::InvalidRequest { message: "WaitRace over zero counters" } for an
-    empty set; SdkError::InterlockReaped as soon as any member reports is_reaped.
-    Trap: the snapshot is taken inside wait. A delivery that landed before wait was
-    called is not a win, because the snapshot already includes it.
+    empty set; SdkError::InterlockReaped as soon as any member reports is_reaped or
+    is_clock_dead (daemon clock expiration is SENTINEL or earlier than now).
 
 len(&self) -> usize
 is_empty(&self) -> bool
@@ -931,17 +976,21 @@ The keepalive owns process liveness. On every iteration, before walking entries,
 ProcessClock is bound:
 
 1. If the Abacus clock's `expiration_ns` has lapsed: die with `DaemonClockLapsed`.
-2. If the ProcessClock is due: a failed `interlock_arm` or a `false` from
+2. If the ProcessClock is due: a failed `interlock_extend` or a `false` from
    `stamp_last_seen` dies with `ProcessClockReaped`; otherwise set its next due time.
 
 Dying under `Abort`: `eprintln!` exactly one of these lines, then `std::process::abort()`:
 - `abacus: ProcessClockReaped: process clock "<name>" (id <id>) was reaped; aborting`
 - `abacus: DaemonClockLapsed: the Abacus clock expired at <exp> ns, now <now> ns; aborting`
+- `abacus: KeepaliveFailed: keepalive thread panicked, process clock "<name>" (id <id>) lost; aborting`
+- `abacus: KeepaliveFailed: keepalive thread panicked; aborting` (no process clock bound)
 
-Dying under `Error`: record the cause as the client's `Liveness` (`ProcessClockReaped` or
-`DaemonClockLapsed`, read through `AbacusClient::liveness`), set the process clock to None,
-and carry on with the other entries. The daemon's cascade reaps every owned interlock, so
-every handle reports `InterlockReaped` from shared memory.
+Dying under `Error`: record the cause as the client's `Liveness` (`ProcessClockReaped`,
+`DaemonClockLapsed`, or `KeepaliveFailed`, read through `AbacusClient::liveness`), set the
+process clock to None, and carry on with the other entries. For `ProcessClockReaped` and
+`DaemonClockLapsed`, the daemon's cascade reaps every owned interlock. For
+`KeepaliveFailed`, every registered entry is marked reaped immediately and all future
+registrations are refused with `SdkError::KeepaliveFailed`.
 
 `set_timeout_policy` on `AbacusClient` forwards to the keepalive, so the liveness policy
 takes effect at once. `connect` starts the keepalive under `Abort`; a death the keepalive
@@ -980,6 +1029,9 @@ is_reaped(&self) -> bool
 | Limit | Value | Enforced in | Error to caller |
 |---|---|---|---|
 | Max live interlocks (excludes clock) | `DEFAULT_MAX_INTERLOCKS` = 4096, overridable by `--max-interlocks` | `registry::Registry::create`, `main::parse_args` | `Condition::InvalidRequest` containing "limit reached" |
+| Max dependencies per entry | `MAX_DEPENDENCIES` = 64 | `registry::Registry::create_with_fd` | `Condition::InvalidRequest` containing "too many dependencies" |
+| Max barrier conditions per entry | `MAX_BARRIER_CONDITIONS` = 64 | `registry::Registry::create_with_fd` | `Condition::InvalidRequest` containing "too many barrier conditions" |
+| Max total watch edges | `DEFAULT_MAX_WATCH_EDGES` = 32768, overridable by `--max-watch-edges` | `registry::Registry::create_with_fd`, `main::parse_args` | `Condition::InvalidRequest` containing "watch edge budget" |
 | Max name length | `MAX_NAME_LEN` = 255 bytes | `registry::validate_name` | `Condition::InvalidRequest` containing "name too long" |
 | Min name length | 1 byte | `registry::validate_name` | `Condition::InvalidRequest` containing "must not be empty" |
 | Max frame payload | `MAX_MESSAGE_SIZE` = 4096 bytes | `codec::frame`, `framing::FrameReader::next_frame`, `client::ClientConn::recv_response` | `ProtocolFault::FrameTooLarge`; daemon answers `ERR_INVALID_REQUEST` and drops the connection |
@@ -991,6 +1043,14 @@ is_reaped(&self) -> bool
 Reusing an existing name does not consume a new live slot: the limit check is skipped when
 the name is already present (`registry::Registry::create`).
 
+Duplicate dependencies are merged: if the same target appears more than once in
+`dependencies`, only one edge is stored. Duplicate barrier conditions with the same
+`(target, word)` pair are merged, keeping the highest threshold (every condition must
+hold, so the highest threshold subsumes the others). Watch edges are the sum of resolved
+(deduplicated) dependency targets plus tier-specific targets (1 for WaitCounter, N for
+WaitBarrier conditions) across all live entries. Recreating a name accounts for the
+replaced entry's edges before checking the budget.
+
 ## Trust model and permissions
 
 ### Trust model
@@ -1001,16 +1061,15 @@ the name is already present (`registry::Registry::create`).
 | Socket access control | Filesystem mode and group on the socket file | Anything else | `transport::Server::apply_socket_options`, `daemon::DaemonConfig::new` (default `0o660`) |
 | Frame content | Nothing: version, tag, lengths, and UTF-8 are checked before use; tier, watched word, interval, and thresholds are validated in the registry | Raw numeric fields from the codec | `codec::decode_request`, `registry::Registry::create` |
 | Shared memory | The daemon reads client-written words but treats any `SENTINEL` or lapsed expiration as termination rather than as a fault | Word values written by peers | `registry::Registry::evaluate_all` |
-| memfd integrity | Backing size is fixed by seals, so a hostile `ftruncate` cannot shrink a mapping under the daemon | Attacher intent | `interlock::seal` (`F_SEAL_SHRINK \| F_SEAL_GROW \| F_SEAL_SEAL`) |
+| memfd integrity | Backing size is fixed by seals; every `interlock_map*` validates seals and exact size before mapping, so a truncated or unsealed fd is rejected at `AllocationStep::Validate` rather than faulting | Attacher intent | `interlock::seal` (creation), `interlock::validate_received_fd` (mapping) |
 | Clock integrity | The clock memfd additionally carries `F_SEAL_FUTURE_WRITE`, so attachers cannot map it writable | Attacher intent | `interlock::interlock_create_clock`, `interlock::interlock_map_clock` |
 
-Straight razor: the daemon hands out the same kind of descriptor for every tier, and except
-for the clock, every handed-out descriptor is mapped `PROT_READ | PROT_WRITE`, including
-`attach_interlock` of any tier and of a ProcessClock (`interlock::interlock_map`, `interlock_map_counter`,
-`interlock_map_timer`, `interlock_map_cron`, `interlock_map_barrier`). Per-word write
-discipline is a property of the SDK handle type, not of page protection. The only
-mmap-enforced restriction is the clock, which is mapped `PROT_READ`
-(`interlock::interlock_map_clock`).
+Straight razor: the daemon hands out the same kind of descriptor for every tier. Creator
+handles and `attach_interlock` map it `PROT_READ | PROT_WRITE` (`interlock::interlock_map`);
+per-word write discipline is a property of the SDK handle type, not of page protection.
+Two attach paths enforce page protection: `attach_wait_counter` maps `PROT_READ`
+(`interlock::interlock_map_readonly`), and the clock maps `PROT_READ` with
+`F_SEAL_FUTURE_WRITE` (`interlock::interlock_map_clock`).
 
 ### Permission model (SDK-enforced)
 
@@ -1022,7 +1081,7 @@ the method simply does not exist on the type; "mmap" means the page protection f
 | `Interlock` (creator, tier 0) | read/write (`open`) | read/write (`close`) | read/write (`touch`) | `free` stamps expiration | `start_touch_thread`, `stop_touch_thread` |
 | `AttachedInterlock` | read/write (`open`) | read/write (`close`) | read only (`expiration_ns`); no `touch` (type) | `free` stamps open_count with `SENTINEL` | none (type) |
 | `WaitCounter` (creator) | read/write via CAS-max target (`wait_until`) | read only (`completed_at`); no `close` (type) | write via `touch` and `wait_until` arming | `free` stamps expiration | keepalive-registered |
-| `AttachedWaitCounter` | read only (`peek`) | read only (`completed_at`) | not exposed (type) | none (type) | none (type) |
+| `AttachedWaitCounter` | read only (mmap + `peek`) | read only (mmap + `completed_at`) | not exposed (mmap + type) | none (mmap + type) | none (mmap + type) |
 | `WaitTimer` (creator) | read/write via the single waiter's exact target | read only (`completed_at`); no `close` (type) | write via `touch` and margin arming | `free` stamps expiration | keepalive-registered |
 | `WaitCron` (creator) | read only (`peek`) | read only (`completed_at`) | keepalive only | `free` stamps expiration | keepalive-registered |
 | `WaitBarrier` (creator) | read/write via `rearm` (+1) | read only (`completed_at`) | keepalive only | `free` stamps expiration | keepalive-registered |
@@ -1264,10 +1323,10 @@ The clock is never evaluated and never reaped: it is held outside the slot table
 |---|---|
 | `InterlockReaped` | `interlock::interlock_arm` on a sentinel expiration |
 | `InterlockNotFound { name }` | `registry::Registry::attach`, `registry::Registry::resolve`, `registry::Registry::create_with_fd` (a watched, condition, or dependency target that is not alive) |
-| `AllocationFailed { step, errno }` | `interlock::memfd_create`, `ftruncate`, `seal`, `mmap_interlock`, `interlock_dup_fd` |
+| `AllocationFailed { step, errno }` | `interlock::memfd_create`, `ftruncate`, `seal`, `validate_received_fd`, `mmap_interlock`, `interlock_dup_fd` |
 | `InvalidRequest { message }` | `registry::validate_name` (on create and attach), `registry::Registry::create_with_fd`, `registry::WatchedWord::from_wire` |
 
-`AllocationStep` variants: `MemfdCreate`, `Ftruncate`, `Seal`, `Mmap`, `Dup`
+`AllocationStep` variants: `MemfdCreate`, `Ftruncate`, `Seal`, `Mmap`, `Dup`, `Validate`
 (`error::AllocationStep`).
 
 ### `ProtocolFault` (`abacus_core::error::ProtocolFault`)
@@ -1320,6 +1379,7 @@ client.rs::SdkError. Derives `Debug, Clone, PartialEq, Eq`, implements `Display`
 | `AllocationFailed { message }` | Daemon reply code `ERR_ALLOCATION_FAILED` (client.rs::daemon_error); `Condition::AllocationFailed` rendered to a string (client.rs::From<Condition>) |
 | `InvalidRequest { message }` | `attach_interlock("clock")` (client.rs::AbacusClient::attach_interlock); `create_wait_cron` with `interval_ms == 0` or an `interval_ms` whose nanoseconds overflow (client.rs::AbacusClient::create_wait_cron, client.rs::checked_interval_ns); `WaitRace::wait` over zero counters (wait_race.rs::WaitRace::wait); an out-of-range `KeepalivePriority::Fifo` (touch.rs::Keepalive::set_priority, client.rs::AbacusClient::set_keepalive_priority); `wait_ms_with_margin` with `margin_ms <= ms`, or a second concurrent wait on one WaitTimer (wait_timer.rs::WaitTimer::wait_ms_with_margin); daemon reply code `ERR_INVALID_REQUEST` (client.rs::daemon_error) |
 | `DeliveryTimeout` | `WaitTimer` margin expiry under `TimeoutPolicy::Error` (wait_timer.rs::WaitTimer::on_timeout) |
+| `FutexFailed { errno }` | A futex wait syscall failed with a permanent errno (not `EAGAIN`, `EINTR`, or `ETIMEDOUT`). From every SDK wait loop: `handle_ops::wait_word`, `wait_counter::WaitCounter::wait_until`, `wait_timer::WaitTimer::wait_ms_with_margin`, `wait_cron::WaitCron::wait`, `wait_barrier::WaitBarrier::wait`. Typical causes: `EPERM` from a seccomp filter blocking the futex syscall, `EFAULT`, `EINVAL`, `ENOSYS`. Classification is shared through `clock::classify_futex_result` |
 | `Transport(TransportError)` | Connect, timeout set, frame send, frame receive, decode, and descriptor-count faults (client.rs::ClientConn); `extract_single_fd` when the reply carries a count other than one (client.rs::extract_single_fd) |
 | `MmapFailed { message }` | The mapping function returns `Condition`, rendered to a string (client.rs::map_handle) |
 | `UnexpectedResponse { message }` | A reply that is neither the expected `Created`/`Attached` nor `Error` (client.rs::AbacusClient::do_create, client.rs::do_attach); an unrecognized daemon error code, message `"unknown daemon error 0x{code:02x}: {message}"` (client.rs::daemon_error) |

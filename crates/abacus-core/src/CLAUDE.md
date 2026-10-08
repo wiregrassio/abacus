@@ -24,7 +24,7 @@ Consumed by the parent package (`crates/abacus-core`).
 
 <known-hazards>
 ## Known Hazards
-- HIGH: `interlock_map*` maps supplied fds without validating backing-object size, a malformed or truncated fd can fault when mapped words are accessed.
+- FIXED: `interlock_map*` now validates seals and size before mapping; a malformed or truncated fd returns `AllocationFailed` at `Validate` instead of faulting.
 - LOW: `interlock_create` adds the creation TTL with unchecked `u64` arithmetic, unlike saturating `interlock_arm`; clock overflow can create an immediately expired deadline.
 </known-hazards>
 

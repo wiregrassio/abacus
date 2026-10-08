@@ -25,21 +25,25 @@ memfd so both processes map the same page.
 |---|---|---|---|
 | 0 | 0 | `open_count` | tier 0: creator and attachers (`Interlock::open`, `AttachedInterlock::open`). tier 1: creator sets the target by CAS-max (`WaitCounter::wait_until`). tier 2: the timer's single waiter sets the absolute clock target exactly, replacing any stale target (`WaitTimer::wait_ms_with_margin`); daemon seeds it at create. tier 3: daemon only (grid line). tier 4: daemon seeds 1 at create; creator increments to re-arm (`WaitBarrier::rearm`). clock: daemon only (`Registry::tick`). |
 | 8 | 1 | `closed_count` | tier 0: creator and attachers (`Interlock::close`, `AttachedInterlock::close`). tiers 1 to 4: daemon only (`Registry::evaluate_all`). clock: daemon writes the start millisecond once at `Registry::with_limit`. |
-| 16 | 2 | `expiration_ns` | Owner, monotonic forward only, by CAS-max (`interlock_arm`, driven by keepalive and explicit `touch`). Daemon stamps `SENTINEL` on reap (`interlock_reap`). Owner stamps `SENTINEL` on free (`interlock_free`). |
+| 16 | 2 | `expiration_ns` | Owner, monotonic forward only, by CAS-max (`interlock_extend` for client-side keepalive and explicit `touch`; `interlock_arm` for the daemon clock only). Daemon stamps `SENTINEL` on reap (`interlock_reap`). Owner stamps `SENTINEL` on free (`interlock_free`). `interlock_extend` also stamps `SENTINEL` on a lapsed deadline. |
 
 ### Invariants
 
 - Counters are monotonic and carry arbitrary increments. `handle_ops::increment` uses
   `fetch_add`.
-- `expiration_ns` is `CLOCK_MONOTONIC` nanoseconds and never decreases: `interlock_arm` is a
-  CAS-max loop that returns `Ok(())` when the requested deadline is already behind the current
-  one. The deadline is capped at `SENTINEL - 1`, so no TTL, however large, arms an interlock
-  into termination.
+- `expiration_ns` is `CLOCK_MONOTONIC` nanoseconds and never decreases: `interlock_arm` and
+  `interlock_extend` are CAS-max loops that return `Ok(())` when the requested deadline is
+  already behind the current one. The deadline is capped at `SENTINEL - 1`, so no TTL, however
+  large, arms an interlock into termination. `interlock_extend` additionally refuses a lapsed
+  deadline (current < now): it writes `SENTINEL`, wakes waiters, and returns `InterlockReaped`.
+  Client-side code uses `interlock_extend`; the daemon uses `interlock_arm` for its own clock
+  recovery after a stall.
 - `SENTINEL` (`u64::MAX`) in any word means terminated. `interlock_is_terminated` reads all
   three.
 - Termination cannot be undone. `handle_ops::increment` never writes a word already at
   `SENTINEL`, and stores `SENTINEL` into a word the add would carry onto or past it; either way
-  it wakes waiters and returns `SdkError::InterlockReaped`. `interlock_arm` refuses to write over a `SENTINEL` expiration.
+  it wakes waiters and returns `SdkError::InterlockReaped`. Both `interlock_arm` and
+  `interlock_extend` refuse to write over a `SENTINEL` expiration.
 - Values above 2^63 are outside the representable signed range; `handle_ops::value` computes
   `open - closed` with `wrapping_sub`.
 
@@ -67,13 +71,13 @@ One memfd per interlock, 24 bytes, mapped once per process that holds it.
 
 The daemon maps read-write (`PROT_READ | PROT_WRITE` via `mmap_interlock`), keeps the
 `InterlockHandle` for the entry's lifetime, and hands clients a `dup` of the fd over
-`SCM_RIGHTS`. The client maps through a tier-specific function in
+`SCM_RIGHTS`. The client maps through one of three functions in
 `abacus-core/src/interlock.rs`:
 
-- `interlock_map`: `PROT_READ | PROT_WRITE`. Bare interlocks and process clocks.
-- `interlock_map_counter`, `_timer`, `_cron`, `_barrier`: `PROT_READ | PROT_WRITE`. Per-word
-  write discipline is enforced by the SDK type, not by page protection.
-- `interlock_map_clock`: `PROT_READ`. The only mmap-enforced restriction.
+- `interlock_map`: `PROT_READ | PROT_WRITE`. Bare interlocks, process clocks, and creator
+  handles for every tier (WaitCounter, WaitTimer, WaitCron, WaitBarrier).
+- `interlock_map_readonly`: `PROT_READ`. Attached WaitCounter views. A stray write faults.
+- `interlock_map_clock`: `PROT_READ`, plus `F_SEAL_FUTURE_WRITE` validation. The clock.
 
 `InterlockHandle` is `Send` and `Sync`: the region is shared memory designed for concurrent
 multi-process access and every access goes through atomics.
@@ -110,9 +114,12 @@ stateDiagram-v2
     Closed --> Overrun: close(h) with open == 0
     Overrun --> Closed: open(h) back to parity
     Overrun --> Open: open(h) past closed
-    Closed --> Closed: interlock_arm (touch), expiration moves forward
-    Open --> Open: interlock_arm (touch)
-    Overrun --> Overrun: interlock_arm (touch)
+    Closed --> Closed: interlock_extend (touch), expiration moves forward
+    Open --> Open: interlock_extend (touch)
+    Overrun --> Overrun: interlock_extend (touch)
+    Closed --> Expired: interlock_extend on lapsed deadline
+    Open --> Expired: interlock_extend on lapsed deadline
+    Overrun --> Expired: interlock_extend on lapsed deadline
     Closed --> Expired: TTL lapse or SENTINEL
     Open --> Expired: TTL lapse or SENTINEL
     Overrun --> Expired: TTL lapse or SENTINEL
@@ -183,7 +190,8 @@ Each iteration:
    no `SA_RESTART`, so `ppoll` returns `EINTR` and the flag is seen at once).
 2. Compute `timespec_from_nanos(next_due.saturating_sub(now))` and `ppoll` over the listener
    fd plus every client fd. Behind schedule means a zero timeout.
-3. Accept every pending connection (non-blocking), service readable clients before hangups.
+3. Accept up to 64 pending connections (non-blocking), stopping at the connection cap or on
+   descriptor pressure. Service readable clients before hangups.
 4. Drop clients whose `revents` carry `POLLHUP`/`POLLERR`/`POLLNVAL` or whose
    `service_client` returns `ClientOutcome::Drop`.
 5. If `now >= next_due`, call `registry.tick(now)` and recompute
@@ -300,8 +308,9 @@ TTL to `margin_ms`, and loops on `closed_count`. `wait_until` reads the clock on
 from that reading. If `now_ns >= deadline_ns`
 without delivery, `on_timeout` applies the policy: `TimeoutPolicy::Error` returns
 `SdkError::DeliveryTimeout`; `TimeoutPolicy::Abort` (default) prints diagnostics and calls
-`std::process::abort()`. The margin defaults to `max(2 * ms, MIN_FATAL_MARGIN_MS)` where
-`MIN_FATAL_MARGIN_MS` is 50. A daemon restart is discovered exactly here: nobody stamps and the
+`std::process::abort()`. The margin defaults to `ms + max(ms, MIN_FATAL_MARGIN_MS)` where
+`MIN_FATAL_MARGIN_MS` is 100 (the daemon clock TTL), so the delivery-lateness tolerance is
+always at least 100 ms. A daemon restart is discovered exactly here: nobody stamps and the
 margin expires.
 
 ### WaitCron (tier 3)
@@ -319,8 +328,9 @@ Firing and re-arm in one step: stamp `closed_count = clock_now_ms`, wake, store
 
 Missed grid lines are skipped, not replayed. Re-arm is computed from `clock_now_ms`, not the
 previous target, so a stall across N lines produces one stamp and one re-arm forward. The SDK
-reads the skew: `WaitCron::wait` reports `Normal` when `closed % interval_ms == 0` and
-`Overrun` otherwise.
+tracks the last fire each caller observed (`last_seen`): `WaitCron::wait` returns immediately
+if a fire landed since the last call, and reports `Overrun` when the fire is off grid or when
+at least one grid line was skipped between the previous return and this fire.
 
 ### WaitBarrier (tier 4)
 
@@ -340,11 +350,14 @@ Re-arm is `WaitBarrier::rearm`: increment `open_count` by 1, restoring `open > c
 
 ### WaitRace
 
-`wait_race::WaitRace` takes a vector of `WaitCounter` handles, snapshots each `closed_count`,
-and polls: for each counter, checks `is_reaped()` (returning `InterlockReaped` for the whole
-race if any member died) and `peek()`, returning `(index, WaitResult)` for the first counter
-whose `closed_count` exceeds its snapshot. Sleeps 1 ms between passes. SDK-only because the
-daemon has no tier for "fire when any of N fires."
+`wait_race::WaitRace` takes a vector of `WaitCounter` handles and polls with a caller-supplied
+timeout: for each counter, checks `is_reaped()` and `is_clock_dead()` (returning
+`InterlockReaped` for the whole race if any member died or its daemon clock lapsed) and
+`peek()`, returning `(index, WaitResult)` for the first counter classified as delivered
+(`closed_count >= open_count` via `classify_wake`). A counter whose `open_count` exceeds its
+`closed_count` is not yet delivered and is skipped. A delivery that landed before `wait` was
+called wins on the first pass. `Ok(None)` on timeout. Sleeps 1 ms between passes. SDK-only
+because the daemon has no tier for "fire when any of N fires."
 
 ### ProcessClock
 
@@ -377,12 +390,15 @@ exists, and a create may not name itself, so the graph is acyclic by constructio
 checks for cycles because none can form. There is no ownership table, no reference count, and
 no release call: ownership is a watch.
 
-`AbacusClient::connect_waiting` wraps the gating for supervised processes: it retries a connect
-that fails with `ENOENT`, `ECONNREFUSED`, or `EACCES` (no socket yet, nobody listening yet, or
-a socket whose mode the daemon has not applied yet; `retryable_connect_errno`) or a missing
-dependency every `CONNECT_RETRY_INTERVAL` (100 ms), logs one line per distinct reason for the
-whole wait, and returns `DependencyTimeout` at a caller-chosen ceiling rather than letting a
-supervisor crash-loop the process through a planned outage. Any other error returns at once.
+`AbacusClient::connect_waiting` wraps the gating for supervised processes: each attempt uses
+`min(DEFAULT_TRANSPORT_TIMEOUT, max_wait - elapsed)` as its transport timeout, so no single
+attempt can overshoot the ceiling. It retries a connect that fails with `ENOENT`,
+`ECONNREFUSED`, `EACCES`, or `ETIMEDOUT` (no socket yet, nobody listening yet, a socket whose
+mode the daemon has not applied yet, or a connect that timed out against a stalled daemon;
+`retryable_connect_errno`) or a missing dependency every `CONNECT_RETRY_INTERVAL` (100 ms,
+also capped at the remaining time), logs one line per distinct reason for the whole wait, and
+returns `DependencyTimeout` at a caller-chosen ceiling rather than letting a supervisor
+crash-loop the process through a planned outage. Any other error returns at once.
 
 ## Daemon and SDK split
 
@@ -424,7 +440,7 @@ Liveness is a deadline in the third word. An owner that stops extending it is de
 definition.
 
 `Keepalive::register_inner` clamps a zero `interval_ms` to 1 ms, floors the requested TTL at
-`2 * interval_ms`, arms it synchronously via `interlock_arm` before returning, starts the
+`2 * interval_ms`, arms it synchronously via `interlock_extend` before returning, starts the
 thread if not running, and pushes an `Entry` with `next_due_ns = now + interval_ns`. Every
 step that can fail returns an error before anything is registered: a terminated interlock is
 `InterlockReaped`, and a thread the OS refuses is `SdkError::KeepaliveSpawnFailed`, never a
@@ -443,7 +459,7 @@ Defaults from `types`:
 
 The keepalive thread is consolidated: one per `Keepalive`, one per `AbacusClient`.
 `touch::run` walks the entry list, arms each due entry, computes the earliest next due (capped
-at `IDLE_SLEEP`, 100 ms), and sleeps on a `Condvar`. An entry whose `interlock_arm` returns
+at `IDLE_SLEEP`, 100 ms), and sleeps on a `Condvar`. An entry whose `interlock_extend` returns
 `InterlockReaped` is flagged and removed. The thread holds only a `Weak<Inner>` and exits when
 the last strong reference drops.
 
@@ -459,6 +475,14 @@ anything else, because the process is gone first. The keepalive starts under `Ab
 connect, so a host that selects `Error` does so after the keepalive is already running. The ProcessClock lives in the
 keepalive's shared state rather than as a registered entry, so it keeps no strong reference to
 the thread: the process clock stops, and lapses, when the client and every handle are gone.
+
+A keepalive thread panic is treated as a liveness death that fails closed. Under `Abort` the
+`RunningGuard` drop writes one diagnostic line and aborts; under `Error` it marks every
+registered entry reaped, drops the process clock, records `Liveness::KeepaliveFailed`, and
+sets a permanent `failed` flag. After a panic, `register`, `register_with_clock`, and
+`bind_process` return `SdkError::KeepaliveFailed` instead of starting a new thread. A
+restart cannot restore the liveness guarantee: the process clock may have been reaped by the
+daemon during the gap, along with every interlock it owned.
 
 The keepalive thread's scheduling is the caller's (`set_keepalive_priority`), never the SDK's.
 It is applied with `pthread_setschedparam` to the running thread and to any thread started
@@ -506,9 +530,10 @@ daemon reaps within roughly 200 ms. The failure mode is latency, not incorrectne
 `expiration_ns` is absolute.
 
 Waiters have their own escape hatch: `WaitTimer::wait_ms_with_margin` arms its own deadline to
-the margin (`max(2 * W, MIN_FATAL_MARGIN_MS)`), and when the deadline passes with nothing
-delivered, calls `on_timeout`. A daemon that stops delivering is discovered by the client on
-its own clock.
+the margin (`W + max(W, MIN_FATAL_MARGIN_MS)`), and when the deadline passes with nothing
+delivered, calls `on_timeout`. The floor equals the daemon clock TTL so the WaitTimer never
+gives up before the keepalive's clock-lapse check does. A daemon that stops delivering is
+discovered by the client on its own clock.
 
 ### Self-reaping on name recreation
 
@@ -548,9 +573,10 @@ Protocol faults end the connection: one `Response::invalid_request` best effort,
 A client not draining its socket is broken and is dropped. A disconnect is not a reap; the
 client's interlocks die by TTL or not at all.
 
-The socket permission model is filesystem permissions: `Server::create` refuses a live-daemon
-path, refuses a non-socket path, unlinks a stale socket, then applies `chown`/`chmod`.
-`Server::drop` removes the socket file.
+The socket permission model is filesystem permissions: `Server::create` refuses a confirmed
+live-daemon path (`SocketPathOccupied`), refuses a probe error with the errno
+(`Io { Connect, errno }`), refuses a non-socket path, unlinks a stale socket (reporting unlink
+failures), then applies `chown`/`chmod`. `Server::drop` removes the socket file best-effort.
 
 That boundary is right because the socket only hands out fds to shared memory already sealed
 against the one operation that could hurt a peer. The failure mode of abuse is a terminated

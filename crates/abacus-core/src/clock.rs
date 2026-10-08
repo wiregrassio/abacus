@@ -59,9 +59,12 @@ pub fn ms_to_nanos(ms: u64) -> u64 {
 }
 
 /// Wake every futex waiter blocked on `word`.
+///
+/// Aborts the process if the wake syscall fails: a broken futex is unrecoverable
+/// because every wait path depends on it.
 pub fn futex_wake(word: &AtomicU64) {
     let ptr = futex_addr(word);
-    unsafe {
+    let rc = unsafe {
         libc::syscall(
             libc::SYS_futex,
             ptr,
@@ -70,12 +73,18 @@ pub fn futex_wake(word: &AtomicU64) {
             std::ptr::null::<libc::timespec>(),
             std::ptr::null::<u32>(),
             0u32,
-        );
+        )
+    };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        eprintln!("abacus: futex wake failed: {err}; aborting");
+        std::process::abort();
     }
 }
 
 /// Block until the low 32 bits of `word` differ from `expected_lo32`, or until
-/// `timeout_nanos` nanoseconds elapse. Pass `0` for `timeout_nanos` to block indefinitely.
+/// `timeout_nanos` nanoseconds elapse. A timeout of 0 returns immediately (the kernel
+/// sees a zero timespec and reports `ETIMEDOUT` at once).
 ///
 /// Returns `Ok(())` on a wake. Returns `Err(errno)` otherwise, with errno captured
 /// immediately after the syscall: `ETIMEDOUT` when the timeout elapsed, `EAGAIN` when the
@@ -83,11 +92,7 @@ pub fn futex_wake(word: &AtomicU64) {
 pub fn futex_wait(word: &AtomicU64, expected_lo32: u32, timeout_nanos: u64) -> Result<(), i32> {
     let ptr = futex_addr(word);
     let ts = timespec_from_nanos(timeout_nanos);
-    let ts_ptr = if timeout_nanos == 0 {
-        std::ptr::null::<libc::timespec>()
-    } else {
-        &ts as *const libc::timespec
-    };
+    let ts_ptr = &ts as *const libc::timespec;
     let rc = unsafe {
         libc::syscall(
             libc::SYS_futex,
@@ -104,6 +109,27 @@ pub fn futex_wait(word: &AtomicU64, expected_lo32: u32, timeout_nanos: u64) -> R
     } else {
         // Capture errno before anything else can touch it.
         Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    }
+}
+
+/// Whether a `futex_wait` result is retriable or permanently broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutexOutcome {
+    /// The wait returned normally (woken, timed out, word changed, or signal): loop again.
+    Retry,
+    /// A permanent failure: the syscall will never succeed on this word.
+    Fatal(i32),
+}
+
+/// Classify a `futex_wait` result. `Ok`, `EAGAIN`, `EINTR`, and `ETIMEDOUT` are retriable;
+/// every other errno (`EPERM`, `EFAULT`, `EINVAL`, `ENOSYS`, ...) is fatal.
+pub fn classify_futex_result(result: Result<(), i32>) -> FutexOutcome {
+    match result {
+        Ok(()) => FutexOutcome::Retry,
+        Err(e) if e == libc::EAGAIN || e == libc::EINTR || e == libc::ETIMEDOUT => {
+            FutexOutcome::Retry
+        }
+        Err(e) => FutexOutcome::Fatal(e),
     }
 }
 
@@ -133,5 +159,38 @@ mod tests {
         let ts = timespec_from_nanos(2 * NANOS_PER_SEC + 5);
         assert_eq!(ts.tv_sec, 2);
         assert_eq!(ts.tv_nsec, 5);
+    }
+
+    #[test]
+    fn classify_futex_retry_and_fatal() {
+        assert_eq!(classify_futex_result(Ok(())), FutexOutcome::Retry);
+        assert_eq!(
+            classify_futex_result(Err(libc::EAGAIN)),
+            FutexOutcome::Retry
+        );
+        assert_eq!(
+            classify_futex_result(Err(libc::EINTR)),
+            FutexOutcome::Retry
+        );
+        assert_eq!(
+            classify_futex_result(Err(libc::ETIMEDOUT)),
+            FutexOutcome::Retry
+        );
+        assert_eq!(
+            classify_futex_result(Err(libc::EPERM)),
+            FutexOutcome::Fatal(libc::EPERM)
+        );
+        assert_eq!(
+            classify_futex_result(Err(libc::EFAULT)),
+            FutexOutcome::Fatal(libc::EFAULT)
+        );
+        assert_eq!(
+            classify_futex_result(Err(libc::EINVAL)),
+            FutexOutcome::Fatal(libc::EINVAL)
+        );
+        assert_eq!(
+            classify_futex_result(Err(libc::ENOSYS)),
+            FutexOutcome::Fatal(libc::ENOSYS)
+        );
     }
 }

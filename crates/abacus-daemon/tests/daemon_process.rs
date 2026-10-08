@@ -349,18 +349,12 @@ fn daemon__loop_keeps_1ms_cadence_after_request_burst() {
 
     let sample_for = Duration::from_millis(400);
     let start = Instant::now();
-    let mut last_value = clock
-        .words()
-        .open_count
-        .load(std::sync::atomic::Ordering::Acquire);
+    let mut last_value = clock.load_open();
     let mut last_change = Instant::now();
     let mut max_gap = Duration::ZERO;
     let mut max_gap_at = Duration::ZERO;
     while start.elapsed() < sample_for {
-        let v = clock
-            .words()
-            .open_count
-            .load(std::sync::atomic::Ordering::Acquire);
+        let v = clock.load_open();
         if v != last_value {
             let gap = last_change.elapsed();
             if gap > max_gap {
@@ -458,7 +452,11 @@ fn daemon__two_processes_share_one_interlock() {
 #[test]
 fn daemon__heartbeat_file_exists_while_running_and_is_removed_on_stop() {
     let mut d = ProcessDaemon::start(bin(), "heartbeat");
-    let heartbeat_path = d.socket_path().parent().unwrap().join("heartbeat");
+    let heartbeat_path = {
+        let mut p = d.socket_path().as_os_str().to_os_string();
+        p.push(".heartbeat");
+        std::path::PathBuf::from(p)
+    };
 
     // Wait for the heartbeat file to contain a valid timestamp. The daemon writes it once
     // per second; std::fs::write creates the file before writing, so poll for content, not

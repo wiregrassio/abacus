@@ -22,10 +22,11 @@ const KEEP_ALIVE_NS: u64 = 10_000 * MS;
 const MAX_NAME_LEN: usize = 255;
 /// This many client interlocks are accepted; one more is refused.
 const MAX_INTERLOCKS: usize = 4096;
-/// Performance floor for evaluate_all over 1000 bare interlocks, median of 100 calls.
-/// Debug is generous (observed around 115 us); release allows about 2x headroom over the
-/// observed ~20 us floor.
-const EVALUATE_1000_MEDIAN_CEILING_US: u128 = if cfg!(debug_assertions) { 200 } else { 50 };
+/// Performance floor for evaluate_all over 1000 interlocks, median of 100 calls.
+/// Debug is generous; release allows about 2x headroom over the observed floor.
+/// The owned-interlock test shares this ceiling: each owned entry calls target_alive
+/// once per tick for its owner, adding inherent per-entry overhead.
+const EVALUATE_1000_MEDIAN_CEILING_US: u128 = if cfg!(debug_assertions) { 300 } else { 50 };
 
 fn words(h: &InterlockHandle) -> (u64, u64, u64) {
     let w = h.words();

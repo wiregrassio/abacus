@@ -9,7 +9,7 @@ use abacus_client::{
     AbacusClient, KeepalivePriority, SdkError, WatchedWord, DEFAULT_TOUCH_INTERVAL_MS,
     DEFAULT_TOUCH_TTL_MS,
 };
-use abacus_core::interlock::{interlock_arm, interlock_create};
+use abacus_core::interlock::{interlock_arm, interlock_create, interlock_create_clock};
 use abacus_tests::{
     unique_name, unique_socket_path, wait_for, FakeDaemon, RawClient, RawResponse, ThreadDaemon,
     ERR_ALLOCATION_FAILED, ERR_INTERLOCK_NOT_FOUND, ERR_INTERLOCK_REAPED, ERR_INVALID_REQUEST,
@@ -88,7 +88,7 @@ fn client__attach_clock_by_name_rejected_client_side() {
     let path = fake.socket_path().to_path_buf();
     let server = std::thread::spawn(move || -> Result<Vec<u8>, String> {
         let mut conn = fake.accept(Duration::from_secs(5))?;
-        let clock = interlock_create().map_err(|e| e.to_string())?;
+        let clock = interlock_create_clock().map_err(|e| e.to_string())?;
         interlock_arm(&clock, 60_000_000_000).map_err(|e| e.to_string())?;
         // connect step 1: attach("clock")
         let first = conn.recv_request()?;
@@ -160,7 +160,7 @@ fn client__poisoned_after_transport_error() {
         let mut conn = fake.accept(Duration::from_secs(5))?;
 
         // Handle the automatic clock attach that connect() performs.
-        let clock = interlock_create().map_err(|e| e.to_string())?;
+        let clock = interlock_create_clock().map_err(|e| e.to_string())?;
         interlock_arm(&clock, 60_000_000_000).map_err(|e| e.to_string())?;
         let req = conn.recv_request()?;
         if req.get(1) != Some(&TAG_ATTACH) {
@@ -292,7 +292,7 @@ fn client__daemon_error_codes_map_to_sdk_errors() {
     let path = fake.socket_path().to_path_buf();
     let server = std::thread::spawn(move || -> Result<(), String> {
         let mut conn = fake.accept(Duration::from_secs(5))?;
-        let clock = interlock_create().map_err(|e| e.to_string())?;
+        let clock = interlock_create_clock().map_err(|e| e.to_string())?;
         interlock_arm(&clock, 60_000_000_000).map_err(|e| e.to_string())?;
         // connect step 1: attach("clock")
         let first = conn.recv_request()?;

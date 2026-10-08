@@ -64,20 +64,22 @@ fn timer_error_policy_returns_rts_timeout_within_margin() {
     assert_eq!(client.min_fatal_margin_ms(), MIN_FATAL_MARGIN_MS);
     let timer = client.create_wait_timer("t-err").unwrap();
     assert_eq!(timer.timeout_policy(), TimeoutPolicy::Error);
-    assert_eq!(timer.margin_for(5), MIN_FATAL_MARGIN_MS);
-    assert_eq!(timer.margin_for(50), 100);
+    assert_eq!(timer.margin_for(5), MIN_FATAL_MARGIN_MS + 5);
+    assert_eq!(timer.margin_for(50), MIN_FATAL_MARGIN_MS + 50);
+    assert_eq!(timer.margin_for(200), 400);
 
     d.stop();
+    let expected_margin = timer.margin_for(5);
     let t0 = Instant::now();
     let r = timer.wait_ms(5);
     let elapsed = t0.elapsed();
     assert_eq!(r, Err(SdkError::DeliveryTimeout));
     assert!(
-        elapsed >= Duration::from_millis(MIN_FATAL_MARGIN_MS),
+        elapsed >= Duration::from_millis(expected_margin),
         "returned early: {elapsed:?}"
     );
     assert!(
-        elapsed < Duration::from_millis(MIN_FATAL_MARGIN_MS + 30),
+        elapsed < Duration::from_millis(expected_margin + 30),
         "returned late: {elapsed:?}"
     );
 

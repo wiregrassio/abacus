@@ -5,7 +5,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use abacus_core::interlock::{interlock_is_terminated, InterlockHandle, SENTINEL};
+use abacus_core::interlock::{
+    interlock_is_terminated, InterlockHandle, ReadOnlyInterlockHandle, SENTINEL,
+};
 
 use crate::client::SdkError;
 use crate::handle_ops;
@@ -24,12 +26,12 @@ pub struct ProcessClock {
 impl ProcessClock {
     pub(crate) fn new(
         handle: InterlockHandle,
-        clock: &InterlockHandle,
+        clock: &ReadOnlyInterlockHandle,
         name: String,
         id: u64,
         dependencies: Vec<String>,
     ) -> Result<Self, SdkError> {
-        let start_time = clock.words().open_count.load(Ordering::Acquire);
+        let start_time = clock.load_open();
         if !stamp_word(&handle.words().closed_count, start_time) {
             return Err(SdkError::InterlockReaped);
         }
@@ -101,7 +103,8 @@ mod tests {
         let handle = interlock_create().unwrap();
         let clock = interlock_create().unwrap();
         handle.words().open_count.store(SENTINEL, Ordering::Release);
-        match ProcessClock::new(handle.clone(), &clock, "test".into(), 1, Vec::new()) {
+        let clock_ro: ReadOnlyInterlockHandle = clock.into();
+        match ProcessClock::new(handle.clone(), &clock_ro, "test".into(), 1, Vec::new()) {
             Err(err) => assert_eq!(err, SdkError::InterlockReaped),
             Ok(_) => panic!("ProcessClock::new must refuse a SENTINEL open_count"),
         }

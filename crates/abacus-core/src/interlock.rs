@@ -17,6 +17,9 @@ pub const CLOCK_NAME: &str = "clock";
 pub const INTERLOCK_SIZE: usize = 24;
 /// TTL a freshly created interlock starts with, in nanoseconds (100 ms).
 pub const CREATION_TTL_NANOS: u64 = 100_000_000;
+/// TTL the daemon writes on its clock each tick, in nanoseconds (100 ms). Shared so the
+/// SDK can tie its fatal-margin floor to the same value.
+pub const CLOCK_TTL_NANOS: u64 = 100_000_000;
 /// The terminal marker. Any word at SENTINEL means the interlock is terminated.
 pub const SENTINEL: u64 = u64::MAX;
 
@@ -84,12 +87,87 @@ impl InterlockHandle {
 
     /// The three words.
     pub fn words(&self) -> &Interlock {
+        // SAFETY: the pointer was returned by mmap(MAP_SHARED, INTERLOCK_SIZE) and the
+        // backing memfd is sealed against shrink/grow, so the mapping cannot fault. The
+        // OwnedFd in the Arc keeps the mapping valid for the handle's lifetime. Layout is
+        // repr(C), 24 bytes, matching INTERLOCK_SIZE (static-asserted below the struct).
+        // All field access is through atomics, which is the intended concurrent-access model.
         unsafe { self.0.words.as_ref() }
     }
 
     /// The memfd backing this mapping.
     pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.0.fd.as_raw_fd()
+    }
+}
+
+/// A read-only reference-counted mapping of one interlock. Exposes only atomic loads
+/// and futex waits, never `&Interlock`. Used for `PROT_READ` mappings (the clock).
+#[derive(Clone, Debug)]
+pub struct ReadOnlyInterlockHandle(Arc<InterlockRegion>);
+
+impl ReadOnlyInterlockHandle {
+    pub(crate) fn from_raw(fd: OwnedFd, words: NonNull<Interlock>) -> Self {
+        Self(Arc::new(InterlockRegion { fd, words }))
+    }
+
+    /// Load open_count.
+    pub fn load_open(&self) -> u64 {
+        // SAFETY: same invariant as InterlockHandle::words (sealed memfd, Arc-held fd,
+        // repr(C) layout). Only atomic loads are performed; no store is possible through
+        // this type, which is the point: the mapping may be PROT_READ.
+        unsafe { self.0.words.as_ref() }
+            .open_count
+            .load(Ordering::Acquire)
+    }
+
+    /// Load closed_count.
+    pub fn load_closed(&self) -> u64 {
+        // SAFETY: see load_open.
+        unsafe { self.0.words.as_ref() }
+            .closed_count
+            .load(Ordering::Acquire)
+    }
+
+    /// Load expiration_ns.
+    pub fn load_expiration(&self) -> u64 {
+        // SAFETY: see load_open.
+        unsafe { self.0.words.as_ref() }
+            .expiration_ns
+            .load(Ordering::Acquire)
+    }
+
+    /// True if any word reads SENTINEL.
+    pub fn is_terminated(&self) -> bool {
+        self.load_open() == SENTINEL
+            || self.load_closed() == SENTINEL
+            || self.load_expiration() == SENTINEL
+    }
+
+    /// The memfd backing this mapping.
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.fd.as_raw_fd()
+    }
+
+    /// Futex-wait on open_count until its low 32 bits differ from `expected_lo32` or
+    /// `timeout_nanos` elapses. Only reads the memory; safe on a PROT_READ page.
+    pub fn futex_wait_open(&self, expected_lo32: u32, timeout_nanos: u64) -> std::result::Result<(), i32> {
+        // SAFETY: see load_open.
+        let word = unsafe { &self.0.words.as_ref().open_count };
+        crate::clock::futex_wait(word, expected_lo32, timeout_nanos)
+    }
+
+    /// Futex-wait on closed_count.
+    pub fn futex_wait_closed(&self, expected_lo32: u32, timeout_nanos: u64) -> std::result::Result<(), i32> {
+        // SAFETY: see load_open.
+        let word = unsafe { &self.0.words.as_ref().closed_count };
+        crate::clock::futex_wait(word, expected_lo32, timeout_nanos)
+    }
+}
+
+impl From<InterlockHandle> for ReadOnlyInterlockHandle {
+    fn from(handle: InterlockHandle) -> Self {
+        Self(handle.0)
     }
 }
 
@@ -140,39 +218,67 @@ pub fn interlock_create_clock() -> Result<InterlockHandle> {
     Ok(handle)
 }
 
+/// Minimum seals required on any received interlock fd.
+const REQUIRED_SEALS: libc::c_int = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+
+/// Additional seal the clock fd must carry.
+const CLOCK_EXTRA_SEALS: libc::c_int = F_SEAL_FUTURE_WRITE;
+
+/// Validate a received fd before mapping: check seals first (so size cannot change between
+/// check and map), then check size. `required_seals` is the bitmask the fd must carry.
+fn validate_received_fd(fd: &OwnedFd, required_seals: libc::c_int) -> Result<()> {
+    let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 || (seals & required_seals) != required_seals {
+        return Err(Condition::AllocationFailed {
+            step: AllocationStep::Validate,
+            errno: if seals < 0 { last_errno() } else { 0 },
+        });
+    }
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
+    if ret != 0 {
+        return Err(Condition::AllocationFailed {
+            step: AllocationStep::Validate,
+            errno: last_errno(),
+        });
+    }
+    if stat.st_size as usize != INTERLOCK_SIZE {
+        return Err(Condition::AllocationFailed {
+            step: AllocationStep::Validate,
+            errno: 0,
+        });
+    }
+    Ok(())
+}
+
 /// Map a raw interlock received as an fd. Read-write: both sides can touch all three words.
+/// Validates seals and size before mapping.
 pub fn interlock_map(fd: OwnedFd) -> Result<InterlockHandle> {
+    validate_received_fd(&fd, REQUIRED_SEALS)?;
     mmap_interlock(fd, libc::PROT_READ | libc::PROT_WRITE)
 }
 
 /// Map the clock interlock. Read-only: the daemon writes, clients only read the time.
-pub fn interlock_map_clock(fd: OwnedFd) -> Result<InterlockHandle> {
-    mmap_interlock(fd, libc::PROT_READ)
+/// Validates seals (including F_SEAL_FUTURE_WRITE) and size before mapping.
+pub fn interlock_map_clock(fd: OwnedFd) -> Result<ReadOnlyInterlockHandle> {
+    validate_received_fd(&fd, REQUIRED_SEALS | CLOCK_EXTRA_SEALS)?;
+    mmap_interlock_readonly(fd, libc::PROT_READ)
 }
 
-/// Map a WaitCounter interlock. Read-write (the SDK enforces which words are written).
-pub fn interlock_map_counter(fd: OwnedFd) -> Result<InterlockHandle> {
-    mmap_interlock(fd, libc::PROT_READ | libc::PROT_WRITE)
-}
-
-/// Map a WaitTimer interlock. Read-write (the SDK enforces which words are written).
-pub fn interlock_map_timer(fd: OwnedFd) -> Result<InterlockHandle> {
-    mmap_interlock(fd, libc::PROT_READ | libc::PROT_WRITE)
-}
-
-/// Map a WaitCron interlock. Read-write (the SDK enforces which words are written).
-pub fn interlock_map_cron(fd: OwnedFd) -> Result<InterlockHandle> {
-    mmap_interlock(fd, libc::PROT_READ | libc::PROT_WRITE)
-}
-
-/// Map a WaitBarrier interlock. Read-write (the SDK enforces which words are written).
-pub fn interlock_map_barrier(fd: OwnedFd) -> Result<InterlockHandle> {
-    mmap_interlock(fd, libc::PROT_READ | libc::PROT_WRITE)
+/// Map a received interlock read-only. Validates seals and size before mapping.
+/// A stray write faults instead of silently corrupting a peer.
+pub fn interlock_map_readonly(fd: OwnedFd) -> Result<ReadOnlyInterlockHandle> {
+    validate_received_fd(&fd, REQUIRED_SEALS)?;
+    mmap_interlock_readonly(fd, libc::PROT_READ)
 }
 
 /// Extend the expiration to `max(current, now + ttl_nanos)`. CAS-max: never decrements.
 /// Returns `InterlockReaped` if expiration already reads SENTINEL.
 /// A TTL past the end of the clock arms to SENTINEL - 1, never to SENTINEL.
+///
+/// This is the raw arm: it will revive an expired-but-not-yet-terminated interlock. The
+/// daemon uses it to recover its own clock after a stall. Client code should use
+/// `interlock_extend`, which terminates an expired interlock instead of reviving it.
 pub fn interlock_arm(handle: &InterlockHandle, ttl_nanos: u64) -> Result<()> {
     let expiration_ns = &handle.words().expiration_ns;
     // Never arm to SENTINEL: a saturated deadline would terminate the interlock.
@@ -182,6 +288,45 @@ pub fn interlock_arm(handle: &InterlockHandle, ttl_nanos: u64) -> Result<()> {
     loop {
         let current = expiration_ns.load(Ordering::Acquire);
         if current == SENTINEL {
+            return Err(Condition::InterlockReaped);
+        }
+        let target = current.max(deadline);
+        if target == current {
+            return Ok(());
+        }
+        match expiration_ns.compare_exchange_weak(
+            current,
+            target,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(_) => continue,
+        }
+    }
+}
+
+/// Client-safe arm: like `interlock_arm`, but terminates an interlock whose deadline has
+/// already passed instead of reviving it. Returns `InterlockReaped` if the expiration reads
+/// SENTINEL or has lapsed (current < now). On lapse, writes SENTINEL and wakes waiters so
+/// the daemon, waiters, and keepalive all agree it is dead.
+pub fn interlock_extend(handle: &InterlockHandle, ttl_nanos: u64) -> Result<()> {
+    let expiration_ns = &handle.words().expiration_ns;
+    let now = monotonic_now_nanos();
+    let deadline = now.saturating_add(ttl_nanos).min(SENTINEL - 1);
+    loop {
+        let current = expiration_ns.load(Ordering::Acquire);
+        if current == SENTINEL {
+            return Err(Condition::InterlockReaped);
+        }
+        if current < now {
+            if expiration_ns
+                .compare_exchange_weak(current, SENTINEL, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
+                crate::clock::futex_wake(&handle.words().open_count);
+                crate::clock::futex_wake(&handle.words().closed_count);
+            }
             return Err(Condition::InterlockReaped);
         }
         let target = current.max(deadline);
@@ -294,6 +439,16 @@ fn seal(fd: &OwnedFd) -> Result<()> {
 }
 
 fn mmap_interlock(fd: OwnedFd, prot: libc::c_int) -> Result<InterlockHandle> {
+    let words = mmap_raw(&fd, prot)?;
+    Ok(InterlockHandle::from_raw(fd, words))
+}
+
+fn mmap_interlock_readonly(fd: OwnedFd, prot: libc::c_int) -> Result<ReadOnlyInterlockHandle> {
+    let words = mmap_raw(&fd, prot)?;
+    Ok(ReadOnlyInterlockHandle::from_raw(fd, words))
+}
+
+fn mmap_raw(fd: &OwnedFd, prot: libc::c_int) -> Result<NonNull<Interlock>> {
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -310,9 +465,8 @@ fn mmap_interlock(fd: OwnedFd, prot: libc::c_int) -> Result<InterlockHandle> {
             errno: last_errno(),
         });
     }
-    let words = NonNull::new(ptr.cast::<Interlock>()).ok_or(Condition::AllocationFailed {
+    NonNull::new(ptr.cast::<Interlock>()).ok_or(Condition::AllocationFailed {
         step: AllocationStep::Mmap,
         errno: 0,
-    })?;
-    Ok(InterlockHandle::from_raw(fd, words))
+    })
 }

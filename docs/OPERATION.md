@@ -59,8 +59,11 @@ default set); a non-root container user needs the `abacus` group's gid (`group_a
 
 Every interlock costs the daemon one file descriptor and one 24-byte mapping. The registry
 cap is `--max-interlocks` (default 4096, excluding the clock); a create past the cap is
-rejected with InvalidRequest. The unit sets `LimitNOFILE=16384` so the cap, the client
-connections, and the fds in flight all fit. Names are 1 to 255 bytes.
+rejected with InvalidRequest. The connection cap is `--max-clients` (default 256); at the
+cap, new connections wait in the kernel backlog until a client disconnects. If the process
+hits its descriptor limit, the listener pauses until a disconnect frees a
+descriptor. The unit sets `LimitNOFILE=16384` so the cap, the client connections, and the
+fds in flight all fit. Names are 1 to 255 bytes.
 
 ## Timing contract
 
@@ -93,9 +96,10 @@ Pinning is not isolation. A daemon pinned to a shared core (one that other proce
 still be scheduled on) will stall past 10 ms about once in a few thousand waits. The
 `CPUAffinity` line in the service unit must come with kernel-level isolation (`isolcpus` boot
 parameter or a cpuset shield) to mean anything; without it, the OS scheduler can still place
-other work on the pinned core, and the daemon's 1 ms evaluation loop stalls. The 50 ms
-fatal-margin floor (`min_fatal_margin_ms`) is the defense until that kernel-level isolation
-exists: it absorbs the scheduling jitter that pinning alone does not prevent.
+other work on the pinned core, and the daemon's 1 ms evaluation loop stalls. The 100 ms
+fatal-margin floor (`min_fatal_margin_ms`, equal to the daemon clock TTL) is the defense
+until that kernel-level isolation exists: a WaitTimer's delivery-lateness tolerance is always
+at least the clock TTL, so it never gives up before the keepalive's clock-lapse check does.
 
 ### Host tuning
 
@@ -159,6 +163,9 @@ The daemon writes one line per event to stderr (`journalctl -u abacus`):
 | `abacus: response error, closing client: <errno>` | a response could not be written for a reason other than a dead peer |
 | `abacus: PR_SET_TIMERSLACK failed, errno=<n>` | timer slack stayed at the kernel default; timing degrades by up to 50 us |
 | `abacus: warning: mlockall failed, errno=<n> (page faults possible in hot loop)` | memory stayed unlocked; the daemon runs, with possible page-fault jitter (raise `LimitMEMLOCK`) |
+| `abacus: heartbeat write failed: <path>: <errno>` | the heartbeat file could not be written; logged once on the transition from success to failure |
+| `abacus: heartbeat write recovered: <path>` | the heartbeat file is writable again after a failure |
+| `abacus: heartbeat remove failed: <path>: <errno>` | the heartbeat file could not be removed on shutdown (NotFound is not reported) |
 
 A client that disconnects, is dropped for not reading its responses, or is dropped for a dead
 socket produces no line. Interlocks are never logged: the registry is observable only through
@@ -166,23 +173,27 @@ the SDK.
 
 ## Heartbeat
 
-The daemon writes `<runtime-dir>/heartbeat` once per second with the current epoch
-timestamp. External health checks can verify the daemon is alive without connecting to
-the socket:
+The daemon writes `<socket-path>.heartbeat` once per second with the current epoch
+timestamp. With the default socket path that is `/run/abacus/abacus.sock.heartbeat`.
+Each daemon writes its own file, so two daemons on different sockets in the same
+directory never collide. External health checks can verify the daemon is alive without
+connecting to the socket:
 
 ```
-test $(($(date +%s) - $(cat /run/abacus/heartbeat))) -lt 5
+test $(($(date +%s) - $(cat /run/abacus/abacus.sock.heartbeat))) -lt 5
 ```
 
 Docker HEALTHCHECK example:
 
 ```dockerfile
 HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
-  CMD test $(($(date +%s) - $(cat /run/abacus/heartbeat))) -lt 5
+  CMD test $(($(date +%s) - $(cat /run/abacus/abacus.sock.heartbeat))) -lt 5
 ```
 
 The file is removed on clean shutdown. After a SIGKILL it remains with a stale
-timestamp; the age check detects this within seconds.
+timestamp; the age check detects this within seconds. A write failure (read-only
+directory, full disk) is logged once on the transition to failure and once on recovery;
+the daemon continues evaluating interlocks.
 
 ## What a consumer sees when the daemon restarts
 
@@ -367,9 +378,9 @@ at SCHED_FIFO 70 (25 ms busy, 1 ms idle), ProcessClock TTL 100 ms. Soak survived
 Reading the numbers: on an idle isolated core the loop lands on the boundary (median 4999 us
 for a 5 ms wait, 4.3 us clock lateness). Under load the median is unchanged and the tail
 reaches 12 to 18 ms for `wait_ms` (which includes client-side futex and scheduling) while the
-daemon's own contribution stays under 18 us. The 50 ms fatal-margin floor has over 2700x
-margin against the worst observed daemon stall on an isolated core; the floor exists for
-deployments where core isolation is absent, where scheduling jitter reaches 12 to 18 ms.
+daemon's own contribution stays under 18 us. The 100 ms fatal-margin floor equals the
+daemon clock TTL; it is set by the consistency requirement that a WaitTimer never gives up
+before the keepalive's clock-lapse check, not by jitter measurements.
 
 To reproduce: build release, start `target/release/abacus --socket-path=/tmp/abacus-probe.sock`,
 then `cargo test --workspace --release --no-fail-fast -- --ignored --nocapture`. The timing

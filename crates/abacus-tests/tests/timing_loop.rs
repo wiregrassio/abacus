@@ -282,7 +282,7 @@ fn timing__cron_10ms_off_grid_under_1_percent() {
         let r = cron
             .wait()
             .unwrap_or_else(|e| panic!("cron wait {i} failed: {e}"));
-        if !r.completed_at.is_multiple_of(CRON_INTERVAL_MS) {
+        if CRON_INTERVAL_MS != 0 && r.completed_at % CRON_INTERVAL_MS != 0 {
             off_grid += 1;
         }
         if r.state == WaitState::Overrun {

@@ -10,8 +10,15 @@ use abacus_core::error::{IoOperation, StartupError, TransportError};
 use abacus_core::interlock::interlock_dup_fd;
 use abacus_wire::{Request, Response};
 
-use crate::registry::{CreateSpec, Registry, Tier, DEFAULT_MAX_INTERLOCKS};
+use crate::registry::{CreateSpec, Registry, Tier, DEFAULT_MAX_INTERLOCKS, DEFAULT_MAX_WATCH_EDGES};
 use crate::transport::{Connection, Server, SocketOptions};
+
+/// Default cap on live client connections.
+pub const DEFAULT_MAX_CLIENTS: usize = 256;
+
+/// Maximum connections accepted per daemon cycle. Matches the listen backlog so the kernel
+/// queue drains at most once before the tick and stop checks run.
+const MAX_ACCEPT_PER_CYCLE: usize = 64;
 
 /// Daemon configuration. Defaults match the `abacus` binary's flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,16 +31,23 @@ pub struct DaemonConfig {
     pub socket_group: Option<String>,
     /// Cap on live interlocks, excluding the clock.
     pub max_interlocks: usize,
+    /// Cap on total watch edges (dependencies + watched targets) across all live entries.
+    pub max_watch_edges: usize,
+    /// Cap on live client connections.
+    pub max_clients: usize,
 }
 
 impl DaemonConfig {
-    /// Defaults with the given socket path: mode 0660, group unchanged, 4096 interlocks.
+    /// Defaults with the given socket path: mode 0660, group unchanged, 4096 interlocks,
+    /// 32768 watch edges, 256 clients.
     pub fn new(socket_path: PathBuf) -> Self {
         Self {
             socket_path,
             socket_mode: 0o660,
             socket_group: None,
             max_interlocks: DEFAULT_MAX_INTERLOCKS,
+            max_watch_edges: DEFAULT_MAX_WATCH_EDGES,
+            max_clients: DEFAULT_MAX_CLIENTS,
         }
     }
 }
@@ -53,7 +67,7 @@ pub fn daemon_run_with(config: &DaemonConfig, stop: &AtomicBool) -> Result<(), S
         group: config.socket_group.clone(),
     };
     let server = Server::create(&config.socket_path, &options)?;
-    let mut registry = Registry::with_limit(config.max_interlocks)?;
+    let mut registry = Registry::with_limits(config.max_interlocks, config.max_watch_edges)?;
     set_timer_slack();
 
     eprintln!("abacus: daemon running on {}", config.socket_path.display());
@@ -62,14 +76,16 @@ pub fn daemon_run_with(config: &DaemonConfig, stop: &AtomicBool) -> Result<(), S
     let mut next_due = anchor;
     let mut clients: Vec<Connection> = Vec::new();
     let mut pollfds: Vec<libc::pollfd> = Vec::new();
-    rebuild_pollfds(&mut pollfds, &server, &clients);
+    let mut fd_pressure = false;
+    rebuild_pollfds(&mut pollfds, &server, &clients, true);
 
-    let heartbeat_path = config
-        .socket_path
-        .parent()
-        .map(|p| p.join("heartbeat"))
-        .unwrap_or_else(|| PathBuf::from("heartbeat"));
+    let heartbeat_path = {
+        let mut p = config.socket_path.as_os_str().to_os_string();
+        p.push(".heartbeat");
+        PathBuf::from(p)
+    };
     let mut last_heartbeat_s: u64 = 0;
+    let mut heartbeat_ok = true;
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -101,7 +117,11 @@ pub fn daemon_run_with(config: &DaemonConfig, stop: &AtomicBool) -> Result<(), S
         let mut changed = false;
 
         if poll_ret > 0 && pollfds[0].revents & libc::POLLIN != 0 {
+            let mut accepted = 0usize;
             loop {
+                if accepted >= MAX_ACCEPT_PER_CYCLE || clients.len() >= config.max_clients {
+                    break;
+                }
                 match server.try_accept() {
                     Ok(Some(conn)) => {
                         if let Err(e) = conn.set_nonblocking(true) {
@@ -109,9 +129,30 @@ pub fn daemon_run_with(config: &DaemonConfig, stop: &AtomicBool) -> Result<(), S
                             continue;
                         }
                         clients.push(conn);
+                        accepted += 1;
                         changed = true;
                     }
                     Ok(None) => break,
+                    Err(TransportError::Io {
+                        operation: IoOperation::Accept,
+                        errno,
+                    }) => {
+                        if errno == libc::EMFILE || errno == libc::ENFILE {
+                            if !fd_pressure {
+                                eprintln!(
+                                    "abacus: accept: descriptor limit reached, pausing listener"
+                                );
+                                fd_pressure = true;
+                                changed = true;
+                            }
+                        } else if errno != libc::ECONNABORTED
+                            && errno != libc::EINTR
+                            && errno != libc::EPROTO
+                        {
+                            eprintln!("abacus: accept error: errno={errno}");
+                        }
+                        break;
+                    }
                     Err(e) => {
                         eprintln!("abacus: accept error: {e}");
                         break;
@@ -138,8 +179,13 @@ pub fn daemon_run_with(config: &DaemonConfig, stop: &AtomicBool) -> Result<(), S
                 }
             }
         }
-        for i in to_remove.into_iter().rev() {
-            clients.remove(i);
+        if !to_remove.is_empty() {
+            if fd_pressure {
+                fd_pressure = false;
+            }
+            for i in to_remove.into_iter().rev() {
+                clients.remove(i);
+            }
             changed = true;
         }
 
@@ -155,17 +201,44 @@ pub fn daemon_run_with(config: &DaemonConfig, stop: &AtomicBool) -> Result<(), S
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             if epoch_s != last_heartbeat_s {
-                let _ = std::fs::write(&heartbeat_path, format!("{epoch_s}\n"));
+                match std::fs::write(&heartbeat_path, format!("{epoch_s}\n")) {
+                    Ok(()) => {
+                        if !heartbeat_ok {
+                            eprintln!(
+                                "abacus: heartbeat write recovered: {}",
+                                heartbeat_path.display()
+                            );
+                            heartbeat_ok = true;
+                        }
+                    }
+                    Err(e) => {
+                        if heartbeat_ok {
+                            eprintln!(
+                                "abacus: heartbeat write failed: {}: {e}",
+                                heartbeat_path.display()
+                            );
+                            heartbeat_ok = false;
+                        }
+                    }
+                }
                 last_heartbeat_s = epoch_s;
             }
         }
 
         if changed {
-            rebuild_pollfds(&mut pollfds, &server, &clients);
+            let listening = !fd_pressure && clients.len() < config.max_clients;
+            rebuild_pollfds(&mut pollfds, &server, &clients, listening);
         }
     }
 
-    let _ = std::fs::remove_file(&heartbeat_path);
+    if let Err(e) = std::fs::remove_file(&heartbeat_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "abacus: heartbeat remove failed: {}: {e}",
+                heartbeat_path.display()
+            );
+        }
+    }
 
     Ok(())
 }
@@ -179,12 +252,17 @@ fn first_tick_boundary(now_ns: u64) -> u64 {
 
 /// Rebuild the pollfds vector in place: clear and refill without deallocating.
 /// The server listener is always index 0; clients follow.
-fn rebuild_pollfds(pollfds: &mut Vec<libc::pollfd>, server: &Server, clients: &[Connection]) {
+fn rebuild_pollfds(
+    pollfds: &mut Vec<libc::pollfd>,
+    server: &Server,
+    clients: &[Connection],
+    listen: bool,
+) {
     pollfds.clear();
     pollfds.reserve(1 + clients.len());
     pollfds.push(libc::pollfd {
         fd: server.as_raw_fd(),
-        events: libc::POLLIN,
+        events: if listen { libc::POLLIN } else { 0 },
         revents: 0,
     });
     for client in clients {

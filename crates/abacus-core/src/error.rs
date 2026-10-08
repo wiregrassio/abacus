@@ -42,6 +42,8 @@ pub enum AllocationStep {
     Mmap,
     /// `dup` of the interlock fd for handout failed.
     Dup,
+    /// A received fd failed pre-map validation (wrong size or missing seals).
+    Validate,
 }
 
 impl fmt::Display for Condition {

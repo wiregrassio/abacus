@@ -15,11 +15,10 @@ use abacus_tests::{
 
 const MS: u64 = 1_000_000;
 
-/// CONTRACTS.md TTL rules as amended: wait_ms(W) arms the TTL to
-/// max(2 * W, MIN_FATAL_MARGIN_MS) so the interlock cannot be reaped while legitimately
-/// waiting. Observed through expiration_ns while the wait is in flight. The 2W case is
-/// visible above the touch thread's own arm; the floor case is a lower bound only, since the
-/// touch thread arms further ahead than 20 ms.
+/// TTL rules: wait_ms(W) arms the TTL to W + max(W, MIN_FATAL_MARGIN_MS) so the interlock
+/// cannot be reaped while legitimately waiting. Above the floor the margin is 2W; at or
+/// below it the margin is W + floor. Observed through expiration_ns while the wait is in
+/// flight.
 #[test]
 fn wait_timer__ttl_is_2x_wait_or_floor() {
     let d = ThreadDaemon::start("d4-ttl");
@@ -53,8 +52,9 @@ fn wait_timer__ttl_is_2x_wait_or_floor() {
     let r = recv_within(&rx, Duration::from_millis(500)).expect("wait_ms(100) never returned");
     assert!(r.is_ok(), "{r:?}");
 
-    // Floor: wait_ms(5) arms at least MIN_FATAL_MARGIN_MS.
+    // Floor: wait_ms(5) arms at least W + MIN_FATAL_MARGIN_MS = 105.
     let t1 = monotonic_now_nanos();
+    let expected_floor_margin = 5 + MIN_FATAL_MARGIN_MS;
     let r = timer.wait_ms(5).expect("wait_ms(5)");
     assert!(
         matches!(r.state, WaitState::Normal | WaitState::Overrun),
@@ -62,8 +62,8 @@ fn wait_timer__ttl_is_2x_wait_or_floor() {
     );
     let (_, _, exp) = interlock_words(&view);
     assert!(
-        exp >= t1 + MIN_FATAL_MARGIN_MS * MS,
-        "after wait_ms(5) expiration is only {} ms past the call; floor is {MIN_FATAL_MARGIN_MS}",
+        exp >= t1 + expected_floor_margin * MS,
+        "after wait_ms(5) expiration is only {} ms past the call; expected at least {expected_floor_margin}",
         exp.saturating_sub(t1) / MS
     );
 
@@ -116,8 +116,8 @@ fn wait_timer__wait_ms_zero_does_not_abort() {
 }
 
 /// Under TimeoutPolicy::Error a daemon that stops delivering produces
-/// Err(SdkError::DeliveryTimeout) after the fatal margin, and the process lives. The daemon is
-/// stopped with SIGSTOP for the duration.
+/// Err(SdkError::InterlockReaped) once the clock TTL lapses, and the process lives. The
+/// daemon is stopped with SIGSTOP for the duration.
 #[test]
 fn wait_timer__rts_timeout_is_an_error_under_error_policy() {
     let mut d = ProcessDaemon::start(&abacus_binary(), "d4-error-policy");
@@ -130,19 +130,20 @@ fn wait_timer__rts_timeout_is_an_error_under_error_policy() {
     let elapsed = t0.elapsed();
     d.kill(libc::SIGCONT);
     assert!(
-        matches!(r, Err(SdkError::DeliveryTimeout)),
+        matches!(r, Err(SdkError::InterlockReaped)),
         "stopped daemon: wait_ms(5) returned {r:?} after {elapsed:?}"
     );
+    let expected_margin = MIN_FATAL_MARGIN_MS + 5;
     assert!(
-        elapsed >= Duration::from_millis(MIN_FATAL_MARGIN_MS)
-            && elapsed < Duration::from_millis(MIN_FATAL_MARGIN_MS + 40),
-        "DeliveryTimeout after {elapsed:?}, expected about {MIN_FATAL_MARGIN_MS} ms"
+        elapsed >= Duration::from_millis(expected_margin)
+            && elapsed < Duration::from_millis(expected_margin + 40),
+        "InterlockReaped after {elapsed:?}, expected about {expected_margin} ms"
     );
 }
 
 /// ARCHITECTURE.md, a daemon restart wakes nobody; the
-/// waiter learns of it through DeliveryTimeout under TimeoutPolicy::Error, and a fresh client
-/// connects and creates on the new daemon.
+/// waiter learns of it through InterlockReaped once the clock TTL lapses under
+/// TimeoutPolicy::Error, and a fresh client connects and creates on the new daemon.
 #[test]
 fn daemon__restart_wakes_nobody_and_timers_time_out() {
     let mut d = ProcessDaemon::start(&abacus_binary(), "d4-restart");
@@ -163,12 +164,12 @@ fn daemon__restart_wakes_nobody_and_timers_time_out() {
         )
     });
     assert!(
-        matches!(r, Err(SdkError::DeliveryTimeout)),
+        matches!(r, Err(SdkError::InterlockReaped)),
         "waiter across a restart returned {r:?} after {elapsed:?}"
     );
     assert!(
         elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(200),
-        "DeliveryTimeout after {elapsed:?}, expected about 2 x 50 ms"
+        "InterlockReaped after {elapsed:?}, expected about the fatal margin"
     );
     assert!(
         !client.is_connected(),

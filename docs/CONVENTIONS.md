@@ -40,7 +40,7 @@ target named `abacus` (`crates/abacus-daemon/CLAUDE.md`).
 Functions and types:
 
 - Core shared-memory operations use a `interlock_` verb prefix: `interlock_create`, `interlock_map`, `interlock_arm`, `interlock_reap`, `interlock_free`, `interlock_is_terminated`, `interlock_dup_fd`, `interlock_read_expiration` (`crates/abacus-core/src/interlock.rs`).
-- Tier-specific mapping functions extend that prefix: `interlock_map_clock`, `interlock_map_counter`, `interlock_map_timer`, `interlock_map_cron`, `interlock_map_barrier` (`crates/abacus-core/src/interlock.rs`).
+- Read-only and clock mapping functions extend that prefix: `interlock_map_readonly`, `interlock_map_clock` (`crates/abacus-core/src/interlock.rs`).
 - Futex helpers use a `futex_` prefix: `futex_wait`, `futex_wake`, `futex_word`, `futex_addr` (`crates/abacus-core/src/clock.rs`).
 - Codec functions pair as `encode_`/`decode_`: `encode_request`, `decode_request`, `encode_response`, `decode_response` (`crates/abacus-wire/src/codec.rs`).
 - SDK handle types are the tier name in `CamelCase`: `Interlock`, `AttachedInterlock`, `AttachedWaitCounter`, `ClockHandle`, `WaitCounter`, `WaitTimer`, `WaitCron`, `WaitBarrier`, `WaitRace`, `ProcessClock` (`crates/abacus-client/src/lib.rs`).

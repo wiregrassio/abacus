@@ -3,13 +3,16 @@
 
 use std::sync::atomic::Ordering;
 
-use abacus_core::clock::{futex_wait, futex_word, monotonic_now_nanos, ms_to_nanos};
+use abacus_core::clock::{
+    classify_futex_result, futex_wait, futex_word, monotonic_now_nanos, ms_to_nanos, FutexOutcome,
+};
 use abacus_core::interlock::{
-    interlock_arm, interlock_free, interlock_is_terminated, InterlockHandle, SENTINEL,
+    interlock_extend, interlock_free, interlock_is_terminated, InterlockHandle,
+    ReadOnlyInterlockHandle, SENTINEL,
 };
 
 use crate::client::SdkError;
-use crate::handle_ops;
+use crate::handle_ops::{self, check_live};
 use crate::touch::{Keepalive, TouchHandle};
 use crate::types::{
     classify_wake, default_touch_ttl_ms, WaitResult, WaitState, DEFAULT_TOUCH_INTERVAL_MS,
@@ -19,17 +22,26 @@ use crate::types::{
 /// daemon's response). A timeout is the caller's to interpret.
 pub struct WaitCounter {
     handle: InterlockHandle,
+    clock: ReadOnlyInterlockHandle,
     touch: Option<TouchHandle>,
 }
 
 impl WaitCounter {
-    pub(crate) fn new(handle: InterlockHandle, keepalive: &Keepalive) -> Result<Self, SdkError> {
+    pub(crate) fn new(
+        handle: InterlockHandle,
+        clock: ReadOnlyInterlockHandle,
+        keepalive: &Keepalive,
+    ) -> Result<Self, SdkError> {
         let touch = Some(keepalive.register(
             handle.clone(),
             DEFAULT_TOUCH_INTERVAL_MS,
             default_touch_ttl_ms(DEFAULT_TOUCH_INTERVAL_MS),
         )?);
-        Ok(Self { handle, touch })
+        Ok(Self {
+            handle,
+            clock,
+            touch,
+        })
     }
 
     /// Set open_count = target (CAS-max), arm a TTL of 2 * timeout_ms, and wait on
@@ -59,16 +71,13 @@ impl WaitCounter {
             }
         }
 
-        // timeout 0 means "poll once and return", not "block forever".
-        // ms_to_nanos(0) == 0, and futex_wait interprets 0 as indefinite, so we
-        // check for immediate delivery and return Timeout if not yet delivered.
+        // timeout 0 means "poll once and return": check for immediate delivery
+        // and return Timeout if not yet delivered, without arming a TTL.
         if timeout_nanos == 0 {
+            check_live(&self.handle, Some(&self.clock), monotonic_now_nanos())?;
             let closed = words.closed_count.load(Ordering::Acquire);
             let open_val = words.open_count.load(Ordering::Acquire);
             if closed == SENTINEL || open_val == SENTINEL {
-                return Err(SdkError::InterlockReaped);
-            }
-            if words.expiration_ns.load(Ordering::Acquire) == SENTINEL {
                 return Err(SdkError::InterlockReaped);
             }
             if let Some(state) = classify_wake(open_val, closed) {
@@ -83,11 +92,13 @@ impl WaitCounter {
             });
         }
 
-        interlock_arm(&self.handle, timeout_nanos.saturating_mul(2)).map_err(SdkError::from)?;
+        interlock_extend(&self.handle, timeout_nanos.saturating_mul(2)).map_err(SdkError::from)?;
 
         let closed_word = &words.closed_count;
         let deadline_ns = monotonic_now_nanos().saturating_add(timeout_nanos);
         loop {
+            let now_ns = monotonic_now_nanos();
+            check_live(&self.handle, Some(&self.clock), now_ns)?;
             let closed = closed_word.load(Ordering::Acquire);
             let open = words.open_count.load(Ordering::Acquire);
             if closed == SENTINEL || open == SENTINEL {
@@ -99,10 +110,6 @@ impl WaitCounter {
                     state,
                 });
             }
-            if words.expiration_ns.load(Ordering::Acquire) == SENTINEL {
-                return Err(SdkError::InterlockReaped);
-            }
-            let now_ns = monotonic_now_nanos();
             if now_ns >= deadline_ns {
                 return Ok(WaitResult {
                     completed_at: closed,
@@ -111,7 +118,13 @@ impl WaitCounter {
             }
             // A spurious wake, EINTR, EAGAIN, or a closed_count change short of delivery waits
             // out only what is left of the caller's timeout, never a fresh full one.
-            let _ = futex_wait(closed_word, futex_word(closed), deadline_ns - now_ns);
+            if let FutexOutcome::Fatal(errno) = classify_futex_result(futex_wait(
+                closed_word,
+                futex_word(closed),
+                deadline_ns - now_ns,
+            )) {
+                return Err(SdkError::FutexFailed { errno });
+            }
         }
     }
 
@@ -140,6 +153,12 @@ impl WaitCounter {
         interlock_is_terminated(&self.handle) || self.touch.as_ref().is_some_and(|t| t.is_reaped())
     }
 
+    /// True when the daemon clock's expiration is SENTINEL or earlier than now.
+    pub(crate) fn is_clock_dead(&self) -> bool {
+        let exp = self.clock.load_expiration();
+        exp == SENTINEL || exp < monotonic_now_nanos()
+    }
+
     /// Terminate: stop the keepalive and stamp SENTINEL on expiration.
     pub fn free(&mut self) {
         self.touch.take();
@@ -161,7 +180,12 @@ mod tests {
     fn wakes_short_of_delivery_do_not_extend_the_timeout() {
         let k = Keepalive::new();
         let h = interlock_create().unwrap();
-        let counter = WaitCounter::new(h.clone(), &k).unwrap();
+        let clock = interlock_create().unwrap();
+        clock
+            .words()
+            .expiration_ns
+            .store(u64::MAX - 1, Ordering::Release);
+        let counter = WaitCounter::new(h.clone(), clock.into(), &k).unwrap();
         // A peer bumps closed_count short of the target and wakes the waiter every 10 ms
         // for 1 s; with no daemon, nothing ever delivers.
         let stop = Arc::new(AtomicBool::new(false));

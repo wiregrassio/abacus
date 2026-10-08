@@ -20,7 +20,8 @@ use abacus_client::{AbacusClient, Interlock, WaitState, WatchedWord};
 use abacus_core::error::{AllocationStep, Condition};
 use abacus_core::interlock::{interlock_map, SENTINEL};
 use abacus_tests::{
-    abacus_binary, attach_words, attach_words_readonly, describe_exit, interlock_words, role_args,
+    abacus_binary, attach_words, attach_words_readonly, describe_exit, interlock_words,
+    interlock_words_readonly, role_args,
     role_command, run_child, serialized, unique_name, wait_child, wait_for, ProcessDaemon,
     RawClient, RawResponse, Rng, TIER_WAIT_CRON,
 };
@@ -463,7 +464,7 @@ fn abuse__attach_clock_and_write_to_it() {
         "writable mmap of clock fd should fail with EPERM: {r:?}"
     );
     let view = attach_words_readonly(d.socket_path(), "clock");
-    let (open, _, _) = interlock_words(&view);
+    let (open, _, _) = interlock_words_readonly(&view);
     assert!(open > 0, "clock is advancing");
     assert_daemon_serves(&mut d, "after failed clock scribble");
     assert_daemon_idle(&mut d, "after failed clock scribble");
