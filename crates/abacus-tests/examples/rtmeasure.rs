@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use abacus_client::{AbacusClient, KeepalivePriority, SdkError, WatchedWord};
+use abacus_client::{AbacusClient, KeepalivePriority, WatchedWord};
 use abacus_core::clock::{monotonic_now_nanos, NANOS_PER_MS};
 use abacus_tests::pin_current_thread;
 
@@ -578,7 +578,6 @@ struct CellSamples {
     stamp_to_running: Vec<u64>,
     spinner_late: u64,
     clock_skips: u64,
-    timeouts: u64,
     unmatched: u64,
     spinner_policy: i32,
     spinner_priority: i32,
@@ -615,7 +614,6 @@ fn run_sweep(cfg: &SweepConfig) {
         Duration::from_secs(60),
     )
     .unwrap_or_else(|e| panic!("connect: {e}"));
-    client.set_timeout_policy(abacus_client::TimeoutPolicy::Error);
 
     let mut csv = fs::File::create(cfg.out.join("samples.csv"))
         .unwrap_or_else(|e| panic!("create samples.csv: {e}"));
@@ -670,7 +668,6 @@ fn run_sweep(cfg: &SweepConfig) {
                     Duration::from_secs(60),
                 )
                 .unwrap_or_else(|e| panic!("loader connect: {e}"));
-                loader_client.set_timeout_policy(abacus_client::TimeoutPolicy::Error);
 
                 let mut interlocks = Vec::new();
                 let mut counters = Vec::new();
@@ -804,9 +801,9 @@ fn run_sweep(cfg: &SweepConfig) {
                 );
                 summary_lines.push(format!(
                     "cell load={load_name} entries={entry_count} \
-                     spinner_late={} clock_skips={} timeouts={} unmatched={} \
+                     spinner_late={} clock_skips={} unmatched={} \
                      spinner={spinner_desc} waiter={waiter_desc}",
-                    cell.spinner_late, cell.clock_skips, cell.timeouts, cell.unmatched,
+                    cell.spinner_late, cell.clock_skips, cell.unmatched,
                 ));
 
                 prev_timer = Some(timer);
@@ -864,7 +861,6 @@ fn run_cell(
     // Waiter data
     let waiter_samples: Arc<std::sync::Mutex<Vec<(u64, u64)>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-    let waiter_timeouts = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let waiter_sched = Arc::new(std::sync::Mutex::new((0i32, 0i32)));
 
     thread::scope(|scope| {
@@ -951,7 +947,6 @@ fn run_cell(
         // Waiter thread (core 7, SCHED_FIFO 80)
         let w_stop = Arc::clone(&stop);
         let w_samples = waiter_samples.clone();
-        let w_timeouts = waiter_timeouts.clone();
         let w_sched = waiter_sched.clone();
 
         scope.spawn(move || {
@@ -965,9 +960,6 @@ fn run_cell(
                     Ok(r) => {
                         let t_waiter = monotonic_now_nanos();
                         w_samples.lock().unwrap().push((r.completed_at, t_waiter));
-                    }
-                    Err(SdkError::DeliveryTimeout) => {
-                        w_timeouts.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => panic!("waiter error: {e}"),
                 }
@@ -1018,7 +1010,6 @@ fn run_cell(
         stamp_to_running,
         spinner_late: spinner_late_count.load(Ordering::Relaxed),
         clock_skips: clock_skip_count.load(Ordering::Relaxed),
-        timeouts: waiter_timeouts.load(Ordering::Relaxed),
         unmatched,
         spinner_policy: sp,
         spinner_priority: spri,
@@ -1050,7 +1041,6 @@ fn run_soak(cfg: &SoakConfig) {
         Duration::from_secs(60),
     )
     .unwrap_or_else(|e| panic!("connect: {e}"));
-    // Default TimeoutPolicy::Abort is correct for soak
 
     client
         .set_process_clock_ttl_ms(cfg.ttl_ms)

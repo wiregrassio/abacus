@@ -1,16 +1,14 @@
-//! Tests timeout-policy behavior, timer TTL margins, zero-duration waits, daemon stalls,
-//! and daemon restart semantics.
+//! Tests timer TTL margins and zero-duration waits.
 
 #![allow(non_snake_case)]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use abacus_client::{SdkError, TimeoutPolicy, WaitState, MIN_FATAL_MARGIN_MS};
+use abacus_client::{WaitState, MIN_FATAL_MARGIN_MS};
 use abacus_core::clock::monotonic_now_nanos;
 use abacus_tests::{
-    abacus_binary, attach_words, interlock_words, on_thread, recv_within, wait_for, wait_for_value,
-    ProcessDaemon, ThreadDaemon,
+    attach_words, interlock_words, on_thread, recv_within, wait_for, wait_for_value, ThreadDaemon,
 };
 
 const MS: u64 = 1_000_000;
@@ -113,75 +111,4 @@ fn wait_timer__wait_ms_zero_does_not_abort() {
     let past = client.clock().now_ms() - 50;
     let r = timer.wait_until(past);
     assert!(r.is_ok(), "wait_until(past) returned {r:?}");
-}
-
-/// Under TimeoutPolicy::Error a daemon that stops delivering produces
-/// Err(SdkError::InterlockReaped) once the clock TTL lapses, and the process lives. The
-/// daemon is stopped with SIGSTOP for the duration.
-#[test]
-fn wait_timer__rts_timeout_is_an_error_under_error_policy() {
-    let mut d = ProcessDaemon::start(&abacus_binary(), "d4-error-policy");
-    let mut client = d.client();
-    client.set_timeout_policy(TimeoutPolicy::Error);
-    let timer = client.create_wait_timer("t").expect("create timer");
-    d.kill(libc::SIGSTOP);
-    let t0 = Instant::now();
-    let r = timer.wait_ms(5);
-    let elapsed = t0.elapsed();
-    d.kill(libc::SIGCONT);
-    assert!(
-        matches!(r, Err(SdkError::InterlockReaped)),
-        "stopped daemon: wait_ms(5) returned {r:?} after {elapsed:?}"
-    );
-    let expected_margin = MIN_FATAL_MARGIN_MS + 5;
-    assert!(
-        elapsed >= Duration::from_millis(expected_margin)
-            && elapsed < Duration::from_millis(expected_margin + 40),
-        "InterlockReaped after {elapsed:?}, expected about {expected_margin} ms"
-    );
-}
-
-/// ARCHITECTURE.md, a daemon restart wakes nobody; the
-/// waiter learns of it through InterlockReaped once the clock TTL lapses under
-/// TimeoutPolicy::Error, and a fresh client connects and creates on the new daemon.
-#[test]
-fn daemon__restart_wakes_nobody_and_timers_time_out() {
-    let mut d = ProcessDaemon::start(&abacus_binary(), "d4-restart");
-    let mut client = d.client();
-    client.set_timeout_policy(TimeoutPolicy::Error);
-    let timer = Arc::new(client.create_wait_timer("t").expect("create timer"));
-    let t = timer.clone();
-    let rx = on_thread(move || {
-        let t0 = Instant::now();
-        (t.wait_ms(50), t0.elapsed())
-    });
-    std::thread::sleep(Duration::from_millis(5)); // ordering only
-    d.restart();
-    let (r, elapsed) = recv_within(&rx, Duration::from_millis(500)).unwrap_or_else(|e| {
-        panic!(
-            "waiter never returned after restart: {e}; peek={:?}",
-            timer.peek()
-        )
-    });
-    assert!(
-        matches!(r, Err(SdkError::InterlockReaped)),
-        "waiter across a restart returned {r:?} after {elapsed:?}"
-    );
-    assert!(
-        elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(200),
-        "InterlockReaped after {elapsed:?}, expected about the fatal margin"
-    );
-    assert!(
-        !client.is_connected(),
-        "old connection still reports connected after restart"
-    );
-    let mut fresh = d.client();
-    let fresh_timer = fresh
-        .create_wait_timer("t2")
-        .expect("create on restarted daemon");
-    let r = fresh_timer.wait_ms(20).expect("wait on restarted daemon");
-    assert!(
-        matches!(r.state, WaitState::Normal | WaitState::Overrun),
-        "{r:?}"
-    );
 }

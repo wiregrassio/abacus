@@ -27,8 +27,7 @@ Static import scan (`docs`): no in-repo consumers found.
 <known-hazards>
 ## Known Hazards
 CRITICAL: Socket peers are unauthenticated. Any process able to open the socket can replace names and terminate writable objects.
-HIGH: `TimeoutPolicy::Abort` can terminate every connected default-policy client after a daemon stall exceeding the 100 ms clock TTL.
-HIGH: Under `TimeoutPolicy::Error`, `WaitCounter` lacks the daemon clock and can return `Timeout` forever after daemon death.
+HIGH: A daemon stall exceeding the 100 ms clock TTL aborts every connected client.
 HIGH: Except for the clock, tier write restrictions are SDK conventions over read-write mappings, not kernel-enforced permissions.
 HIGH: CPU affinity without kernel-level isolation does not provide the documented timing envelope and can trigger fatal liveness failures.
 HIGH: Stale-socket detection can unlink a live daemon socket after permission or transient backlog failures.

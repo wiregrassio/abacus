@@ -23,8 +23,8 @@ use crate::interlock::{AttachedInterlock, AttachedWaitCounter, ClockHandle, Inte
 use crate::process_clock::ProcessClock;
 use crate::touch::Keepalive;
 use crate::types::{
-    KeepalivePriority, Liveness, TimeoutPolicy, WatchedWord, CONNECT_RETRY_INTERVAL,
-    DEFAULT_TRANSPORT_TIMEOUT, MIN_FATAL_MARGIN_MS,
+    KeepalivePriority, WatchedWord, CONNECT_RETRY_INTERVAL, DEFAULT_TRANSPORT_TIMEOUT,
+    MIN_FATAL_MARGIN_MS,
 };
 use crate::wait_barrier::WaitBarrier;
 use crate::wait_counter::WaitCounter;
@@ -67,8 +67,6 @@ pub enum SdkError {
         /// What.
         message: String,
     },
-    /// A WaitTimer's fatal margin elapsed without delivery, under `TimeoutPolicy::Error`.
-    DeliveryTimeout,
     /// A dependency or the daemon did not appear within the ceiling passed to `connect_waiting`.
     DependencyTimeout {
         /// How long the wait ran.
@@ -114,10 +112,6 @@ impl std::fmt::Display for SdkError {
             Self::MmapFailed { message } => write!(f, "mmap failed: {message}"),
             Self::InvalidRequest { message } => write!(f, "invalid request: {message}"),
             Self::UnexpectedResponse { message } => write!(f, "unexpected response: {message}"),
-            Self::DeliveryTimeout => write!(
-                f,
-                "DeliveryTimeout: daemon did not deliver within the margin"
-            ),
             Self::DependencyTimeout { waited, missing } => {
                 write!(f, "dependency timeout: waited {waited:?} for \"{missing}\"")
             }
@@ -267,7 +261,6 @@ pub struct AbacusClient {
     conn: ClientConn,
     clock: ClockHandle,
     keepalive: Keepalive,
-    timeout_policy: TimeoutPolicy,
     min_fatal_margin_ms: u64,
     process_clock: ProcessClock,
     clock_name: String,
@@ -280,7 +273,7 @@ impl AbacusClient {
     ///
     /// `clock_name` identifies one live process. If another client already holds a
     /// ProcessClock with this name, connecting reaps it: the holder aborts with
-    /// `ProcessClockReaped` (or reports it under `TimeoutPolicy::Error`), every entry
+    /// `ProcessClockReaped`, every entry
     /// the holder owns is reaped, and every ProcessClock or entry that listed the name
     /// as a dependency is reaped too. Dependencies are bound by registry id, so they do
     /// not move to the new holder. Tested by
@@ -327,7 +320,6 @@ impl AbacusClient {
             conn,
             clock: ClockHandle::new(clock_handle),
             keepalive,
-            timeout_policy: TimeoutPolicy::default(),
             min_fatal_margin_ms: MIN_FATAL_MARGIN_MS,
             process_clock,
             clock_name: clock_name.to_string(),
@@ -362,12 +354,8 @@ impl AbacusClient {
             let remaining = max_wait - elapsed;
             let attempt_timeout = remaining.min(DEFAULT_TRANSPORT_TIMEOUT);
 
-            match Self::connect_with_timeout(
-                socket_path,
-                clock_name,
-                dependencies,
-                attempt_timeout,
-            ) {
+            match Self::connect_with_timeout(socket_path, clock_name, dependencies, attempt_timeout)
+            {
                 Ok(client) => return Ok(client),
                 Err(SdkError::Transport(TransportError::Io {
                     operation: IoOperation::Connect,
@@ -399,18 +387,6 @@ impl AbacusClient {
             let remaining = max_wait.saturating_sub(start.elapsed());
             std::thread::sleep(CONNECT_RETRY_INTERVAL.min(remaining));
         }
-    }
-
-    /// The policy WaitTimers created after this call use on a missed fatal margin.
-    /// Also sets the keepalive's liveness policy.
-    pub fn set_timeout_policy(&mut self, policy: TimeoutPolicy) {
-        self.timeout_policy = policy;
-        self.keepalive.set_policy(policy);
-    }
-
-    /// The current timeout policy.
-    pub fn timeout_policy(&self) -> TimeoutPolicy {
-        self.timeout_policy
     }
 
     /// The fatal-margin floor WaitTimers created after this call use. Default
@@ -447,8 +423,7 @@ impl AbacusClient {
         self.keepalive.set_process_ttl_ms(ttl_ms)
     }
 
-    /// The ProcessClock TTL the keepalive writes, in milliseconds; `None` once the
-    /// keepalive has dropped the clock after its death under `TimeoutPolicy::Error`.
+    /// The ProcessClock TTL the keepalive writes, in milliseconds.
     pub fn process_clock_ttl_ms(&self) -> Option<u64> {
         self.keepalive.process_ttl_ms()
     }
@@ -466,14 +441,6 @@ impl AbacusClient {
     /// The client's ProcessClock.
     pub fn process_clock(&self) -> &ProcessClock {
         &self.process_clock
-    }
-
-    /// Process liveness as last observed by the keepalive thread. Under `TimeoutPolicy::Abort`
-    /// a dead process never observes anything but `Alive`, since the keepalive aborts the
-    /// process first; under `TimeoutPolicy::Error` this is how a host learns its process clock
-    /// was reaped or the Abacus daemon died.
-    pub fn liveness(&self) -> Liveness {
-        self.keepalive.liveness()
     }
 
     /// Create a bare interlock (tier 0) with the keepalive running.
@@ -537,17 +504,14 @@ impl AbacusClient {
         WaitCounter::new(handle, self.clock.handle().clone(), &self.keepalive)
     }
 
-    /// Create a WaitTimer (tier 2) watching the clock, with this client's timeout policy and
-    /// fatal-margin floor.
+    /// Create a WaitTimer (tier 2) watching the clock, with this client's fatal-margin floor.
     pub fn create_wait_timer(&mut self, name: &str) -> Result<WaitTimer> {
         let owner = Some((self.clock_name.clone(), self.clock_id));
-        let (_, handle) =
-            self.do_create(create_request(name, 2, owner, &[]), interlock_map)?;
+        let (_, handle) = self.do_create(create_request(name, 2, owner, &[]), interlock_map)?;
         WaitTimer::new(
             handle,
             self.clock.handle().clone(),
             &self.keepalive,
-            self.timeout_policy,
             self.min_fatal_margin_ms,
         )
     }
@@ -957,7 +921,6 @@ mod tests {
             SdkError::UnexpectedResponse {
                 message: "m".into(),
             },
-            SdkError::DeliveryTimeout,
             SdkError::DependencyTimeout {
                 waited: Duration::from_secs(1),
                 missing: "m".into(),

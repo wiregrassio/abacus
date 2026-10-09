@@ -508,9 +508,9 @@ fn interlock__map_clock_rejects_non_clock_fd() {
             step: AllocationStep::Validate,
             ..
         }) => {}
-        other => panic!(
-            "expected Validate failure for non-clock fd passed to map_clock, got {other:?}"
-        ),
+        other => {
+            panic!("expected Validate failure for non-clock fd passed to map_clock, got {other:?}")
+        }
     }
 }
 
@@ -518,9 +518,7 @@ fn interlock__map_clock_rejects_non_clock_fd() {
 #[test]
 fn interlock__extend_on_lapsed_deadline_terminates_and_returns_reaped() {
     let h = interlock_create().expect("create");
-    h.words()
-        .expiration_ns
-        .store(1, Ordering::Release);
+    h.words().expiration_ns.store(1, Ordering::Release);
     let r = interlock_extend(&h, 500 * MS);
     assert_eq!(
         r,
@@ -542,9 +540,7 @@ fn interlock__extend_on_lapsed_deadline_terminates_and_returns_reaped() {
 #[test]
 fn interlock__extend_on_sentinel_returns_reaped() {
     let h = interlock_create().expect("create");
-    h.words()
-        .expiration_ns
-        .store(SENTINEL, Ordering::Release);
+    h.words().expiration_ns.store(SENTINEL, Ordering::Release);
     let r = interlock_extend(&h, 100 * MS);
     assert_eq!(
         r,

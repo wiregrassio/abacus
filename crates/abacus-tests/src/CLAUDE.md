@@ -25,7 +25,7 @@ Consumed by the parent package (`crates/abacus-tests`).
 <known-hazards>
 ## Known Hazards
 - CRITICAL: Mapping an interlock supplied by a hostile client can SIGBUS after memfd shrink. Perform such mapping in a role child, never the test process.
-- HIGH: SDK clients created in the test process must use `TimeoutPolicy::Error`, not `Abort`, or test-process abort skips daemon cleanup.
+- HIGH: SDK clients abort their process on a missed fatal margin or daemon death. A wait that may miss its margin, or a client that may outlive its daemon, belongs in a role child, or the test-process abort skips daemon cleanup.
 - HIGH: Timing, CPU, and load tests must hold `serialized()` to prevent concurrent measurements across workspace test binaries.
 - MEDIUM: `ProcessDaemon` and system metrics depend on Linux facilities including `/proc`, `flock`, `prctl`, `sched_setaffinity`, and RLIMITs.
 </known-hazards>

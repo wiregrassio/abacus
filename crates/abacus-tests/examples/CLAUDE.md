@@ -32,7 +32,7 @@ Static import scan, directories importing `examples`:
 - HIGH: `rtmeasure.rs` assumes a specific Linux real-time environment and fixed CPU layout, changes thread scheduling to `SCHED_FIFO`, and requires `SYS_NICE`.
 - HIGH: `rtmeasure.rs` load and soak modes intentionally saturate cores and can disrupt colocated workloads.
 - MEDIUM: `probe.rs` `partial` mode deliberately holds an incomplete Unix-socket frame open, consuming a daemon connection during the test.
-- MEDIUM: `xcontainer.rs` defaults to `TimeoutPolicy::Abort`, so daemon or producer failure terminates the process.
+- MEDIUM: In `pod.rs`, `rtmeasure.rs`, and `xcontainer.rs`, daemon or producer failure aborts the process.
 </known-hazards>
 
 <files>

@@ -305,10 +305,10 @@ SDK: `WaitTimer::wait_ms_with_margin(ms, margin_ms)` reads the clock, returns im
 concurrent second wait returns `InvalidRequest`), sets `open_count` to exactly
 `clock_now + ms` (never over `SENTINEL`, replacing a stale target a timed-out wait left), arms
 TTL to `margin_ms`, and loops on `closed_count`. `wait_until` reads the clock once and waits
-from that reading. If `now_ns >= deadline_ns`
-without delivery, `on_timeout` applies the policy: `TimeoutPolicy::Error` returns
-`SdkError::DeliveryTimeout`; `TimeoutPolicy::Abort` (default) prints diagnostics and calls
-`std::process::abort()`. The margin defaults to `ms + max(ms, MIN_FATAL_MARGIN_MS)` where
+from that reading. The loop does not read the daemon clock's expiration: a dead daemon reaches
+the timer as a missed margin. If `now_ns >= deadline_ns` without delivery, `on_timeout` prints
+an `abacus: DeliveryTimeout` diagnostic and calls `std::process::abort()`; there is no
+error-returning alternative. The margin defaults to `ms + max(ms, MIN_FATAL_MARGIN_MS)` where
 `MIN_FATAL_MARGIN_MS` is 100 (the daemon clock TTL), so the delivery-lateness tolerance is
 always at least 100 ms. A daemon restart is discovered exactly here: nobody stamps and the
 margin expires.
@@ -410,7 +410,7 @@ interlock cap, per-tier fields), what a watcher watches (`Registry::resolve` bin
 dies, and what the current time is.
 
 The SDK handles locally: futex waits (each tier's loop with its own classification), keepalive,
-timeout policy, target arithmetic (CAS-max for a WaitCounter, an exact target for a
+fatal margins, target arithmetic (CAS-max for a WaitCounter, an exact target for a
 WaitTimer's single waiter), and wake classification.
 
 The split is where the shared memory ends. Anything that can be done by reading or writing the
@@ -431,12 +431,13 @@ daemon re-arms it in shared memory.
 its own bound expires without delivery.
 
 The sentinel check always precedes classification. Every wait loop loads both counters and
-returns `InterlockReaped` if either is `SENTINEL` before calling `classify_wake`. The
-expiration word is also checked: `SENTINEL` or a lapsed deadline yields `InterlockReaped`.
+returns `InterlockReaped` if either is `SENTINEL` before calling `classify_wake`. Except in
+`WaitTimer`, whose missed margin aborts instead, the expiration word is also checked:
+`SENTINEL` or a lapsed deadline yields `InterlockReaped`.
 
 ## TTL and keepalive
 
-Liveness is a deadline in the third word. An owner that stops extending it is dead by
+A record's liveness is a deadline in the third word. An owner that stops extending it is dead by
 definition.
 
 `Keepalive::register_inner` clamps a zero `interval_ms` to 1 ms, floors the requested TTL at
@@ -466,22 +467,15 @@ the last strong reference drops.
 The keepalive also owns process liveness. On every pass, before touching its entries, it checks
 the daemon clock's expiration and, when due, touches the ProcessClock. A lapsed daemon clock
 (`DaemonClockLapsed`) or a ProcessClock that will not arm or stamp (`ProcessClockReaped`) is
-death. Under `TimeoutPolicy::Abort`, the default, it writes one diagnostic line and aborts the
-process; under `TimeoutPolicy::Error` it records why the process died as a `Liveness`
-(`ProcessClockReaped` or `DaemonClockLapsed`, read through `AbacusClient::liveness`), stops
-touching the clock and nothing else, and the cascade leaves every handle reporting
-`InterlockReaped`. `liveness()` reads `Alive` until then; under `Abort` a caller never sees
-anything else, because the process is gone first. The keepalive starts under `Abort` at
-connect, so a host that selects `Error` does so after the keepalive is already running. The ProcessClock lives in the
-keepalive's shared state rather than as a registered entry, so it keeps no strong reference to
+death: it writes one diagnostic line and aborts the process. There is no policy to select
+and no recorded liveness state to read; the process is gone first. The ProcessClock lives in
+the keepalive's shared state rather than as a registered entry, so it keeps no strong reference to
 the thread: the process clock stops, and lapses, when the client and every handle are gone.
 
-A keepalive thread panic is treated as a liveness death that fails closed. Under `Abort` the
-`RunningGuard` drop writes one diagnostic line and aborts; under `Error` it marks every
-registered entry reaped, drops the process clock, records `Liveness::KeepaliveFailed`, and
-sets a permanent `failed` flag. After a panic, `register`, `register_with_clock`, and
-`bind_process` return `SdkError::KeepaliveFailed` instead of starting a new thread. A
-restart cannot restore the liveness guarantee: the process clock may have been reaped by the
+A keepalive thread panic is treated as a liveness death that fails closed: the
+`RunningGuard` drop marks every registered entry reaped, drops the process clock, sets the
+`failed` flag, writes one diagnostic line, and aborts. A restarted thread could not restore
+the liveness guarantee: the process clock may have been reaped by the
 daemon during the gap, along with every interlock it owned.
 
 The keepalive thread's scheduling is the caller's (`set_keepalive_priority`), never the SDK's.

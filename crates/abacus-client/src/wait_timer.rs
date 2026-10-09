@@ -1,6 +1,5 @@
 //! WaitTimer: a WaitCounter on clock.open_count with a fatal margin. If the daemon does not
-//! deliver within the margin it is dead, and the timer either aborts the process or returns
-//! `DeliveryTimeout`, per the client's `TimeoutPolicy`.
+//! deliver within the margin, the timer prints a diagnostic and aborts the process.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,11 +13,10 @@ use abacus_core::interlock::{
 };
 
 use crate::client::SdkError;
-use crate::handle_ops::{self, check_live};
+use crate::handle_ops;
 use crate::touch::{Keepalive, TouchHandle};
 use crate::types::{
-    classify_wake, default_touch_ttl_ms, TimeoutPolicy, WaitResult, WaitState,
-    DEFAULT_TOUCH_INTERVAL_MS,
+    classify_wake, default_touch_ttl_ms, WaitResult, WaitState, DEFAULT_TOUCH_INTERVAL_MS,
 };
 
 /// A WaitTimer. `wait_ms(W)` targets clock + W and gives the daemon
@@ -32,7 +30,6 @@ pub struct WaitTimer {
     handle: InterlockHandle,
     clock: ReadOnlyInterlockHandle,
     touch: Option<TouchHandle>,
-    policy: TimeoutPolicy,
     min_margin_ms: u64,
     /// True while a wait holds the timer's single waiter slot.
     waiting: AtomicBool,
@@ -43,7 +40,6 @@ impl WaitTimer {
         handle: InterlockHandle,
         clock: ReadOnlyInterlockHandle,
         keepalive: &Keepalive,
-        policy: TimeoutPolicy,
         min_margin_ms: u64,
     ) -> Result<Self, SdkError> {
         let touch = Some(keepalive.register(
@@ -55,15 +51,9 @@ impl WaitTimer {
             handle,
             clock,
             touch,
-            policy,
             min_margin_ms,
             waiting: AtomicBool::new(false),
         })
-    }
-
-    /// The policy applied when the fatal margin elapses.
-    pub fn timeout_policy(&self) -> TimeoutPolicy {
-        self.policy
     }
 
     /// The margin `wait_ms(ms)` uses: `ms + max(ms, min_fatal_margin_ms)`.
@@ -82,11 +72,9 @@ impl WaitTimer {
     /// the TTL and the deadline are both set to it, so the timer cannot be reaped while
     /// legitimately waiting.
     ///
-    /// On `Normal` or `Overrun` delivery returns the result. On a missed margin: with
-    /// `TimeoutPolicy::Abort` prints a diagnostic and aborts the process; with
-    /// `TimeoutPolicy::Error` returns `Err(DeliveryTimeout)`. `Err(InterlockReaped)` if the timer
-    /// is terminated before delivery. `Err(InvalidRequest)` if another wait is in progress on
-    /// this timer.
+    /// On `Normal` or `Overrun` delivery returns the result. On a missed margin, prints a
+    /// diagnostic and aborts the process. `Err(InterlockReaped)` if the timer is terminated
+    /// before delivery. `Err(InvalidRequest)` if another wait is in progress on this timer.
     pub fn wait_ms_with_margin(&self, ms: u64, margin_ms: u64) -> Result<WaitResult, SdkError> {
         let clock_now = self.clock.load_open();
         self.wait_from(clock_now, ms, margin_ms)
@@ -99,7 +87,6 @@ impl WaitTimer {
         }
 
         if ms == 0 {
-            check_live(&self.handle, Some(&self.clock), monotonic_now_nanos())?;
             return Ok(WaitResult {
                 completed_at: clock_now,
                 state: WaitState::Normal,
@@ -138,7 +125,6 @@ impl WaitTimer {
         let closed_word = &words.closed_count;
         loop {
             let now_ns = monotonic_now_nanos();
-            check_live(&self.handle, Some(&self.clock), now_ns)?;
             let closed = closed_word.load(Ordering::Acquire);
             let open = words.open_count.load(Ordering::Acquire);
             if closed == SENTINEL || open == SENTINEL {
@@ -171,17 +157,12 @@ impl WaitTimer {
         open: u64,
         closed: u64,
     ) -> Result<WaitResult, SdkError> {
-        match self.policy {
-            TimeoutPolicy::Error => Err(SdkError::DeliveryTimeout),
-            TimeoutPolicy::Abort => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "abacus: DeliveryTimeout: daemon did not deliver within {margin_ms}ms \
-                     (wait={ms}ms, target={target}, open={open}, closed={closed}); aborting"
-                );
-                std::process::abort();
-            }
-        }
+        let _ = writeln!(
+            std::io::stderr(),
+            "abacus: DeliveryTimeout: daemon did not deliver within {margin_ms}ms \
+             (wait={ms}ms, target={target}, open={open}, closed={closed}); aborting"
+        );
+        std::process::abort();
     }
 
     /// Wait until an absolute clock time: `wait_ms(timestamp_ms - clock_now)` from a single
@@ -239,25 +220,39 @@ impl Drop for WaiterGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use abacus_core::clock::futex_wake;
     use abacus_core::interlock::interlock_create;
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
-    /// A timer over a fake clock frozen at 1000 ms. No daemon and no clock expiration set,
-    /// so every non-zero wait detects the lapsed clock and ends in `InterlockReaped`.
-    fn local_timer(policy: TimeoutPolicy) -> (WaitTimer, InterlockHandle, Keepalive) {
+    /// A timer over a fake clock frozen at 1000 ms. No daemon: a test delivers a wait itself
+    /// with `deliver`, since an undelivered wait aborts the process at its margin.
+    fn local_timer() -> (WaitTimer, InterlockHandle, Keepalive) {
         let k = Keepalive::new();
         let h = interlock_create().unwrap();
         let clock = interlock_create().unwrap();
         clock.words().open_count.store(1000, Ordering::Release);
-        let t = WaitTimer::new(h.clone(), clock.into(), &k, policy, 100).unwrap();
+        let t = WaitTimer::new(h.clone(), clock.into(), &k, 100).unwrap();
         (t, h, k)
+    }
+
+    /// Spin until the timer's target is `target`, then do the daemon's part: close at it.
+    fn deliver(h: &InterlockHandle, target: u64) {
+        let start = Instant::now();
+        while h.words().open_count.load(Ordering::Acquire) != target {
+            if start.elapsed() > Duration::from_secs(1) {
+                panic!("the wait never set its target {target}");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        h.words().closed_count.store(target, Ordering::Release);
+        futex_wake(&h.words().closed_count);
     }
 
     #[test]
     fn a_second_concurrent_wait_is_refused() {
-        let (t, h, _k) = local_timer(TimeoutPolicy::Error);
+        let (t, h, _k) = local_timer();
         let t = Arc::new(t);
         let first = {
             let t = t.clone();
@@ -271,30 +266,20 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(matches!(t.wait_ms(5), Err(SdkError::InvalidRequest { .. })));
-        assert_eq!(first.join().unwrap(), Err(SdkError::InterlockReaped));
-        assert_eq!(t.wait_ms_with_margin(5, 20), Err(SdkError::InterlockReaped));
-    }
-
-    #[test]
-    fn a_timed_out_wait_does_not_leave_its_target_for_the_next() {
-        let (t, h, _k) = local_timer(TimeoutPolicy::Error);
-        assert_eq!(
-            t.wait_ms_with_margin(100, 150),
-            Err(SdkError::InterlockReaped)
-        );
-        assert_eq!(h.words().open_count.load(Ordering::Acquire), 1100);
-        assert_eq!(t.wait_ms_with_margin(5, 20), Err(SdkError::InterlockReaped));
-        assert_eq!(
-            h.words().open_count.load(Ordering::Acquire),
-            1005,
-            "the next wait must target its own deadline"
-        );
+        deliver(&h, 1100);
+        first.join().unwrap().unwrap();
     }
 
     #[test]
     fn wait_until_targets_the_timestamp() {
-        let (t, h, _k) = local_timer(TimeoutPolicy::Error);
-        assert_eq!(t.wait_until(1010), Err(SdkError::InterlockReaped));
+        let (t, h, _k) = local_timer();
+        let t = Arc::new(t);
+        let waiter = {
+            let t = t.clone();
+            thread::spawn(move || t.wait_until(1010))
+        };
+        deliver(&h, 1010);
+        waiter.join().unwrap().unwrap();
         assert_eq!(h.words().open_count.load(Ordering::Acquire), 1010);
     }
 }

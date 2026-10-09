@@ -23,7 +23,7 @@ This constraint shaped every design decision:
 - **Fail-loud.** A timed wait that misses its deadline by more than 2x aborts the process by
   default, because a real-time stage that missed its budget has already failed. Silent
   degradation is the failure mode this design eliminates.
-- **Lifecycle from the primitive.** Liveness is a deadline in shared memory. Stop extending it
+- **Lifecycle from the primitive.** A record's liveness is a deadline in shared memory. Stop extending it
   and you are dead by definition. The daemon reaps you; your peers learn from the memory they
   already hold. No release call, no reference counting, no cleanup protocol.
 - **Minimal dependencies.** One runtime dependency: `libc`. No async runtime, no allocator, no

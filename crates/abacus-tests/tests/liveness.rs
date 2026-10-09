@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use abacus_client::{AbacusClient, Liveness, SdkError, DEFAULT_TOUCH_TTL_MS};
+use abacus_client::{AbacusClient, SdkError, DEFAULT_TOUCH_TTL_MS};
 use abacus_tests::{
     abacus_binary, abacus_reason, describe_exit, recv_abacus_line, role_args, role_command,
     spawn_stderr_reader, unique_name, wait_child, wait_for, wait_for_ready, ProcessDaemon,
@@ -391,54 +391,6 @@ fn liveness__clean_exit_lapses_owned_interlocks() {
         x.is_reaped()
     })
     .unwrap_or_else(|_| panic!("x not reaped 1 s after clean exit"));
-}
-
-/// Under `TimeoutPolicy::Error` (the test kit's `client_with` selects it): SIGKILL the daemon
-/// and `client.liveness()` reports `DaemonClockLapsed` within 1 s, without aborting the
-/// process.
-#[test]
-fn liveness__error_policy_reports_daemon_death() {
-    let mut d = ProcessDaemon::start(bin(), "err-daemon-lv");
-    let client = d
-        .client_with(&unique_name("pc"), &[])
-        .expect("connect as pc");
-
-    d.kill(libc::SIGKILL);
-
-    wait_for(Duration::from_secs(1), Duration::from_millis(1), || {
-        client.liveness() == Liveness::DaemonClockLapsed
-    })
-    .unwrap_or_else(|_| {
-        panic!(
-            "liveness did not report DaemonClockLapsed within 1 s of daemon SIGKILL: {:?}",
-            client.liveness()
-        )
-    });
-}
-
-/// Under `TimeoutPolicy::Error`: c2 connecting with the same clock name as c1 reaps c1's
-/// clock. c1.liveness() reports ProcessClockReaped within 1 s; c2 stays Alive.
-#[test]
-fn liveness__error_policy_reports_a_reaped_clock() {
-    let d = ProcessDaemon::start(bin(), "err-reap-lv");
-    let c1 = d.client_with("P", &[]).expect("connect c1 as P");
-    let c2 = d.client_with("P", &[]).expect("connect c2 as P");
-
-    wait_for(Duration::from_secs(1), Duration::from_millis(1), || {
-        c1.liveness() == Liveness::ProcessClockReaped
-    })
-    .unwrap_or_else(|_| {
-        panic!(
-            "c1 liveness did not report ProcessClockReaped within 1 s: {:?}",
-            c1.liveness()
-        )
-    });
-
-    assert_eq!(
-        c2.liveness(),
-        Liveness::Alive,
-        "c2 should still report Alive"
-    );
 }
 
 // ---------------------------------------------------------------------------

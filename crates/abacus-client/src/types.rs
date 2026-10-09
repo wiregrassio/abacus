@@ -46,32 +46,15 @@ pub const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 const _: () = assert!(DEFAULT_TOUCH_TTL_MS == default_touch_ttl_ms(DEFAULT_TOUCH_INTERVAL_MS));
 
-/// Process liveness as last observed by the client's keepalive thread.
+/// How a process died, as observed by the keepalive thread. Under the always-abort
+/// policy the keepalive aborts on either variant; they exist for the diagnostic message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Liveness {
-    /// The process clock is healthy: touched on schedule, the Abacus clock has not lapsed.
-    Alive,
+pub(crate) enum Liveness {
     /// The keepalive found this client's process clock terminated (SENTINEL after an arm or
     /// stamp attempt).
     ProcessClockReaped,
     /// The keepalive found the Abacus clock's expiration lapsed.
     DaemonClockLapsed,
-    /// The keepalive thread panicked. All registrations are marked reaped and no new
-    /// registrations are accepted. Under `TimeoutPolicy::Abort` the process aborted before
-    /// this value could be observed.
-    KeepaliveFailed,
-}
-
-/// What a WaitTimer does when the daemon misses its fatal margin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TimeoutPolicy {
-    /// Print a diagnostic and abort the process. The design default: the blocking wait is the
-    /// liveness check.
-    #[default]
-    Abort,
-    /// Return `SdkError::DeliveryTimeout`. Required for any host that cannot be aborted (a non-Rust
-    /// binding, a managed runtime, a process that must run cleanup).
-    Error,
 }
 
 /// Scheduling the SDK applies to a client's keepalive thread. The caller chooses; the SDK

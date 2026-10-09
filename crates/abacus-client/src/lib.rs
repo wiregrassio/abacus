@@ -22,9 +22,9 @@ pub use interlock::{AttachedInterlock, AttachedWaitCounter, ClockHandle, Interlo
 pub use process_clock::ProcessClock;
 pub use touch::{Keepalive, TouchHandle};
 pub use types::{
-    default_touch_ttl_ms, InterlockState, KeepalivePriority, Liveness, TimeoutPolicy, WaitResult,
-    WaitState, WatchedWord, CONNECT_RETRY_INTERVAL, DEFAULT_TOUCH_INTERVAL_MS,
-    DEFAULT_TOUCH_TTL_MS, DEFAULT_TRANSPORT_TIMEOUT, MIN_FATAL_MARGIN_MS, MIN_TOUCH_TTL_MS,
+    default_touch_ttl_ms, InterlockState, KeepalivePriority, WaitResult, WaitState, WatchedWord,
+    CONNECT_RETRY_INTERVAL, DEFAULT_TOUCH_INTERVAL_MS, DEFAULT_TOUCH_TTL_MS,
+    DEFAULT_TRANSPORT_TIMEOUT, MIN_FATAL_MARGIN_MS, MIN_TOUCH_TTL_MS,
 };
 pub use wait_barrier::WaitBarrier;
 pub use wait_counter::WaitCounter;

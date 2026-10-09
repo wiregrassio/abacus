@@ -17,9 +17,7 @@ use abacus_core::interlock::{
 };
 
 use crate::client::SdkError;
-use crate::types::{
-    default_touch_ttl_ms, KeepalivePriority, Liveness, TimeoutPolicy, DEFAULT_TOUCH_INTERVAL_MS,
-};
+use crate::types::{default_touch_ttl_ms, KeepalivePriority, Liveness, DEFAULT_TOUCH_INTERVAL_MS};
 
 /// Longest the thread sleeps with nothing due, so it notices ownership changes.
 const IDLE_SLEEP: Duration = Duration::from_millis(100);
@@ -50,8 +48,6 @@ struct State {
     next_id: u64,
     thread_running: bool,
     process: Option<Process>,
-    policy: TimeoutPolicy,
-    liveness: Liveness,
     /// True after a keepalive panic: no new registrations accepted.
     failed: bool,
     /// The scheduling the caller chose for the thread; applied at spawn and by
@@ -100,8 +96,6 @@ impl Keepalive {
                     next_id: 1,
                     thread_running: false,
                     process: None,
-                    policy: TimeoutPolicy::Abort,
-                    liveness: Liveness::Alive,
                     failed: false,
                     priority: KeepalivePriority::Normal,
                     thread: None,
@@ -188,17 +182,6 @@ impl Keepalive {
         Ok(())
     }
 
-    /// Set the timeout policy for process liveness.
-    pub(crate) fn set_policy(&self, policy: TimeoutPolicy) {
-        lock(&self.inner.state).policy = policy;
-    }
-
-    /// The process liveness last observed by the keepalive thread. `Alive` until (under
-    /// `TimeoutPolicy::Error`) the process clock is found reaped or the Abacus clock lapses.
-    pub(crate) fn liveness(&self) -> Liveness {
-        lock(&self.inner.state).liveness
-    }
-
     #[cfg(test)]
     pub(crate) fn process_bound(&self) -> bool {
         lock(&self.inner.state).process.is_some()
@@ -254,8 +237,7 @@ impl Keepalive {
     /// does. The clock is armed with it at once: a longer TTL takes effect now, a shorter
     /// one from the first touch whose `now + ttl` passes the current deadline (arming
     /// never moves a deadline back). `Err(InterlockReaped)` when no process clock is
-    /// bound (never bound, or dropped after its death under `TimeoutPolicy::Error`) or
-    /// the arm finds it terminated; the TTL is then unchanged.
+    /// bound or the arm finds it terminated; the TTL is then unchanged.
     pub fn set_process_ttl_ms(&self, ttl_ms: u64) -> Result<(), SdkError> {
         let mut st = lock(&self.inner.state);
         let Some(process) = st.process.as_mut() else {
@@ -412,8 +394,7 @@ fn apply_priority(
 
 /// On a normal exit, clears `thread_running` and `thread` so a later registration
 /// starts a fresh thread. On a panic, fails closed: marks every entry reaped, drops
-/// the process clock, sets `failed` so no new registrations are accepted, and applies
-/// the timeout policy (abort under `Abort`, record `KeepaliveFailed` under `Error`).
+/// the process clock, sets `failed`, and aborts the process.
 struct RunningGuard(Weak<Inner>);
 
 impl Drop for RunningGuard {
@@ -432,26 +413,18 @@ impl Drop for RunningGuard {
             entry.reaped.store(true, Ordering::Release);
         }
         let process = st.process.take();
-        let policy = st.policy;
-        match policy {
-            TimeoutPolicy::Abort => {
-                let diag = if let Some(p) = &process {
-                    format!(
-                        "abacus: KeepaliveFailed: keepalive thread panicked, \
-                         process clock \"{}\" (id {}) lost; aborting",
-                        p.name, p.id
-                    )
-                } else {
-                    "abacus: KeepaliveFailed: keepalive thread panicked; aborting".to_string()
-                };
-                let _ = writeln!(std::io::stderr(), "{diag}");
-                drop(st);
-                std::process::abort();
-            }
-            TimeoutPolicy::Error => {
-                st.liveness = Liveness::KeepaliveFailed;
-            }
-        }
+        let diag = if let Some(p) = &process {
+            format!(
+                "abacus: KeepaliveFailed: keepalive thread panicked, \
+                 process clock \"{}\" (id {}) lost; aborting",
+                p.name, p.id
+            )
+        } else {
+            "abacus: KeepaliveFailed: keepalive thread panicked; aborting".to_string()
+        };
+        let _ = writeln!(std::io::stderr(), "{diag}");
+        drop(st);
+        std::process::abort();
     }
 }
 
@@ -492,37 +465,25 @@ fn run(weak: Weak<Inner>) {
         }
 
         if let Some(d) = death {
-            let policy = st.policy;
             let proc = st.process.take().unwrap();
-            match policy {
-                TimeoutPolicy::Abort => {
-                    match d {
-                        Liveness::ProcessClockReaped => {
-                            let _ = writeln!(
-                                std::io::stderr(),
-                                "abacus: ProcessClockReaped: process clock \"{}\" (id {}) was reaped; aborting",
-                                proc.name, proc.id
-                            );
-                        }
-                        Liveness::DaemonClockLapsed => {
-                            let exp = proc.abacus_clock.load_expiration();
-                            let _ = writeln!(
-                                std::io::stderr(),
-                                "abacus: DaemonClockLapsed: the Abacus clock expired at {exp} ns, now {now} ns; aborting"
-                            );
-                        }
-                        Liveness::Alive | Liveness::KeepaliveFailed => unreachable!(
-                            "death is only ever recorded as ProcessClockReaped or DaemonClockLapsed"
-                        ),
-                    }
-                    drop(st);
-                    std::process::abort();
+            match d {
+                Liveness::ProcessClockReaped => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "abacus: ProcessClockReaped: process clock \"{}\" (id {}) was reaped; aborting",
+                        proc.name, proc.id
+                    );
                 }
-                TimeoutPolicy::Error => {
-                    // Record the cause and drop the process clock; carry on with entries.
-                    st.liveness = d;
+                Liveness::DaemonClockLapsed => {
+                    let exp = proc.abacus_clock.load_expiration();
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "abacus: DaemonClockLapsed: the Abacus clock expired at {exp} ns, now {now} ns; aborting"
+                    );
                 }
             }
+            drop(st);
+            std::process::abort();
         }
 
         let mut i = 0;
@@ -535,7 +496,10 @@ fn run(weak: Weak<Inner>) {
                     continue;
                 }
                 if let Some(clock) = &entry.clock {
-                    if !stamp_last_seen(&entry.handle, clock.words().open_count.load(Ordering::Acquire)) {
+                    if !stamp_last_seen(
+                        &entry.handle,
+                        clock.words().open_count.load(Ordering::Acquire),
+                    ) {
                         entry.reaped.store(true, Ordering::Release);
                         st.entries.remove(i);
                         continue;
@@ -594,69 +558,8 @@ impl Drop for TouchHandle {
 mod tests {
     use super::*;
     use abacus_core::interlock::{
-        interlock_arm, interlock_create, interlock_free, interlock_read_expiration,
-        ReadOnlyInterlockHandle, SENTINEL,
+        interlock_arm, interlock_create, interlock_free, interlock_read_expiration, SENTINEL,
     };
-    use std::time::Instant;
-
-    #[test]
-    fn a_panicked_thread_fails_closed_under_error_policy() {
-        let k = Keepalive::new();
-        k.set_policy(TimeoutPolicy::Error);
-        let h1 = interlock_create().unwrap();
-        let t1 = k.register(h1, 5, 200).unwrap();
-        assert!(k.thread_running());
-        k.inner.panic_next_pass.store(true, Ordering::Release);
-        k.inner.wake.notify_all();
-        let start = Instant::now();
-        while k.thread_running() && start.elapsed() < Duration::from_secs(1) {
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            !k.thread_running(),
-            "thread_running still true 1 s after the keepalive thread panicked"
-        );
-        assert_eq!(
-            k.liveness(),
-            Liveness::KeepaliveFailed,
-            "liveness should report KeepaliveFailed after a panic"
-        );
-        assert!(t1.is_reaped(), "existing registration should be marked reaped");
-        assert_eq!(k.registered(), 0, "entries should be cleared");
-        assert!(!k.process_bound(), "process should be dropped");
-        let h2 = interlock_create().unwrap();
-        assert_eq!(
-            k.register(h2, 5, 200).err(),
-            Some(SdkError::KeepaliveFailed),
-            "register should refuse after a keepalive panic"
-        );
-    }
-
-    #[test]
-    fn bind_process_refuses_after_keepalive_panic() {
-        let k = Keepalive::new();
-        k.set_policy(TimeoutPolicy::Error);
-        let h = interlock_create().unwrap();
-        let _t = k.register(h, 5, 200).unwrap();
-        k.inner.panic_next_pass.store(true, Ordering::Release);
-        k.inner.wake.notify_all();
-        let start = Instant::now();
-        while k.thread_running() && start.elapsed() < Duration::from_secs(1) {
-            thread::sleep(Duration::from_millis(1));
-        }
-        let pc = interlock_create().unwrap();
-        let abacus_clock = interlock_create().unwrap();
-        interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
-        abacus_clock
-            .words()
-            .open_count
-            .store(1000, Ordering::Release);
-        assert_eq!(
-            k.bind_process(pc, "test".into(), 1, abacus_clock.into()),
-            Err(SdkError::KeepaliveFailed),
-            "bind_process should refuse after a keepalive panic"
-        );
-    }
 
     #[test]
     fn register_arms_immediately_with_ttl() {
@@ -738,58 +641,8 @@ mod tests {
     }
 
     #[test]
-    fn error_policy_drops_reaped_process_clock() {
-        let k = Keepalive::new();
-        k.set_policy(TimeoutPolicy::Error);
-        let pc = interlock_create().unwrap();
-        let abacus_clock = interlock_create().unwrap();
-        interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
-        abacus_clock
-            .words()
-            .open_count
-            .store(1000, Ordering::Release);
-        k.bind_process(pc.clone(), "test".into(), 1, abacus_clock.into())
-            .unwrap();
-        pc.words().open_count.store(SENTINEL, Ordering::Release);
-        thread::sleep(Duration::from_millis(3 * DEFAULT_TOUCH_INTERVAL_MS));
-        assert!(!k.process_bound(), "process still bound after SENTINEL");
-        assert_eq!(k.liveness(), Liveness::ProcessClockReaped);
-    }
-
-    #[test]
-    fn error_policy_drops_on_lapsed_abacus_clock() {
-        let k = Keepalive::new();
-        k.set_policy(TimeoutPolicy::Error);
-        let pc = interlock_create().unwrap();
-        let abacus_clock = interlock_create().unwrap();
-        abacus_clock
-            .words()
-            .open_count
-            .store(1000, Ordering::Release);
-        abacus_clock
-            .words()
-            .expiration_ns
-            .store(1, Ordering::Release);
-        k.bind_process(pc.clone(), "test".into(), 1, abacus_clock.into())
-            .unwrap();
-        let exp0 = interlock_read_expiration(&pc);
-        thread::sleep(Duration::from_millis(3 * DEFAULT_TOUCH_INTERVAL_MS));
-        assert!(
-            !k.process_bound(),
-            "process still bound after Abacus clock lapsed"
-        );
-        assert_eq!(
-            interlock_read_expiration(&pc),
-            exp0,
-            "expiration advanced after process was dropped"
-        );
-        assert_eq!(k.liveness(), Liveness::DaemonClockLapsed);
-    }
-
-    #[test]
     fn process_clock_is_touched_while_healthy() {
         let k = Keepalive::new();
-        k.set_policy(TimeoutPolicy::Error);
         let pc = interlock_create().unwrap();
         let abacus_clock = interlock_create().unwrap();
         interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
@@ -806,7 +659,6 @@ mod tests {
             interlock_read_expiration(&pc) > exp0,
             "expiration did not advance on a healthy process clock"
         );
-        assert_eq!(k.liveness(), Liveness::Alive);
     }
 
     #[test]
@@ -854,7 +706,6 @@ mod tests {
     #[test]
     fn failed_spawn_leaves_the_process_unbound() {
         let k = Keepalive::new();
-        k.set_policy(TimeoutPolicy::Error);
         let pc = interlock_create().unwrap();
         let abacus_clock = interlock_create().unwrap();
         interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
@@ -927,7 +778,6 @@ mod tests {
     #[test]
     fn set_process_ttl_lowers_the_ttl_of_later_touches() {
         let k = Keepalive::new();
-        k.set_policy(TimeoutPolicy::Error);
         let pc = interlock_create().unwrap();
         let abacus_clock = interlock_create().unwrap();
         interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
@@ -952,7 +802,6 @@ mod tests {
     #[test]
     fn set_process_ttl_floors_at_two_intervals() {
         let k = Keepalive::new();
-        k.set_policy(TimeoutPolicy::Error);
         let pc = interlock_create().unwrap();
         let abacus_clock = interlock_create().unwrap();
         interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
@@ -969,7 +818,6 @@ mod tests {
     #[test]
     fn set_process_ttl_raises_the_expiration_at_once() {
         let k = Keepalive::new();
-        k.set_policy(TimeoutPolicy::Error);
         let pc = interlock_create().unwrap();
         let abacus_clock = interlock_create().unwrap();
         interlock_arm(&abacus_clock, ms_to_nanos(5000)).unwrap();
@@ -989,5 +837,40 @@ mod tests {
         let k = Keepalive::new();
         assert_eq!(k.set_process_ttl_ms(100), Err(SdkError::InterlockReaped));
         assert_eq!(k.process_ttl_ms(), None);
+    }
+
+    /// A keepalive panic aborts the process. The panic runs in a child so the abort
+    /// does not take down the test binary.
+    #[test]
+    fn keepalive_panic_aborts_the_process() {
+        if std::env::var("ABACUS_CHILD_KEEPALIVE_PANIC").is_ok() {
+            // Child: register, inject a panic, wait. Exits 3 only if nothing aborted.
+            let k = Keepalive::new();
+            let h = interlock_create().unwrap();
+            let _t = k.register(h, 40, 200).unwrap();
+            k.inner.panic_next_pass.store(true, Ordering::Release);
+            k.inner.wake.notify_all();
+            thread::sleep(Duration::from_secs(2));
+            std::process::exit(3);
+        }
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "touch::tests::keepalive_panic_aborts_the_process",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("ABACUS_CHILD_KEEPALIVE_PANIC", "1")
+            .output()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "child status {:?}, stderr: {stderr}",
+            output.status
+        );
+        assert!(stderr.contains("KeepaliveFailed"), "stderr: {stderr}");
     }
 }

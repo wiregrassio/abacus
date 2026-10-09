@@ -21,9 +21,8 @@ use abacus_core::error::{AllocationStep, Condition};
 use abacus_core::interlock::{interlock_map, SENTINEL};
 use abacus_tests::{
     abacus_binary, attach_words, attach_words_readonly, describe_exit, interlock_words,
-    interlock_words_readonly, role_args,
-    role_command, run_child, serialized, unique_name, wait_child, wait_for, ProcessDaemon,
-    RawClient, RawResponse, Rng, TIER_WAIT_CRON,
+    interlock_words_readonly, role_args, role_command, run_child, serialized, unique_name,
+    wait_child, wait_for, ProcessDaemon, RawClient, RawResponse, Rng, TIER_WAIT_CRON,
 };
 
 const STORM_CLIENTS: usize = 100;

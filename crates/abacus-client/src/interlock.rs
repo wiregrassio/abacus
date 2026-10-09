@@ -3,8 +3,7 @@
 use std::time::Duration;
 
 use abacus_core::interlock::{
-    interlock_free, interlock_is_terminated, InterlockHandle, ReadOnlyInterlockHandle,
-    SENTINEL,
+    interlock_free, interlock_is_terminated, InterlockHandle, ReadOnlyInterlockHandle, SENTINEL,
 };
 
 use crate::client::SdkError;
@@ -41,6 +40,7 @@ impl Interlock {
 
     /// The underlying shared-memory handle. Crate-internal: callers use typed methods
     /// instead, which enforce write discipline.
+    #[allow(dead_code)] // kept for the compile_fail doctests in abacus-tests/src/permissions.rs
     pub(crate) fn handle(&self) -> &InterlockHandle {
         &self.handle
     }
@@ -162,6 +162,7 @@ impl AttachedInterlock {
 
     /// The underlying shared-memory handle. Crate-internal: callers use typed methods
     /// instead, which enforce write discipline.
+    #[allow(dead_code)] // kept for the compile_fail doctests in abacus-tests/src/permissions.rs
     pub(crate) fn handle(&self) -> &InterlockHandle {
         &self.handle
     }
@@ -265,6 +266,7 @@ impl AttachedWaitCounter {
     }
 
     /// The underlying read-only shared-memory handle.
+    #[allow(dead_code)] // kept for the compile_fail doctests in abacus-tests/src/permissions.rs
     pub(crate) fn handle(&self) -> &ReadOnlyInterlockHandle {
         &self.handle
     }

@@ -22,23 +22,22 @@ Non-isolated operation is best-effort and explicitly out of contract.
 
 ### SDK
 
-- **`WaitTimer` aborts the process by default.** A missed fatal margin means the coordination plane is gone and there is nothing correct left to do. Hosts that cannot be aborted select `TimeoutPolicy::Error`.
+- **The SDK aborts the process on every death.** A missed `WaitTimer` fatal margin, a reaped ProcessClock, a lapsed Abacus clock, and a keepalive panic all abort: the coordination plane is gone and there is nothing correct left to do. There is no error-returning alternative.
 - **WaitCounter targets are CAS-max; a WaitTimer takes one waiter.** Waiters on one WaitCounter are not isolated from each other: one handle is one shared object, not a per-caller channel, and a second waiter cannot lower the target. A WaitTimer refuses a second concurrent wait with `InvalidRequest`. Use separate interlocks for independent waits.
 - **`is_connected` detects EOF, not health.** It reports true for a daemon that is alive but wedged. Only a completed request proves service.
-- **Selecting `TimeoutPolicy::Error` leaves an Abort window.** `connect` starts the keepalive under `Abort`, and `set_timeout_policy` can only run after `connect` returns; a liveness lapse in that gap aborts the process.
 - **Read-only views are SDK convention.** `attach_interlock` maps any tier read-write, and attaching a ProcessClock is read-write; the daemon hands out the same descriptor for every tier. Only the clock is protected by its memfd seals.
 - **`WatchedWord` discriminants are defined twice.** The SDK (`types::WatchedWord`) and the daemon (`registry::WatchedWord`) each define 0 and 1; nothing shared ties them together.
 
 ### Daemon
 
-- **Crash-only, no state recovery, no restart notification.** A restart comes back empty; existing mappings stay valid but orphaned. Waiters discover the restart through the clock's 100 ms TTL. Recreate and resume, or crash and let the supervisor restart the consumer. This is the design, not a gap.
+- **Crash-only, no state recovery, no restart notification.** A restart comes back empty; existing mappings stay valid but orphaned. SDK clients discover the restart through the clock's 100 ms TTL and abort; the supervisor restarts the consumer. This is the design, not a gap.
 - **No peer authentication.** No `SO_PEERCRED` check: any process that can open the socket can create over any name and terminate any writable object. Recreating any name reaps its holder with no ownership check. Security rests on socket ownership and group mode, stated plainly rather than half-enforced.
 - **No rate limiting or per-peer quota.** Only the global `max_interlocks` cap applies.
 - **Slow readers are dropped, not buffered.** `EAGAIN` on write is treated as connection death, because the protocol is strict request/response and a client not draining its socket is broken.
 - **No metrics, health endpoint, structured logging, or admin tool.** Diagnostics are stderr lines; the registry is observable only through the SDK. The daemon's budget is a 1 ms loop; an observability surface is a design problem of its own.
 - **CPU pinning assumes an isolated core.** The unit pins the daemon to core 4 at the default scheduling policy, correct only where the host boots with `isolcpus` covering core 4 and places nothing else there. Without kernel-level isolation the pin is a half-measure that reads as a guarantee, so check the boot parameters before deploying.
 - **Socket is listening before its mode is applied.** `UnixListener::bind` sockets, binds, and listens in one call; the chmod and chown follow. In the window the socket accepts connections at umask-derived permissions. The shipped unit closes it with `UMask=0117` (the socket is born 0660); a daemon started any other way, including the test kit's in-process daemons (a process-wide umask is not an option there), still has it. Clients retry `EACCES` (`connect_waiting`).
-- **The daemon clock's TTL has no slack beyond a CFS period.** The clock is armed for 100 ms each tick, against the SDK's 200 ms keepalive floor. A daemon stall longer than 100 ms lapses the clock, and every `Abort`-policy client aborts with `DaemonClockLapsed`.
+- **The daemon clock's TTL has no slack beyond a CFS period.** The clock is armed for 100 ms each tick, against the SDK's 200 ms keepalive floor. A daemon stall longer than 100 ms lapses the clock, and every client aborts with `DaemonClockLapsed`.
 - **Diagnostics are blocking stderr writes.** The keepalive's abort line and the daemon's log lines are plain writes to stderr. A stalled log sink can delay an abort or stall the daemon loop.
 
 ## Deferred implementation
@@ -49,13 +48,6 @@ Non-isolated operation is best-effort and explicitly out of contract.
 
 **When:** when `WaitRace` polling shows up in a profile.
 
-### ~~WaitCounter waits cannot see a dead daemon under Error policy~~ (resolved)
-
-Resolved: `WaitCounter` now carries the daemon clock handle, and `wait_until` checks it on
-every loop iteration (including the zero-timeout path) via `check_live`. `WaitRace::wait`
-checks each member's clock on every pass via `is_clock_dead`. Both return
-`InterlockReaped` when the clock's expiration is `SENTINEL` or earlier than now.
-
 ### Boolean compositions
 
 WaitAnd, WaitOr, WaitXor, WaitNand require daemon-side tier discriminants (tiers 5 to 8) not present in wire ABI v2.
@@ -64,7 +56,7 @@ WaitAnd, WaitOr, WaitXor, WaitNand require daemon-side tier discriminants (tiers
 
 ### Non-Rust binding (FFI)
 
-The Rust SDK is the complete implementation; a non-Rust binding wraps it via FFI. The prerequisite, `TimeoutPolicy::Error`, exists: a binding must select it, because an abort takes the host with it.
+The Rust SDK is the complete implementation; a non-Rust binding wraps it via FFI. Every death aborts the process, and an abort takes the host with it; a host that cannot be aborted is not supported.
 
 **When:** when a non-Rust consumer needs Abacus coordination.
 

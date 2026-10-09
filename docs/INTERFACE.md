@@ -34,8 +34,8 @@ send length-prefixed frames, and receive one response per request.
 ### SDK connection
 
 `AbacusClient` (client.rs::AbacusClient) owns one socket connection, one read-only clock
-handle, one keepalive, one ProcessClock, and the default timeout policy applied to timers
-it creates. Connecting creates the client's ProcessClock: every client has exactly one,
+handle, one keepalive, one ProcessClock, and the fatal-margin floor applied to timers it
+creates. Connecting creates the client's ProcessClock: every client has exactly one,
 created at connect, not by a separate call.
 
 `KeepalivePriority` (types.rs::KeepalivePriority) is the scheduling the SDK applies to the
@@ -55,9 +55,8 @@ AbacusClient::connect(socket_path: &Path, clock_name: &str, dependencies: &[&str
     the given dependencies and no owner, and binds the keepalive to it. Delegates to
     connect_with_timeout (client.rs::AbacusClient::connect).
     clock_name identifies one live process. If another client already holds a ProcessClock
-    with this name, connecting reaps it: the holder aborts with ProcessClockReaped (or
-    reports it under TimeoutPolicy::Error), every entry the holder owns is reaped, and
-    every ProcessClock or entry that listed the name as a dependency is reaped too.
+    with this name, connecting reaps it: the holder aborts with ProcessClockReaped, every
+    entry the holder owns is reaped, and every ProcessClock or entry that listed the name as a dependency is reaped too.
     Dependencies are bound by registry id, so they do not move to the new holder. Enforced
     by liveness__recreated_clock_aborts_the_old_process.
     Errors: SdkError::Transport(TransportError::Io { operation: IoOperation::Connect, .. })
@@ -88,8 +87,7 @@ AbacusClient::connect_with_timeout(socket_path: &Path, clock_name: &str,
     SdkError::KeepaliveSpawnFailed when the keepalive thread cannot be started. When the
     keepalive cannot bind the new ProcessClock for either reason, connect frees it first,
     so the daemon reaps it on its next pass (client.rs::bind_or_free).
-    Default: TimeoutPolicy::Abort (types.rs::TimeoutPolicy default) and
-    min_fatal_margin_ms = MIN_FATAL_MARGIN_MS = 100 (types.rs::MIN_FATAL_MARGIN_MS).
+    Default: min_fatal_margin_ms = MIN_FATAL_MARGIN_MS = 100 (types.rs::MIN_FATAL_MARGIN_MS).
 
 AbacusClient::connect_waiting(socket_path: &Path, clock_name: &str,
     dependencies: &[&str], max_wait: Duration) -> Result<Self>
@@ -108,15 +106,6 @@ AbacusClient::connect_waiting(socket_path: &Path, clock_name: &str,
     - "abacus: waiting up to <max_wait> for the Abacus daemon at <path>"
     When max_wait passes without success: SdkError::DependencyTimeout { waited, missing }.
     (client.rs::AbacusClient::connect_waiting).
-
-set_timeout_policy(&mut self, policy: TimeoutPolicy)
-    Sets the policy handed to every WaitTimer created afterwards and to the keepalive's
-    liveness checks (client.rs::AbacusClient::set_timeout_policy). The keepalive runs
-    under Abort from connect until this call.
-
-timeout_policy(&self) -> TimeoutPolicy
-    Returns the current policy (client.rs::AbacusClient::timeout_policy).
-    Default: TimeoutPolicy::Abort (types.rs::TimeoutPolicy).
 
 set_min_fatal_margin_ms(&mut self, margin_ms: u64)
     Sets the floor used by timers created afterwards
@@ -156,14 +145,12 @@ set_process_clock_ttl_ms(&self, ttl_ms: u64) -> Result<()>
     cannot be throttled (an isolated core, a full CPU quota, a real-time keepalive)
     (client.rs::AbacusClient::set_process_clock_ttl_ms,
     touch.rs::Keepalive::set_process_ttl_ms).
-    Errors: SdkError::InterlockReaped when no process clock is bound (dropped after its
-    death under TimeoutPolicy::Error) or the arm finds it terminated; the TTL is then
-    unchanged.
+    Errors: SdkError::InterlockReaped when no process clock is bound or the arm finds it
+    terminated; the TTL is then unchanged.
     Default: DEFAULT_TOUCH_TTL_MS = 200 (types.rs::DEFAULT_TOUCH_TTL_MS).
 
 process_clock_ttl_ms(&self) -> Option<u64>
-    The ProcessClock TTL the keepalive writes, in milliseconds; None once the keepalive
-    has dropped the clock after its death under TimeoutPolicy::Error
+    The ProcessClock TTL the keepalive writes, in milliseconds
     (client.rs::AbacusClient::process_clock_ttl_ms, touch.rs::Keepalive::process_ttl_ms).
     Default: Some(200).
 
@@ -180,16 +167,6 @@ process_clock(&self) -> &ProcessClock
 
 clock(&self) -> &ClockHandle
     The read-only clock attached at connect (client.rs::AbacusClient::clock).
-
-liveness(&self) -> Liveness
-    Process liveness as last observed by the keepalive thread
-    (client.rs::AbacusClient::liveness, touch.rs::Keepalive::liveness).
-    Liveness::Alive until the keepalive finds the ProcessClock reaped
-    (Liveness::ProcessClockReaped), the Abacus clock's expiration lapsed
-    (Liveness::DaemonClockLapsed), or the keepalive thread panicked
-    (Liveness::KeepaliveFailed) (types.rs::Liveness). Under TimeoutPolicy::Abort the
-    keepalive aborts the process first, so a caller only ever reads Alive; under
-    TimeoutPolicy::Error the keepalive records the cause here and keeps running.
 
 is_connected(&self) -> bool
     false once the connection is poisoned (a send or receive on it failed); otherwise
@@ -305,8 +282,8 @@ create_wait_counter(&mut self, name: &str, watched_name: &str, watched_word: Wat
     to name; the other daemon error mappings.
 
 create_wait_timer(&mut self, name: &str) -> Result<WaitTimer>
-    Creates tier 2 and hands the timer the clock handle, the client's timeout policy, and
-    the client's min_fatal_margin_ms (client.rs::AbacusClient::create_wait_timer).
+    Creates tier 2 and hands the timer the clock handle and the client's
+    min_fatal_margin_ms (client.rs::AbacusClient::create_wait_timer).
     Errors: daemon error mappings; SdkError::MmapFailed.
 
 create_wait_cron(&mut self, name: &str, interval_ms: u64) -> Result<WaitCron>
@@ -456,6 +433,8 @@ Wait precedence: termination takes priority over delivery. Every wait loop check
 liveness (any word at SENTINEL, expiration lapsed, daemon clock lapsed) before comparing
 the target. A wait on an already-reached target returns `InterlockReaped` when the
 interlock is terminated, not `Ok`. The shared gate is `handle_ops::check_live`.
+`WaitTimer` is the exception: its loop checks only for SENTINEL words, and a dead daemon
+reaches it as a missed fatal margin, which aborts.
 
 ### SDK: AttachedInterlock
 
@@ -591,8 +570,8 @@ value the daemon stamped on delivery, and termination.
 
 ### SDK: WaitTimer
 
-Tier 2. Created through `create_wait_timer(name)`, which passes the clock handle, the
-client's `TimeoutPolicy`, and the client's `min_fatal_margin_ms`
+Tier 2. Created through `create_wait_timer(name)`, which passes the clock handle and the
+client's `min_fatal_margin_ms`
 (client.rs::AbacusClient::create_wait_timer, wait_timer.rs::WaitTimer::new). Registered
 with the keepalive at `DEFAULT_TOUCH_INTERVAL_MS` and TTL 200.
 
@@ -601,10 +580,6 @@ One waiter at a time: a wait started while another is in progress on the same ti
 `completed_at` may be called from any thread during a wait.
 
 ```
-timeout_policy(&self) -> TimeoutPolicy
-    The policy captured at construction (wait_timer.rs::WaitTimer::timeout_policy).
-    Default: TimeoutPolicy::Abort (types.rs::TimeoutPolicy).
-
 margin_for(&self, ms: u64) -> u64
     ms + max(ms, min_margin_ms), saturating at u64::MAX
     (wait_timer.rs::WaitTimer::margin_for).
@@ -618,20 +593,21 @@ wait_ms_with_margin(&self, ms: u64, margin_ms: u64) -> Result<WaitResult, SdkErr
     Reads the clock, takes the timer's single waiter slot, sets open_count to exactly
     clock_now + ms (replacing any stale target a timed-out wait left; never over a
     SENTINEL), arms the TTL to margin_ms, then futex-waits on closed_count until
-    classify_wake yields a state (wait_timer.rs::WaitTimer::wait_ms_with_margin).
+    classify_wake yields a state (wait_timer.rs::WaitTimer::wait_ms_with_margin). It does
+    not read the daemon clock's expiration while waiting: a dead daemon is detected by the
+    margin itself.
     ms == 0 returns at once with WaitResult { completed_at: clock_now, state: Normal }
     and arms nothing.
-    Errors: SdkError::InterlockReaped when the clock word is SENTINEL, when the timer's
-    open_count or closed_count is SENTINEL, when expiration_ns is SENTINEL, or when
-    ms == 0 and the handle is already terminated; SdkError::InvalidRequest { message:
+    Errors: SdkError::InterlockReaped when the clock word is SENTINEL or when the timer's
+    open_count or closed_count is SENTINEL; SdkError::InvalidRequest { message:
     "margin_ms (N) must exceed wait (M)" } when margin_ms <= ms; SdkError::InvalidRequest
     when another wait is in progress on this timer;
     SdkError::InterlockReaped from interlock_extend on a SENTINEL or lapsed expiration;
     SdkError::FutexFailed { errno } when the futex syscall fails permanently (returned
     before the deadline path, so a syscall failure is never misreported as DeliveryTimeout).
-    On the margin expiring: TimeoutPolicy::Error returns Err(SdkError::DeliveryTimeout);
-    TimeoutPolicy::Abort prints an "abacus: DeliveryTimeout" diagnostic to stderr and calls
-    std::process::abort (wait_timer.rs::WaitTimer::on_timeout).
+    On the margin expiring: prints an "abacus: DeliveryTimeout" diagnostic to stderr and
+    calls std::process::abort (wait_timer.rs::WaitTimer::on_timeout). There is no
+    error-returning alternative.
 
 wait_until(&self, timestamp_ms: u64) -> Result<WaitResult, SdkError>
     Reads the clock once and waits timestamp_ms.saturating_sub(clock_now) from that same
@@ -887,9 +863,8 @@ set_process_ttl_ms(&self, ttl_ms: u64) -> Result<(), SdkError>
     intervals as register does, and arms the clock with it at once; a shorter TTL takes
     effect from the first touch whose now + ttl passes the current deadline
     (touch.rs::Keepalive::set_process_ttl_ms).
-    Errors: SdkError::InterlockReaped when no process clock is bound (never bound, or
-    dropped after its death under TimeoutPolicy::Error) or the arm finds it terminated;
-    the TTL is then unchanged.
+    Errors: SdkError::InterlockReaped when no process clock is bound or the arm finds it
+    terminated; the TTL is then unchanged.
 
 process_ttl_ms(&self) -> Option<u64>
     The TTL written on the process clock in milliseconds; None when no process clock is
@@ -924,14 +899,10 @@ every `Keepalive` clone and the last strong reference are gone, the thread sets
 `thread_running = false` and returns (touch.rs::run).
 
 A keepalive thread panic is a liveness death that fails closed
-(touch.rs::RunningGuard::drop). Under `TimeoutPolicy::Abort` (the default): one
-diagnostic line to stderr, then `std::process::abort()`. Under `TimeoutPolicy::Error`:
-every registered entry is marked reaped, the process clock is dropped,
-`liveness()` reports `Liveness::KeepaliveFailed`, and all future `register`,
-`register_with_clock`, and `bind_process` calls return
-`SdkError::KeepaliveFailed`. A restart cannot restore the guarantee: the process
-clock may have been reaped by the daemon during the gap, along with everything it
-owned.
+(touch.rs::RunningGuard::drop): every registered entry is marked reaped, the process
+clock is dropped, one diagnostic line goes to stderr, then `std::process::abort()`. A
+restart of the thread cannot restore the guarantee: the process clock may have been
+reaped by the daemon during the gap, along with everything it owned.
 
 ## SDK-only compositions
 
@@ -979,22 +950,14 @@ ProcessClock is bound:
 2. If the ProcessClock is due: a failed `interlock_extend` or a `false` from
    `stamp_last_seen` dies with `ProcessClockReaped`; otherwise set its next due time.
 
-Dying under `Abort`: `eprintln!` exactly one of these lines, then `std::process::abort()`:
+Dying: write exactly one of these lines to stderr, then `std::process::abort()`:
 - `abacus: ProcessClockReaped: process clock "<name>" (id <id>) was reaped; aborting`
 - `abacus: DaemonClockLapsed: the Abacus clock expired at <exp> ns, now <now> ns; aborting`
 - `abacus: KeepaliveFailed: keepalive thread panicked, process clock "<name>" (id <id>) lost; aborting`
 - `abacus: KeepaliveFailed: keepalive thread panicked; aborting` (no process clock bound)
 
-Dying under `Error`: record the cause as the client's `Liveness` (`ProcessClockReaped`,
-`DaemonClockLapsed`, or `KeepaliveFailed`, read through `AbacusClient::liveness`), set the
-process clock to None, and carry on with the other entries. For `ProcessClockReaped` and
-`DaemonClockLapsed`, the daemon's cascade reaps every owned interlock. For
-`KeepaliveFailed`, every registered entry is marked reaped immediately and all future
-registrations are refused with `SdkError::KeepaliveFailed`.
-
-`set_timeout_policy` on `AbacusClient` forwards to the keepalive, so the liveness policy
-takes effect at once. `connect` starts the keepalive under `Abort`; a death the keepalive
-observes before `set_timeout_policy(Error)` runs still aborts.
+There is no policy and no recorded liveness state: every death aborts the process, and
+the daemon's cascade reaps every interlock the process owned.
 
 ```
 uptime_ms(&self) -> i64
@@ -1195,7 +1158,7 @@ treat a daemon clock expiration at `SENTINEL` or in the past as a dead daemon.
 | Waiter | Timeout result |
 |---|---|
 | `WaitCounter::wait_until` | `Ok(WaitResult { state: Timeout, completed_at })` once `timeout_ms` has elapsed since the call with no delivery; wakes short of delivery do not restart the timeout |
-| `WaitTimer::wait_ms*` | `on_timeout`: `TimeoutPolicy::Error` yields `Err(SdkError::DeliveryTimeout)`; `TimeoutPolicy::Abort` prints a diagnostic and calls `std::process::abort` |
+| `WaitTimer::wait_ms*` | `on_timeout`: prints an `abacus: DeliveryTimeout` diagnostic and calls `std::process::abort` |
 | `Interlock::wait_open_for` and siblings | `Ok(None)` |
 | `WaitCron::wait`, `WaitBarrier::wait` | no timeout; they return only on delivery or reap |
 
@@ -1378,7 +1341,6 @@ client.rs::SdkError. Derives `Debug, Clone, PartialEq, Eq`, implements `Display`
 | `InterlockNotFound { name }` | Daemon reply code `ERR_INTERLOCK_NOT_FOUND`, with the reply message carried as `name` (client.rs::daemon_error) |
 | `AllocationFailed { message }` | Daemon reply code `ERR_ALLOCATION_FAILED` (client.rs::daemon_error); `Condition::AllocationFailed` rendered to a string (client.rs::From<Condition>) |
 | `InvalidRequest { message }` | `attach_interlock("clock")` (client.rs::AbacusClient::attach_interlock); `create_wait_cron` with `interval_ms == 0` or an `interval_ms` whose nanoseconds overflow (client.rs::AbacusClient::create_wait_cron, client.rs::checked_interval_ns); `WaitRace::wait` over zero counters (wait_race.rs::WaitRace::wait); an out-of-range `KeepalivePriority::Fifo` (touch.rs::Keepalive::set_priority, client.rs::AbacusClient::set_keepalive_priority); `wait_ms_with_margin` with `margin_ms <= ms`, or a second concurrent wait on one WaitTimer (wait_timer.rs::WaitTimer::wait_ms_with_margin); daemon reply code `ERR_INVALID_REQUEST` (client.rs::daemon_error) |
-| `DeliveryTimeout` | `WaitTimer` margin expiry under `TimeoutPolicy::Error` (wait_timer.rs::WaitTimer::on_timeout) |
 | `FutexFailed { errno }` | A futex wait syscall failed with a permanent errno (not `EAGAIN`, `EINTR`, or `ETIMEDOUT`). From every SDK wait loop: `handle_ops::wait_word`, `wait_counter::WaitCounter::wait_until`, `wait_timer::WaitTimer::wait_ms_with_margin`, `wait_cron::WaitCron::wait`, `wait_barrier::WaitBarrier::wait`. Typical causes: `EPERM` from a seccomp filter blocking the futex syscall, `EFAULT`, `EINVAL`, `ENOSYS`. Classification is shared through `clock::classify_futex_result` |
 | `Transport(TransportError)` | Connect, timeout set, frame send, frame receive, decode, and descriptor-count faults (client.rs::ClientConn); `extract_single_fd` when the reply carries a count other than one (client.rs::extract_single_fd) |
 | `MmapFailed { message }` | The mapping function returns `Condition`, rendered to a string (client.rs::map_handle) |

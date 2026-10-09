@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -215,10 +216,9 @@ fn daemon__sigkill_leaves_stale_socket_that_next_start_replaces() {
 }
 
 /// ARCHITECTURE.md, README: a daemon restart wakes nobody and every waiter
-/// discovers it through its own futex timeout. With today's abort policy the waiting child
-/// dies by SIGABRT (DeliveryTimeout) within 2x its wait; the child instead reports
-/// `Err(SdkError::DeliveryTimeout)` under `TimeoutPolicy::Error` (). Then a
-/// fresh client connects and creates on the new daemon.
+/// discovers it through its own futex timeout: the waiting child dies by SIGABRT
+/// (DeliveryTimeout) within 2x its wait. Then a fresh client connects and creates on the new
+/// daemon.
 #[test]
 fn daemon__restart_wakes_nobody_and_timers_time_out() {
     let mut d = ProcessDaemon::start(bin(), "restart-timers");
@@ -246,6 +246,9 @@ fn daemon__restart_wakes_nobody_and_timers_time_out() {
             attached.peek()
         )
     });
+    // The observer must not outlive the old daemon: its keepalive aborts on the lapsed clock.
+    drop(attached);
+    drop(observer);
 
     let t0 = Instant::now();
     d.restart();
@@ -274,19 +277,44 @@ fn daemon__restart_wakes_nobody_and_timers_time_out() {
 }
 
 /// README: a restart comes back empty. Old connections are dead, old names are gone, and a
-/// fresh client can create.
+/// fresh client can create. The old client runs in a role child: its keepalive aborts once
+/// the old clock lapses (contract 26), which must not depend on how fast the restart is.
 #[test]
 fn daemon__restart_then_fresh_client_can_create() {
     let mut d = ProcessDaemon::start(bin(), "restart-fresh");
-    let mut old = d.client();
-    let _before = old
-        .create_wait_timer("before")
-        .expect("create before restart");
+    let sock = d.socket_path().to_str().unwrap().to_string();
+    let mut child = role_command("role__old_client", &[&sock, "before"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn role");
+    let mut out = BufReader::new(child.stdout.take().expect("child stdout"));
+    let mut seen = String::new();
+    loop {
+        let mut line = String::new();
+        let n = out.read_line(&mut line).expect("read child stdout");
+        assert!(n > 0, "old client exited before creating: {seen}");
+        seen.push_str(&line);
+        // The harness prints "test <role> ... " without a newline before the role's output.
+        if line.trim_end().ends_with(OLD_CLIENT_CREATED) {
+            break;
+        }
+    }
+
     d.restart();
+    let status = wait_child(&mut child, Duration::from_secs(5)).expect("old client did not end");
+    out.read_to_string(&mut seen).expect("read child stdout");
     assert!(
-        !old.is_connected(),
-        "old connection reports connected after restart"
+        seen.lines().any(|l| l.ends_with(OLD_CLIENT_DISCONNECTED)),
+        "old connection never reported disconnected after restart; stdout: {seen}"
     );
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGABRT),
+        "old client should abort on the lapsed clock, ended with {}",
+        describe_exit(&status)
+    );
+
     let mut fresh = d.client();
     let timer = fresh
         .create_wait_timer("after")
@@ -525,6 +553,35 @@ fn role__create_and_advance() {
     il.close(n).expect("close");
     // Hold (the stimulus) so the parent can attach and watch; bounded.
     std::thread::sleep(Duration::from_millis(500));
+}
+
+const OLD_CLIENT_CREATED: &str = "role__old_client: created";
+const OLD_CLIENT_DISCONNECTED: &str = "role__old_client: disconnected";
+
+/// Role: connect to `args[0]`, create WaitTimer `args[1]`, report it on stdout, poll
+/// `is_connected` until the daemon dies and report that, then wait for the keepalive abort.
+/// Exits 3 if the connection never drops, 4 if no abort follows; the parent expects neither.
+/// Not a test; spawned by `daemon__restart_then_fresh_client_can_create`.
+#[test]
+#[ignore = "role: process entry point for daemon__restart_then_fresh_client_can_create"]
+fn role__old_client() {
+    let Some(args) = role_args("role__old_client") else {
+        return;
+    };
+    let mut client =
+        AbacusClient::connect(Path::new(&args[0]), &unique_name("role"), &[]).expect("connect");
+    let _timer = client.create_wait_timer(&args[1]).expect("create timer");
+    println!("{OLD_CLIENT_CREATED}");
+    if wait_for(Duration::from_secs(5), Duration::from_millis(1), || {
+        !client.is_connected()
+    })
+    .is_err()
+    {
+        std::process::exit(3);
+    }
+    println!("{OLD_CLIENT_DISCONNECTED}");
+    std::thread::sleep(Duration::from_secs(2));
+    std::process::exit(4);
 }
 
 /// Role: connect to `args[0]`, create WaitTimer `args[1]`, `wait_ms(args[2])`. Exits 3 if the

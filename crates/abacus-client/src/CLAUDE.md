@@ -26,7 +26,7 @@ Consumed by the parent package (`crates/abacus-client`).
 
 <known-hazards>
 ## Known Hazards
-- HIGH: `TimeoutPolicy::Abort` is the default, a missed WaitTimer fatal margin or lost process liveness aborts the host process.
+- HIGH: Every death aborts the host process: a missed WaitTimer fatal margin, a reaped ProcessClock, a lapsed Abacus clock, or a keepalive panic.
 - HIGH: Keepalive scheduling and CPU affinity inherit from the connecting thread. A non-real-time keepalive can starve behind real-time work and cause reaping.
 - MEDIUM: `AttachedInterlock::free` writes the termination sentinel despite attached expiration being read-only, terminating the shared interlock for all holders.
 - MEDIUM: `WaitRace` polls every millisecond and is an SDK-side stopgap pending daemon-side `WaitOr`.

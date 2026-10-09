@@ -8,7 +8,9 @@ use abacus_core::clock::{
     classify_futex_result, futex_wait, futex_wake, futex_word, monotonic_now_nanos, ms_to_nanos,
     FutexOutcome,
 };
-use abacus_core::interlock::{interlock_extend, InterlockHandle, ReadOnlyInterlockHandle, SENTINEL};
+use abacus_core::interlock::{
+    interlock_extend, InterlockHandle, ReadOnlyInterlockHandle, SENTINEL,
+};
 
 use crate::client::SdkError;
 use crate::types::{interlock_state, InterlockState, DEFAULT_TIMEOUT_NANOS};

@@ -130,24 +130,6 @@ fn wait_race__sub_delivery_advance_does_not_win() {
     );
 }
 
-/// Under Error policy, stopping the daemon causes the clock TTL to lapse. WaitRace::wait
-/// must detect the dead clock and return InterlockReaped, not hang forever.
-#[test]
-fn wait_race__daemon_death_returns_reaped_under_error_policy() {
-    let mut d = ThreadDaemon::start("race-death");
-    let mut client = d.client();
-    let (_sources, counters) = three_counters(&mut client);
-    let race = WaitRace::new(counters);
-    let rx = on_thread(move || race.wait(5000));
-    std::thread::sleep(Duration::from_millis(5));
-    d.stop();
-    let r = recv_within(&rx, Duration::from_secs(1)).expect("race hung after daemon death");
-    assert!(
-        matches!(r, Err(SdkError::InterlockReaped)),
-        "race after daemon death returned {r:?}, expected InterlockReaped"
-    );
-}
-
 /// A delivery that lands before wait() is called must be detected immediately: the counter
 /// is already in the delivered state (closed_count >= open_count).
 #[test]
@@ -186,7 +168,10 @@ fn wait_race__delivery_before_wait_wins_immediately() {
     let race = WaitRace::new(counters);
     // The delivery happened before wait; it must still win.
     let result = race.wait(1000).expect("race wait").expect("race timed out");
-    assert_eq!(result.0, 2, "pre-delivered counter 2 should win, got {result:?}");
+    assert_eq!(
+        result.0, 2,
+        "pre-delivered counter 2 should win, got {result:?}"
+    );
     assert!(
         matches!(result.1.state, WaitState::Normal | WaitState::Overrun),
         "winner state {result:?}"
@@ -203,7 +188,10 @@ fn wait_race__timeout_zero_polls_once() {
     let t0 = std::time::Instant::now();
     let result = race.wait(0).expect("race wait");
     let elapsed = t0.elapsed();
-    assert!(result.is_none(), "no counter was delivered, expected None, got {result:?}");
+    assert!(
+        result.is_none(),
+        "no counter was delivered, expected None, got {result:?}"
+    );
     assert!(
         elapsed < Duration::from_millis(50),
         "timeout 0 should return quickly, took {elapsed:?}"
@@ -220,7 +208,10 @@ fn wait_race__timeout_expiry_returns_none() {
     let t0 = std::time::Instant::now();
     let result = race.wait(50).expect("race wait");
     let elapsed = t0.elapsed();
-    assert!(result.is_none(), "no delivery, expected None, got {result:?}");
+    assert!(
+        result.is_none(),
+        "no delivery, expected None, got {result:?}"
+    );
     assert!(
         elapsed >= Duration::from_millis(40),
         "should wait at least close to 50 ms, only waited {elapsed:?}"

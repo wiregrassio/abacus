@@ -9,8 +9,7 @@
 //! The producer creates `<prefix>/frames` and opens it once per period (`frames` 0 runs until
 //! killed). The consumer connects with the producer's clock as a dependency, watches the frame
 //! count with a WaitCounter, and prints a line per delivered frame. Both connect with
-//! `connect_waiting` (60 s ceiling) and run the default `TimeoutPolicy::Abort`, so a dead
-//! producer or daemon aborts them.
+//! `connect_waiting` (60 s ceiling), so a dead producer or daemon aborts them.
 
 use std::env;
 use std::path::Path;

@@ -146,37 +146,6 @@ fn wait_cron__missed_fire_returns_immediately_with_overrun() {
     );
 }
 
-/// After SIGKILL of the daemon, a WaitCron::wait() that has no local deadline must
-/// return Err(InterlockReaped) within a bounded time (the clock TTL) instead of hanging
-/// forever. Before the fix, the client keepalive re-arms the interlock's own expiration,
-/// so the `exp < now` check in the wait loop never fires, and the daemon (the sole writer
-/// of closed_count) is dead, so the SENTINEL check never fires either.
-#[test]
-fn wait_cron__daemon_death_returns_reaped_not_hang() {
-    let mut d = ProcessDaemon::start(&abacus_binary(), "cron-death");
-    let mut client = d.client();
-    let cron = Arc::new(client.create_wait_cron("c", 10).expect("create cron"));
-    // Consume one fire to confirm the cron is alive and ticking.
-    cron.wait().expect("first fire");
-    let c = cron.clone();
-    let rx = on_thread(move || c.wait());
-    // Give the wait thread time to enter the futex loop.
-    std::thread::sleep(Duration::from_millis(5));
-    d.kill(libc::SIGKILL);
-    // The wait must return InterlockReaped within 500 ms (clock TTL + margin).
-    let r = recv_within(&rx, Duration::from_millis(500)).unwrap_or_else(|e| {
-        panic!(
-            "cron.wait() hung after daemon SIGKILL: {e}; peek={:?}",
-            cron.peek()
-        )
-    });
-    assert!(
-        matches!(r, Err(SdkError::InterlockReaped)),
-        "expected InterlockReaped after daemon death, got {r:?}; peek={:?}",
-        cron.peek()
-    );
-}
-
 /// SURFACE.md WaitCron: after free() the next wait() returns InterlockReaped.
 #[test]
 fn wait_cron__free_then_wait_is_reaped() {

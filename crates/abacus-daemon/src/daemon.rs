@@ -10,7 +10,9 @@ use abacus_core::error::{IoOperation, StartupError, TransportError};
 use abacus_core::interlock::interlock_dup_fd;
 use abacus_wire::{Request, Response};
 
-use crate::registry::{CreateSpec, Registry, Tier, DEFAULT_MAX_INTERLOCKS, DEFAULT_MAX_WATCH_EDGES};
+use crate::registry::{
+    CreateSpec, Registry, Tier, DEFAULT_MAX_INTERLOCKS, DEFAULT_MAX_WATCH_EDGES,
+};
 use crate::transport::{Connection, Server, SocketOptions};
 
 /// Default cap on live client connections.

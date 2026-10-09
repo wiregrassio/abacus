@@ -4,8 +4,8 @@
 use std::time::{Duration, Instant};
 
 use abacus_client::{
-    AbacusClient, SdkError, TimeoutPolicy, WaitState, WatchedWord, DEFAULT_TOUCH_INTERVAL_MS,
-    MIN_FATAL_MARGIN_MS, MIN_TOUCH_TTL_MS,
+    AbacusClient, SdkError, WaitState, WatchedWord, DEFAULT_TOUCH_INTERVAL_MS, MIN_FATAL_MARGIN_MS,
+    MIN_TOUCH_TTL_MS,
 };
 use abacus_core::error::{IoOperation, TransportError};
 use abacus_tests::{unique_name, wait_for, RawClient, ThreadDaemon};
@@ -53,43 +53,16 @@ fn cron_fires_on_grid_without_drift() {
     );
 }
 
-/// With TimeoutPolicy::Error a stopped daemon produces DeliveryTimeout within the
-/// margin, and the margin has a floor.
+/// The margin has a floor.
 #[test]
-fn timer_error_policy_returns_rts_timeout_within_margin() {
-    let mut d = ThreadDaemon::start("rts-timeout");
+fn timer_margin_has_a_floor() {
+    let d = ThreadDaemon::start("rts-timeout");
     let mut client = AbacusClient::connect(d.socket_path(), &unique_name("pc"), &[]).unwrap();
-    client.set_timeout_policy(TimeoutPolicy::Error);
-    assert_eq!(client.timeout_policy(), TimeoutPolicy::Error);
     assert_eq!(client.min_fatal_margin_ms(), MIN_FATAL_MARGIN_MS);
     let timer = client.create_wait_timer("t-err").unwrap();
-    assert_eq!(timer.timeout_policy(), TimeoutPolicy::Error);
     assert_eq!(timer.margin_for(5), MIN_FATAL_MARGIN_MS + 5);
     assert_eq!(timer.margin_for(50), MIN_FATAL_MARGIN_MS + 50);
     assert_eq!(timer.margin_for(200), 400);
-
-    d.stop();
-    let expected_margin = timer.margin_for(5);
-    let t0 = Instant::now();
-    let r = timer.wait_ms(5);
-    let elapsed = t0.elapsed();
-    assert_eq!(r, Err(SdkError::DeliveryTimeout));
-    assert!(
-        elapsed >= Duration::from_millis(expected_margin),
-        "returned early: {elapsed:?}"
-    );
-    assert!(
-        elapsed < Duration::from_millis(expected_margin + 30),
-        "returned late: {elapsed:?}"
-    );
-
-    // Per-call margin.
-    let t0 = Instant::now();
-    assert_eq!(
-        timer.wait_ms_with_margin(5, 60),
-        Err(SdkError::DeliveryTimeout)
-    );
-    assert!(t0.elapsed() >= Duration::from_millis(60));
     // A margin that cannot work is rejected up front.
     assert!(matches!(
         timer.wait_ms_with_margin(5, 5),

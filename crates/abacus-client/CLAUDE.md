@@ -29,7 +29,7 @@ Static import scan, directories importing `abacus-client`:
 
 <known-hazards>
 ## Known Hazards
-- HIGH: Default `WaitTimer` timeout policy can abort the host process on missed fatal margins or lost liveness.
+- HIGH: The SDK aborts the host process on a missed `WaitTimer` fatal margin or lost liveness.
 - HIGH: Keepalive can starve under inherited scheduling or CPU affinity, allowing registered resources to reap.
 - MEDIUM: `AttachedInterlock::free` terminates the shared interlock for all holders despite attached expiration being read-only.
 - MEDIUM: `WaitRace` uses millisecond SDK-side polling pending daemon-side `WaitOr`.

@@ -168,10 +168,7 @@ mod tests {
             classify_futex_result(Err(libc::EAGAIN)),
             FutexOutcome::Retry
         );
-        assert_eq!(
-            classify_futex_result(Err(libc::EINTR)),
-            FutexOutcome::Retry
-        );
+        assert_eq!(classify_futex_result(Err(libc::EINTR)), FutexOutcome::Retry);
         assert_eq!(
             classify_futex_result(Err(libc::ETIMEDOUT)),
             FutexOutcome::Retry

@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use abacus_client::{AbacusClient, TimeoutPolicy};
+use abacus_client::AbacusClient;
 use abacus_core::error::{ProtocolFault, TransportError};
 use abacus_core::interlock::{
     interlock_map, interlock_map_clock, InterlockHandle, ReadOnlyInterlockHandle,
@@ -249,34 +249,26 @@ impl ThreadDaemon {
         }
     }
 
-    /// Connect an SDK client to this daemon, panicking with the error if it fails. Timers
-    /// this client creates use `TimeoutPolicy::Error`, not the SDK's `Abort` default: a
-    /// missed fatal margin in the test process must not `process::abort()` the test binary
-    /// (which skips every `Drop`, leaking the daemon and its socket). Role children created
-    /// via `role_command` connect their own `AbacusClient` directly and keep the `Abort`
-    /// default, since they are meant to abort on timeout.
+    /// Connect an SDK client to this daemon, panicking with the error if it fails. The
+    /// client aborts the process on a missed fatal margin or a daemon death, so a wait that
+    /// may miss its margin runs in a role child created via `role_command`.
     pub fn client(&self) -> AbacusClient {
-        let mut client =
-            AbacusClient::connect(&self.path, &unique_name("pc"), &[]).unwrap_or_else(|e| {
-                panic!(
-                    "connect to thread daemon {} failed: {e}",
-                    self.path.display()
-                )
-            });
-        client.set_timeout_policy(TimeoutPolicy::Error);
-        client
+        AbacusClient::connect(&self.path, &unique_name("pc"), &[]).unwrap_or_else(|e| {
+            panic!(
+                "connect to thread daemon {} failed: {e}",
+                self.path.display()
+            )
+        })
     }
 
     /// Connect with an explicit clock name and dependencies. Returns the error instead of
-    /// panicking. Error policy.
+    /// panicking.
     pub fn client_with(
         &self,
         clock_name: &str,
         dependencies: &[&str],
     ) -> Result<AbacusClient, abacus_client::SdkError> {
-        let mut client = AbacusClient::connect(&self.path, clock_name, dependencies)?;
-        client.set_timeout_policy(TimeoutPolicy::Error);
-        Ok(client)
+        AbacusClient::connect(&self.path, clock_name, dependencies)
     }
 }
 
@@ -387,7 +379,7 @@ impl ProcessDaemon {
             .stderr(Stdio::from(stderr));
         // SAFETY: prctl(PR_SET_PDEATHSIG) is async-signal-safe and touches no Rust state.
         // Kills this daemon child if the test process dies before reaping it (a SIGABRT
-        // from TimeoutPolicy::Abort in some other thread, a panic, or the test binary being
+        // from an SDK abort in some other thread, a panic, or the test binary being
         // killed outright), so a leaked ProcessDaemon does not leak its child too.
         unsafe {
             cmd.pre_exec(set_pdeathsig_kill);
@@ -527,34 +519,26 @@ impl ProcessDaemon {
         self.startup = t0.elapsed();
     }
 
-    /// Connect an SDK client to this daemon, panicking with the error if it fails. Timers
-    /// this client creates use `TimeoutPolicy::Error`, not the SDK's `Abort` default: a
-    /// missed fatal margin in the test process must not `process::abort()` the test binary
-    /// (which skips every `Drop`, leaking the daemon child and its socket). Role children
-    /// created via `role_command` connect their own `AbacusClient` directly and keep the
-    /// `Abort` default, since they are meant to abort on timeout.
+    /// Connect an SDK client to this daemon, panicking with the error if it fails. The
+    /// client aborts the process on a missed fatal margin or a daemon death, so a wait that
+    /// may miss its margin runs in a role child created via `role_command`.
     pub fn client(&self) -> AbacusClient {
-        let mut client =
-            AbacusClient::connect(&self.path, &unique_name("pc"), &[]).unwrap_or_else(|e| {
-                panic!(
-                    "connect to process daemon {} failed: {e}",
-                    self.path.display()
-                )
-            });
-        client.set_timeout_policy(TimeoutPolicy::Error);
-        client
+        AbacusClient::connect(&self.path, &unique_name("pc"), &[]).unwrap_or_else(|e| {
+            panic!(
+                "connect to process daemon {} failed: {e}",
+                self.path.display()
+            )
+        })
     }
 
     /// Connect with an explicit clock name and dependencies. Returns the error instead of
-    /// panicking. Error policy.
+    /// panicking.
     pub fn client_with(
         &self,
         clock_name: &str,
         dependencies: &[&str],
     ) -> Result<AbacusClient, abacus_client::SdkError> {
-        let mut client = AbacusClient::connect(&self.path, clock_name, dependencies)?;
-        client.set_timeout_policy(TimeoutPolicy::Error);
-        Ok(client)
+        AbacusClient::connect(&self.path, clock_name, dependencies)
     }
 }
 

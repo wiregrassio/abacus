@@ -50,14 +50,14 @@ Consumed by the parent package (`crates/abacus-tests`).
 | `sentinel_increments.rs` | Sentinel-preserving increment and attacher-free race regression tests. |
 | `soak_hour.rs` | Ignored long-running daemon resource and wait-service soak test. |
 | `stop_flag.rs` | Stoppable daemon-loop, socket cleanup, connection state, and shutdown timeout tests. |
-| `timeout_policy.rs` | Timer TTL margin, timeout policy, daemon stall, and restart behavior tests. |
+| `timeout_policy.rs` | Timer TTL margin and zero-duration wait tests. |
 | `timing_liveness.rs` | Ignored hardware timing measurements for multi-level liveness cascades. |
 | `timing_load.rs` | Ignored CPU-load timing benchmarks, isolation profiles, and keepalive thread-budget tests. |
 | `timing_loop.rs` | Ignored idle-hardware loop, timer, cron, barrier, counter, and registry-scale timing benchmarks. |
 | `touch.rs` | Default touch-thread TTL stall-survival test. |
 | `wait_barrier.rs` | WaitBarrier evaluation, rearm, latency, reap, and registry-stamping tests. |
 | `wait_counter.rs` | WaitCounter delivery, contention, timeout, TTL, reap, and clock-watch tests. |
-| `wait_cron.rs` | WaitCron grid, rearm, overrun, daemon-death, and termination tests. |
+| `wait_cron.rs` | WaitCron grid, rearm, overrun, and termination tests. |
 | `wait_race.rs` | SDK-only multi-counter race winner and reap-error tests. |
 | `wait_timer.rs` | WaitTimer duration, absolute target, monotonicity, role, and reap tests. |
 | `wire_crate.rs` | Wire codec round-trip, truncation, mutation, random-input, and crate dependency-boundary tests. |

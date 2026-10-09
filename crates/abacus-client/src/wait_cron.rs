@@ -76,9 +76,7 @@ impl WaitCron {
             }
             if closed > seen {
                 self.last_seen.fetch_max(closed, Ordering::AcqRel);
-                let state = if closed % self.interval_ms != 0 {
-                    WaitState::Overrun
-                } else if closed > seen + self.interval_ms {
+                let state = if closed % self.interval_ms != 0 || closed > seen + self.interval_ms {
                     WaitState::Overrun
                 } else {
                     WaitState::Normal

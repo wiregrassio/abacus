@@ -22,7 +22,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use abacus_client::{AbacusClient, TimeoutPolicy, WaitState, WatchedWord};
+use abacus_client::{AbacusClient, WaitState, WatchedWord};
 
 const CAPTURE_MS: u64 = 16; // ~60 fps
 const INFERENCE_MS: u64 = 8;
@@ -52,7 +52,6 @@ fn main() {
 
     let mut coord =
         AbacusClient::connect(sock, &format!("pod-{pid}-coord"), &[]).expect("connect coordinator");
-    coord.set_timeout_policy(TimeoutPolicy::Error);
 
     // Coordinator creates the shared interlocks so names exist before threads start.
     let _frame = coord.create_interlock(&frame_name).expect("create frame");
@@ -74,7 +73,6 @@ fn main() {
     let cam_handle = thread::spawn(move || {
         let mut client = AbacusClient::connect(&cam_sock, &format!("pod-{pid}-cam"), &[])
             .expect("connect producer");
-        client.set_timeout_policy(TimeoutPolicy::Error);
         let frame = client.attach_interlock(&cam_frame).expect("attach frame");
 
         for _ in 0..cycles {
@@ -91,7 +89,6 @@ fn main() {
     let inf_handle = thread::spawn(move || {
         let mut client = AbacusClient::connect(&inf_sock, &format!("pod-{pid}-inf"), &[])
             .expect("connect consumer");
-        client.set_timeout_policy(TimeoutPolicy::Error);
 
         // Watch the producer's frame count.
         let ready = client

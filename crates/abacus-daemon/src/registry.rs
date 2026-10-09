@@ -107,10 +107,17 @@ enum Target {
 /// unrepresentable.
 enum EntryKind {
     Interlock,
-    WaitCounter { target: Target, word: WatchedWord },
+    WaitCounter {
+        target: Target,
+        word: WatchedWord,
+    },
     WaitTimer,
-    WaitCron { interval_ms: u64 },
-    WaitBarrier { conditions: Vec<(Target, WatchedWord, u64)> },
+    WaitCron {
+        interval_ms: u64,
+    },
+    WaitBarrier {
+        conditions: Vec<(Target, WatchedWord, u64)>,
+    },
 }
 
 impl EntryKind {
@@ -331,7 +338,9 @@ impl Registry {
                         message: format!("WaitCron interval_ns ({ival_ns}) is less than 1ms"),
                     });
                 }
-                EntryKind::WaitCron { interval_ms: ival_ms }
+                EntryKind::WaitCron {
+                    interval_ms: ival_ms,
+                }
             }
             Tier::WaitBarrier => {
                 let conds = spec
@@ -423,11 +432,11 @@ impl Registry {
         // Merge duplicate barrier conditions: same (target, word) keeps the highest
         // threshold, since every condition must hold.
         if let EntryKind::WaitBarrier { ref mut conditions } = kind {
-            let mut merged: Vec<(Target, WatchedWord, u64)> =
-                Vec::with_capacity(conditions.len());
+            let mut merged: Vec<(Target, WatchedWord, u64)> = Vec::with_capacity(conditions.len());
             for &(target, word, threshold) in conditions.iter() {
-                if let Some(existing) =
-                    merged.iter_mut().find(|(t, w, _)| *t == target && *w == word)
+                if let Some(existing) = merged
+                    .iter_mut()
+                    .find(|(t, w, _)| *t == target && *w == word)
                 {
                     existing.2 = existing.2.max(threshold);
                 } else {
@@ -485,12 +494,11 @@ impl Registry {
                         message: "clock word is SENTINEL".to_string(),
                     });
                 }
-                let next_line =
-                    next_grid_line(clock_now_ms, *interval_ms).ok_or_else(|| {
-                        Condition::InvalidRequest {
-                            message: "WaitCron grid line overflow".to_string(),
-                        }
-                    })?;
+                let next_line = next_grid_line(clock_now_ms, *interval_ms).ok_or_else(|| {
+                    Condition::InvalidRequest {
+                        message: "WaitCron grid line overflow".to_string(),
+                    }
+                })?;
                 handle
                     .words()
                     .open_count
@@ -1307,7 +1315,9 @@ mod tests {
                 ..Default::default()
             })
             .unwrap_err();
-        assert!(matches!(err, Condition::InvalidRequest { ref message } if message.contains("too many dependencies")));
+        assert!(
+            matches!(err, Condition::InvalidRequest { ref message } if message.contains("too many dependencies"))
+        );
     }
 
     #[test]
@@ -1339,7 +1349,9 @@ mod tests {
                 ..Default::default()
             })
             .unwrap_err();
-        assert!(matches!(err, Condition::InvalidRequest { ref message } if message.contains("too many barrier conditions")));
+        assert!(
+            matches!(err, Condition::InvalidRequest { ref message } if message.contains("too many barrier conditions"))
+        );
     }
 
     // -- deduplication tests --
@@ -1418,7 +1430,9 @@ mod tests {
                 ..Default::default()
             })
             .unwrap_err();
-        assert!(matches!(err, Condition::InvalidRequest { ref message } if message.contains("watch edge budget")));
+        assert!(
+            matches!(err, Condition::InvalidRequest { ref message } if message.contains("watch edge budget"))
+        );
     }
 
     #[test]
@@ -1432,7 +1446,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let (_, y) = r
+        let (_, _y) = r
             .create(CreateSpec {
                 name: "y".into(),
                 dependencies: vec!["t".into()],
@@ -1502,6 +1516,8 @@ mod tests {
         // A third would exceed.
         create_bare(&mut r, "src3");
         let err = create_counter(&mut r, "w3", "src3", 0).unwrap_err();
-        assert!(matches!(err, Condition::InvalidRequest { ref message } if message.contains("watch edge budget")));
+        assert!(
+            matches!(err, Condition::InvalidRequest { ref message } if message.contains("watch edge budget"))
+        );
     }
 }

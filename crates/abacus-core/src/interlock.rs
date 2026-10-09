@@ -151,14 +151,22 @@ impl ReadOnlyInterlockHandle {
 
     /// Futex-wait on open_count until its low 32 bits differ from `expected_lo32` or
     /// `timeout_nanos` elapses. Only reads the memory; safe on a PROT_READ page.
-    pub fn futex_wait_open(&self, expected_lo32: u32, timeout_nanos: u64) -> std::result::Result<(), i32> {
+    pub fn futex_wait_open(
+        &self,
+        expected_lo32: u32,
+        timeout_nanos: u64,
+    ) -> std::result::Result<(), i32> {
         // SAFETY: see load_open.
         let word = unsafe { &self.0.words.as_ref().open_count };
         crate::clock::futex_wait(word, expected_lo32, timeout_nanos)
     }
 
     /// Futex-wait on closed_count.
-    pub fn futex_wait_closed(&self, expected_lo32: u32, timeout_nanos: u64) -> std::result::Result<(), i32> {
+    pub fn futex_wait_closed(
+        &self,
+        expected_lo32: u32,
+        timeout_nanos: u64,
+    ) -> std::result::Result<(), i32> {
         // SAFETY: see load_open.
         let word = unsafe { &self.0.words.as_ref().closed_count };
         crate::clock::futex_wait(word, expected_lo32, timeout_nanos)
