@@ -351,13 +351,14 @@ Re-arm is `WaitBarrier::rearm`: increment `open_count` by 1, restoring `open > c
 ### WaitRace
 
 `wait_race::WaitRace` takes a vector of `WaitCounter` handles and polls with a caller-supplied
-timeout: for each counter, checks `is_reaped()` and `is_clock_dead()` (returning
-`InterlockReaped` for the whole race if any member died or its daemon clock lapsed) and
-`peek()`, returning `(index, WaitResult)` for the first counter classified as delivered
-(`closed_count >= open_count` via `classify_wake`). A counter whose `open_count` exceeds its
-`closed_count` is not yet delivered and is skipped. A delivery that landed before `wait` was
-called wins on the first pass. `Ok(None)` on timeout. Sleeps 1 ms between passes. SDK-only
-because the daemon has no tier for "fire when any of N fires."
+timeout: for each counter in index order, checks `is_reaped()` and `is_clock_dead()`
+(returning `InterlockReaped` for the whole race when that member died or its daemon clock
+lapsed) and then `peek()`, returning `(index, WaitResult)` when that counter is classified as
+delivered (`closed_count >= open_count` via `classify_wake`). The first member that decides a
+pass decides the race: a terminated member after a delivered one is not reached. A counter
+whose `open_count` exceeds its `closed_count` is not yet delivered and is skipped. A delivery
+that landed before `wait` was called wins on the first pass. `Ok(None)` on timeout. Sleeps
+1 ms between passes. SDK-only because the daemon has no tier for "fire when any of N fires."
 
 ### ProcessClock
 

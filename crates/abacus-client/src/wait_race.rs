@@ -25,9 +25,11 @@ impl WaitRace {
     }
 
     /// Poll until one counter is delivered (`closed_count >= open_count`) or `timeout_ms`
-    /// elapses. Returns `Ok(Some((index, result)))` for the first delivered counter,
-    /// `Ok(None)` on timeout, or `Err(InterlockReaped)` if any counter is terminated or
-    /// the daemon clock lapses. `timeout_ms == 0` polls once and returns.
+    /// elapses. Each pass checks the counters in index order, termination before delivery,
+    /// and the first counter that decides the pass decides the result:
+    /// `Err(InterlockReaped)` if it is terminated or its daemon clock lapsed,
+    /// `Ok(Some((index, result)))` if it is delivered. A terminated counter after a
+    /// delivered one is not reached. `Ok(None)` on timeout; `timeout_ms == 0` polls once.
     pub fn wait(&self, timeout_ms: u64) -> Result<Option<(usize, WaitResult)>, SdkError> {
         if self.counters.is_empty() {
             return Err(SdkError::InvalidRequest {

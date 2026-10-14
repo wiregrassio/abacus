@@ -923,8 +923,11 @@ wait(&self, timeout_ms: u64) -> Result<Option<(usize, WaitResult)>, SdkError>
     called wins on the first pass. Returns Ok(None) after timeout_ms milliseconds if
     no counter fires. timeout_ms == 0 polls once and returns.
     Errors: SdkError::InvalidRequest { message: "WaitRace over zero counters" } for an
-    empty set; SdkError::InterlockReaped as soon as any member reports is_reaped or
-    is_clock_dead (daemon clock expiration is SENTINEL or earlier than now).
+    empty set; SdkError::InterlockReaped when the pass reaches a member that reports
+    is_reaped or is_clock_dead (daemon clock expiration is SENTINEL or earlier than now)
+    before it reaches a delivered one. Each member is checked for termination and then
+    for delivery, in index order, and the first member that decides the pass decides the
+    result: a terminated member after a delivered one is not reached.
 
 len(&self) -> usize
 is_empty(&self) -> bool

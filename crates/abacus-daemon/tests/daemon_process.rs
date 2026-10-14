@@ -475,7 +475,7 @@ fn daemon__two_processes_share_one_interlock() {
     );
 }
 
-/// The daemon writes `<runtime-dir>/heartbeat` once per second with the current epoch
+/// The daemon writes `<socket-path>.heartbeat` once per second with the current epoch
 /// timestamp. The file exists while the daemon runs and is removed on clean shutdown.
 #[test]
 fn daemon__heartbeat_file_exists_while_running_and_is_removed_on_stop() {

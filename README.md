@@ -82,8 +82,8 @@ container bind-mount pattern, and the heartbeat health check are in `docs/OPERAT
 The daemon is crash-only by design. `panic = "abort"` is deliberate: a panic terminates the
 process rather than unwinding through a half-evaluated registry. A restart comes back empty,
 wakes no one, and every timer discovers the restart through its own fatal margin. systemd
-never gives up restarting. The daemon writes `/run/abacus/heartbeat` once per second for
-external health checks.
+never gives up restarting. The daemon writes `/run/abacus/abacus.sock.heartbeat` (the socket
+path plus `.heartbeat`) once per second for external health checks.
 
 Every local process that can open the socket can create over names, attach to any object, and
 terminate writable objects. Deployment security rests on socket ownership and mode.
